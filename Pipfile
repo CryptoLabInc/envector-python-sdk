@@ -1,0 +1,38 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+grpcio-tools = ">=1.49.1,<=1.74.0"
+grpcio-health-checking = ">=1.49.1,<=1.74.0"
+protobuf = ">=5.0.0,<6.0.0"
+loguru = "*"
+numpy = ">=2.0.2"
+tqdm = "*"
+cryptography = "*"
+
+[dev-packages]
+ipykernel = "*"
+ipywidgets = "*"
+ruff = "*"
+pre-commit = "*"
+pytest = "*"
+pytest-cov = "*"
+pytest-html = "*"
+pytest-xdist = "*"
+sphinx = "*"
+nbsphinx = "*"
+sphinx-mdinclude = "*"
+sphinx-rtd-theme = "==2.0.0"
+mypy = "*"
+types-psutil = "*"
+types-Deprecated = "*"
+line-profiler = "*"
+furo = "*"
+myst_nb = "*"
+
+[scripts]
+export-wheel = "bash scripts/build_and_install.sh --type wheel"
+pytest = "pytest -v"
+docs = "sphinx-build -b html docs build_docs"

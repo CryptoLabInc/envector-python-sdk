@@ -1,0 +1,89 @@
+# ==========================
+# Python cache/artifacts
+# ==========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ==========================
+# Virtual environments
+# ==========================
+.venv/
+.venv*/
+.python-version
+.envrc
+
+# ==========================
+# Packaging / build outputs
+# ==========================
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+_skbuild/
+
+# Native/C-extension outputs
+*.so
+*.pyd
+*.pyo
+
+# CMake / scikit-build
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+# ==========================
+# Test / coverage
+# ==========================
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# ==========================
+# Type checking / lint
+# ==========================
+.mypy_cache/
+.pytype/
+.ruff_cache/
+
+# ==========================
+# Docs
+# ==========================
+docs/_build/
+site/
+
+# ==========================
+# Jupyter
+# ==========================
+.ipynb_checkpoints/
+
+# ==========================
+# IDE / Editor
+# ==========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.history
+
+# ==========================
+# OS-specific
+# ==========================
+.DS_Store
+Thumbs.db
+
+# ==========================
+# Project-specific
+# ==========================
+# Generated keys and KEK
+keys/
+aes.kek
+envector.egg-info/

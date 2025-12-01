@@ -1,0 +1,76 @@
+# pyproject.toml
+
+[build-system]
+requires = [
+    "scikit-build-core>=0.9.0",
+    "setuptools>=67",
+    "wheel>=0.44.0",
+    "pybind11>=2.10",
+    "grpcio-tools",
+    "cmake==3.27.0",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pyenvector"
+version = "1.2.0"
+description = "A client application for performing encrypted vector search using homomorphic encryption."
+authors = [
+    {name = "cryptolabinc", email = "pypi@cryptolab.co.kr"}
+]
+readme = "README_pypi.md"
+requires-python = ">=3.9,<3.14"
+dependencies = [
+    "grpcio>=1.49.1,<=1.74.0",
+    "grpcio-health-checking>=1.49.1,<=1.74.0",
+    "protobuf>=5.0.0,<6.0.0",
+    "loguru",
+    "numpy>=2.0.2",
+    "tqdm",
+    "cryptography"
+]
+
+license = {text = "Proprietary"}
+classifiers = [
+    "License :: Other/Proprietary License",
+]
+
+[project.scripts]
+pyenvector-keygen = "pyenvector.cli.pyenvector_keygen:main"
+
+[project.optional-dependencies]
+colab = [
+    "numpy==2.0.2" # Compatible with Colab
+]
+
+[tool.scikit-build]
+cmake.source-dir = "./external/evi-crypto"
+
+cmake.version = ">=3.19"
+
+# macOS deployment target for Apple Silicon compatibility
+cmake.define.MACOSX_DEPLOYMENT_TARGET = "11.0"
+
+cmake.args = [
+  "-DBUILD_PYTHON=ON",
+]
+
+wheel.packages = ["pyenvector"]
+
+wheel.install-dir = "evi"
+
+[tool.ruff]
+line-length = 120
+extend-exclude = [
+    # Exclude generated protobuf/grpc Python files from lint/format
+    "pyenvector/proto_gen/**",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+per-file-ignores = { "__init__.py" = ["F401", "F403"] }
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

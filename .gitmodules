@@ -1,0 +1,3 @@
+[submodule "external/evi-crypto"]
+	path = external/evi-crypto
+	url = https://github.com/CryptoLabInc/evi-crypto.git
