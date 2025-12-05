@@ -26,6 +26,8 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher as CryptoCipher
 from cryptography.hazmat.primitives.ciphers import algorithms, modes
 
+from pyenvector.utils.utils import get_key_stream
+
 
 class AESHelper:
     """Helper class for AES-CTR operations to reduce code duplication."""
@@ -128,7 +130,7 @@ def _get_kek_bytes(kek: Union[bytes, str]) -> bytes:
         raise ValueError(f"KEK must be bytes or str (file path), got {type(kek)}")
 
 
-def seal_metadata_enc_key(metadata_enc_key: bytes, kek: Union[bytes, str], output_path: str) -> None:
+def seal_metadata_enc_key(metadata_enc_key: bytes, kek: Union[bytes, str], output_path: str = None) -> None:
     """
     Seals a metadata encryption key using KEK (Key Encryption Key) with AES-256-GCM.
 
@@ -148,17 +150,18 @@ def seal_metadata_enc_key(metadata_enc_key: bytes, kek: Union[bytes, str], outpu
 
     # Encrypt the metadata key using AES-256-GCM
     sealed_key = AESHelper.encrypt_with_aes(kek_bytes, metadata_enc_key)
-
+    if output_path is None:
+        return sealed_key
     # Save to file
     AESHelper.save_key_to_file(sealed_key, output_path)
 
 
-def unseal_metadata_enc_key(sealed_key_path: str, kek: Union[bytes, str]) -> bytes:
+def unseal_metadata_enc_key(sealed_key_source: Union[str, bytes, bytearray], kek: Union[bytes, str]) -> bytes:
     """
     Unseals a metadata encryption key using KEK (Key Encryption Key) with AES-256-GCM.
 
     Args:
-        sealed_key_path: Path to the sealed key file
+        sealed_key_source: Path to the sealed key file or raw sealed key bytes
         kek: The Key Encryption Key (32 bytes or path to KEK file)
 
     Returns:
@@ -171,9 +174,13 @@ def unseal_metadata_enc_key(sealed_key_path: str, kek: Union[bytes, str]) -> byt
     # Get KEK bytes (from bytes or file path)
     kek_bytes = _get_kek_bytes(kek)
 
-    # Read sealed key file
-    with open(sealed_key_path, "rb") as f:
-        sealed_data = f.read()
+    # Load sealed key bytes from path or raw bytes
+    if isinstance(sealed_key_source, (bytes, bytearray)):
+        sealed_data = bytes(sealed_key_source)
+    elif isinstance(sealed_key_source, str):
+        sealed_data = get_key_stream(sealed_key_source)
+    else:
+        raise TypeError("sealed_key_source must be a path or bytes-like object.")
 
     # Check minimum size
     if len(sealed_data) < AESHelper.MIN_SEALED_KEY_SIZE:
@@ -210,15 +217,16 @@ def _resolve_metadata_key(
     kek: Optional[Union[bytes, str]] = None,
 ) -> bytes:
     """Return usable metadata key bytes from a path/bytes."""
-    if isinstance(key_source, (bytes, bytearray)):
-        key = bytes(key_source)
-        AESHelper.validate_key_length(key, AESHelper.AES256_KEY_SIZE)
-        return key
     if key_source is None:
         raise ValueError("Metadata key is not configured.")
+    if isinstance(key_source, (bytes, bytearray)):
+        key_bytes = bytes(key_source)
+    else:
+        key_bytes = get_key_stream(key_source)
     if kek is not None:
-        return unseal_metadata_enc_key(key_source, kek)
-    return load_key(key_source)
+        return unseal_metadata_enc_key(key_bytes, kek)
+    AESHelper.validate_key_length(key_bytes, AESHelper.AES256_KEY_SIZE)
+    return key_bytes
 
 
 def encrypt_metadata(

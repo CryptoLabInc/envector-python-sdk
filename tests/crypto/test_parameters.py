@@ -32,22 +32,22 @@ def test_context_parameter_combinations(
     "expected_seal_mode_name, expected_eval_key_path, "
     "expected_enc_key_path, expect_error",
     [
-        ("/keys", "123", "NONE", None, "NONE", "/keys/123/EvalKey.bin", "/keys/123/EncKey.bin", False),
-        ("/keys", "456", "NONE", None, "NONE", "/keys/456/EvalKey.bin", "/keys/456/EncKey.bin", False),
-        ("/keys", None, "NONE", None, "NONE", "/keys/EvalKey.bin", "/keys/EncKey.bin", False),
-        ("/keys", "789", "AES", None, "AES_KEK", "/keys/789/EvalKey.bin", "/keys/789/EncKey.bin", True),
-        ("/keys", None, "AES", None, "AES_KEK", "/keys/EvalKey.bin", "/keys/EncKey.bin", True),
+        ("/keys", "123", "NONE", None, "NONE", "/keys/123/EvalKey.json", "/keys/123/EncKey.json", False),
+        ("/keys", "456", "NONE", None, "NONE", "/keys/456/EvalKey.json", "/keys/456/EncKey.json", False),
+        ("/keys", None, "NONE", None, "NONE", "/keys/EvalKey.json", "/keys/EncKey.json", False),
+        ("/keys", "789", "AES", None, "AES_KEK", "/keys/789/EvalKey.json", "/keys/789/EncKey.json", True),
+        ("/keys", None, "AES", None, "AES_KEK", "/keys/EvalKey.json", "/keys/EncKey.json", True),
         (
             "/keys",
             "789",
             "AES",
             "./temp/keys/aes.kek",
             "AES_KEK",
-            "/keys/789/EvalKey.bin",
-            "/keys/789/EncKey.bin",
+            "/keys/789/EvalKey.json",
+            "/keys/789/EncKey.json",
             False,
         ),
-        ("/keys", None, "AES", "./temp/keys/aes.kek", "AES_KEK", "/keys/EvalKey.bin", "/keys/EncKey.bin", False),
+        ("/keys", None, "AES", "./temp/keys/aes.kek", "AES_KEK", "/keys/EvalKey.json", "/keys/EncKey.json", False),
     ],
 )
 def test_key_parameter_initialization(

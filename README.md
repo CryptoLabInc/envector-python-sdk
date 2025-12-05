@@ -146,39 +146,57 @@ Keys will be stored in `{key_path}/{key_id}`.
 ```bash
 source .venv/bin/activate
 # Generate keys without KEK (Key Encryption Key)
-pyenvector-keygen --key_path keys --key_id id --seal_mode none --metadata_encryption true
+pyenvector-keygen --key-path keys --key-id id --seal-mode none --metadata-encryption true
 ```
 
 #### Generate keys with AES KEK
 
 ```bash
-pyenvector-keygen --key_path keys --key_id seal --seal_mode aes --seal_kek_path aes.kek --eval_mode rmp --preset ip
+pyenvector-keygen --key-path keys --key-id seal --seal-mode aes --seal-key-path aes.kek --eval-mode rmp --preset ip
+```
+
+#### Upload keys directly to AWS
+
+```bash
+pyenvector-keygen \
+  --key-store aws \
+  --key-id test-envector \
+  --region-name ap-northeast-2 \
+  --bucket-name envector-cli \
+  --secret-prefix envector/keys
 ```
 
 **Arguments (with defaults):**
-- `--key_path`: Directory to store keys (default: `./keys`)
-- `--key_id`: Key ID (subdirectory under key_path, default: `id`)
+- `--dim` / `--dim_list`: Dimensions to generate (default: `32 64 128 256 512 1024 2048 4096`)
+- `--key-path` / `--key_path`: Directory to store keys (default: `./keys`; ignored when using `--key-store aws`)
+- `--key-id` / `--key_id`: Key identifier (required for AWS mode)
 - `--preset`: Parameter preset (e.g. `ip`, default: `ip`)
-- `--eval_mode`: Evaluation mode (e.g. `rmp`, default: `rmp`)
-- `--seal_mode`: Seal mode (`none` or `aes`, default: `none`)
-- `--seal_kek_path`: Path to AES KEK file (required if `seal_mode` is `aes`)
-- `--seal_kek_stdin`: Read AES KEK from stdin (if set, overrides `--seal_kek_path`)
-- `--metadata_encryption`: Metadata encryption mode (`false` for no encryption, `true` for AES-GCM encryption; default: `true`)
+- `--eval-mode` / `--eval_mode`: Evaluation mode (e.g. `rmp`, default: `rmp`)
+- `--seal-mode` / `--seal_mode`: Seal mode (`none` or `aes`, default: `none`; must stay `none` when using AWS)
+- `--seal-key-path` / `--seal_key_path`: Path to AES KEK file (required when `--seal-mode aes`)
+- `--seal-key-stdin` / `--seal_key_stdin`: Read AES KEK from stdin (overrides `--seal-key-path`)
+- `--metadata-encryption` / `--metadata_encryption`: Metadata encryption (`true` by default)
+- `--key-store` / `--key_store`: `local` (default) writes JSON files, `aws` uploads key streams to AWS
+- `--region-name` / `--region_name`: AWS region (required when `--key-store aws`)
+- `--bucket-name` / `--bucket_name`: AWS S3 bucket for encrypted/eval keys (required for AWS)
+- `--secret-prefix` / `--secret_prefix`: AWS Secrets Manager prefix for Sec/Metadata keys (required for AWS)
+
+When using `--key-store aws`, keys are generated in-memory using `generate_keys_stream` and uploaded directly to AWS (no local files are written, and sealing options are disabled).
 
 If you use `--seal_kek_stdin`, you can provide the KEK via standard input:
 ```bash
 echo "your-32-byte-kek" | pyenvector-keygen \
---key_path keys \
---key_id seal \
---seal_mode aes \
---seal_kek_stdin \
---eval_mode rmp \
+--key-path keys \
+--key-id seal \
+--seal-mode aes \
+--seal-key-stdin \
+--eval-mode rmp \
 --preset ip \
---metadata_encryption true
+--metadata-encryption true
 ```
 Or, you can use file redirection:
 ```bash
-pyenvector-keygen --key_path keys --key_id seal --seal_mode aes --seal_kek_stdin --eval_mode rmp --preset ip < aes.kek
+pyenvector-keygen --key-path keys --key-id seal --seal-mode aes --seal-key-stdin --eval-mode rmp --preset ip < aes.kek
 ```
 ---
 

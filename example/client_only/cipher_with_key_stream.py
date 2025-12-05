@@ -1,5 +1,4 @@
 import argparse
-import os
 
 import numpy as np
 
@@ -24,38 +23,15 @@ def get_random_vector(dim, seed=None):
     return vec
 
 
-def get_key_stream(key_path):
-    if isinstance(key_path, str):
-        if not key_path.endswith(".bin"):
-            import ast
-
-            key_bytes = ast.literal_eval(key_path)
-        else:
-            with open(key_path, "rb") as key_file:
-                key_bytes = key_file.read()
-    elif isinstance(key_path, bytes):
-        key_bytes = key_path
-    else:
-        raise TypeError("key_path must be a file path (str) or bytes")
-    return key_bytes
-
-
 def main(args):
     # Key Path
-    key_path = "./keys"
     key_id = "test-key-mm" if args.eval_mode.upper() == "MM" else "test-key"
-    key_dir = f"{key_path}/{key_id}"
 
-    # Skip key generation if keys already exist
-    if os.path.exists(key_dir) and os.listdir(key_dir):
-        print(f"Keys already exist in {key_dir}. Skipping key generation.")
-    else:
-        # Generate keys
-        keygen = KeyGenerator(key_dir, eval_mode=args.eval_mode)
-        keygen.generate_keys()
+    keygen = KeyGenerator(key_id=key_id, eval_mode=args.eval_mode)
+    key_dict = keygen.generate_keys_stream()
 
-    enc_key_stream = get_key_stream(key_dir + "/EncKey.bin")
-    sec_key_stream = get_key_stream(key_dir + "/SecKey.bin")
+    enc_key_stream = key_dict["enc_blob"]
+    sec_key_stream = key_dict["sec_blob"]
 
     # Generate random vector
     num_data = 10

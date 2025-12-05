@@ -49,17 +49,17 @@ def main():
     # Encrypt vector
     cipher = Cipher(dim=DIM, preset=PRESET, eval_mode=MODE, seal_mode=seal_mode, seal_kek_path=seal_kek_path)
 
-    db_ctxt = [cipher.encrypt(vec, "item", key_dir + "/EncKey.bin") for vec in vectors]
+    db_ctxt = [cipher.encrypt(vec, "item", key_dir + "/EncKey.json") for vec in vectors]
     print("Vector encrypted successfully.")
 
     print(f"Get plaintext vector: first 10:\n  {vectors[0][0:10]}")
     print(f"Get Serialized CipherText: first 100 bytes:\n  {db_ctxt[0].serialize()[0:100]}")
     decrypted = cipher.decrypt(
-        db_ctxt[0], sec_key_path=key_dir + "/SecKey_sealed.bin", seal_mode=seal_mode, seal_kek_path=seal_kek_path
+        db_ctxt[0], sec_key_path=key_dir + "/SecKey.json", seal_mode=seal_mode, seal_kek_path=seal_kek_path
     )
     print(f"Get Decrypted Vector: first 10:\n  {decrypted[0:10]}")
 
-    bulk_db_ctxt = cipher.encrypt_multiple(vectors, "item", key_dir + "/EncKey.bin")
+    bulk_db_ctxt = cipher.encrypt_multiple(vectors, "item", key_dir + "/EncKey.json")
     print("Bulk vector encrypted successfully.")
 
     print(f"Get plaintext vector: first 10:\n  {vectors[0][0:10]}")
@@ -67,7 +67,7 @@ def main():
     print(f"Get Serialized CipherText: first 100 bytes:\n  {bulk_db_ctxt.serialize()[0:100]}")
     bulk_decrypted = cipher.decrypt(
         bulk_db_ctxt,
-        sec_key_path=key_dir + "/SecKey_sealed.bin",
+        sec_key_path=key_dir + "/SecKey.json",
         seal_mode=seal_mode,
         seal_kek_path=seal_kek_path,
         idx=0,

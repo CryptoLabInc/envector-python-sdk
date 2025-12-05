@@ -9,5 +9,6 @@
 #  For licensing inquiries or permission requests, please contact: pypi@cryptolab.co.kr
 # ========================================================================================
 
+from pyenvector.utils.aws import AWSClient
 from pyenvector.utils.logging_config import logger
 from pyenvector.utils.utils import topk

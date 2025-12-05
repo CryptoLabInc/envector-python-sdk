@@ -74,15 +74,18 @@ class Cipher:
         if enc_key_path is not None:
             if os.path.exists(enc_key_path) is False:
                 raise ValueError(f"Encryption key not found in {enc_key_path}.")
-            self._encryptor = Encryptor._create_from_context_parameter(self._context_param, enc_key_path)
+            enc_key_stream = utils.get_key_stream(enc_key_path)
+            self._encryptor = Encryptor._create_from_context_parameter(self._context_param, enc_key_stream)
         elif use_key_stream and enc_key is not None:
-            self._encryptor = Encryptor._create_from_context_parameter(self._context_param, enc_key)
-        elif utils.get_envector_enc_key() is not None:
-            self._encryptor = Encryptor._create_from_context_parameter(
-                self._context_param, utils.get_envector_enc_key()
-            )
+            enc_key_stream = utils.get_key_stream(enc_key)
+            self._encryptor = Encryptor._create_from_context_parameter(self._context_param, enc_key_stream)
         else:
-            self._encryptor = None
+            env_enc_key = utils.get_envector_enc_key()
+            if env_enc_key is not None:
+                enc_key_stream = utils.get_key_stream(env_enc_key)
+                self._encryptor = Encryptor._create_from_context_parameter(self._context_param, enc_key_stream)
+            else:
+                self._encryptor = None
         env_sec_key = utils.get_envector_sec_key()
         self._seal_info = None
         self._decryptor = None
@@ -162,8 +165,11 @@ class Cipher:
             if os.path.exists(enc_key_path) is False:
                 raise ValueError(f"Encryption key not found in {enc_key_path}.")
             enc_key = enc_key_path
-        if enc_key:
+        if enc_key is not None:
+            enc_key = utils.get_key_stream(enc_key)
             self._encryptor = Encryptor._create_from_context_parameter(self._context_param, enc_key)
+        elif self._encryptor is None:
+            raise ValueError("Encryptor is not initialized. Ensure the encryption key path is set.")
 
         enc_res = self.encryptor.encrypt(vector, encode_type)
         return CipherBlock(data=enc_res, enc_type="single")
@@ -201,8 +207,11 @@ class Cipher:
             if os.path.exists(enc_key_path) is False:
                 raise ValueError(f"Encryption key not found in {enc_key_path}.")
             enc_key = enc_key_path
-        if enc_key:
+        if enc_key is not None:
+            enc_key = utils.get_key_stream(enc_key)
             self._encryptor = Encryptor._create_from_context_parameter(self._context_param, enc_key)
+        elif self._encryptor is None:
+            raise ValueError("Encryptor is not initialized. Ensure the encryption key path is set.")
 
         enc_res = []
         enc_res = self.encryptor.encrypt_multiple(vectors, encode_type)
