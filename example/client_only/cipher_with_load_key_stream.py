@@ -4,6 +4,7 @@ import os
 import numpy as np
 
 from pyenvector.crypto import Cipher, KeyGenerator
+from pyenvector.utils.utils import get_key_stream
 
 PRESET = "ip"  # Preset for the context
 DIM = 512  # Dimension for the context
@@ -38,28 +39,30 @@ def main(args):
         keygen = KeyGenerator(key_dir, eval_mode=args.eval_mode)
         keygen.generate_keys()
 
+    enc_key_stream = get_key_stream(key_dir + "/EncKey.json")
+    sec_key_stream = get_key_stream(key_dir + "/SecKey.json")
+
     # Generate random vector
     num_data = 10
     seed = 42
     vectors = [get_random_vector(DIM, seed=seed + i) for i in range(num_data)]
 
     # Encrypt vector
-    cipher = Cipher(dim=DIM, preset=PRESET, eval_mode=args.eval_mode)
-    sec_key_path = f"{key_dir}/SecKey.json"
+    cipher = Cipher(dim=DIM, preset=PRESET, eval_mode=args.eval_mode, use_key_stream=True)
 
-    db_ctxt = [cipher.encrypt(vec, "item", key_dir + "/EncKey.json") for vec in vectors]
+    db_ctxt = [cipher.encrypt(vec, "item", enc_key=enc_key_stream) for vec in vectors]
     print("Vector encrypted successfully.")
 
     print(f"Get plaintext vector: first 10:\n  {vectors[0][0:10]}")
     print(f"Get Serialized CipherText: first 100 bytes:\n  {db_ctxt[0].serialize()[0:100]}")
-    print(f"Get Decrypted Vector: first 10:\n  {cipher.decrypt(db_ctxt[0], sec_key_path=sec_key_path)[0:10]}")
+    print(f"Get Decrypted Vector: first 10:\n  {cipher.decrypt(db_ctxt[0], sec_key=sec_key_stream)[0:10]}")
 
-    bulk_db_ctxt = cipher.encrypt_multiple(vectors, "item", key_dir + "/EncKey.json")
+    bulk_db_ctxt = cipher.encrypt_multiple(vectors, "item", enc_key=enc_key_stream)
     print("Bulk vector encrypted successfully.")
 
     print(f"Get plaintext vector: first 10:\n  {vectors[0][0:10]}")
     print(f"Get Serialized CipherText: first 100 bytes:\n  {bulk_db_ctxt.serialize()[0:100]}")
-    print(f"Get Decrypted Vector: first 10:\n  {cipher.decrypt(bulk_db_ctxt, sec_key_path=sec_key_path)[0:10]}")
+    print(f"Get Decrypted Vector: first 10:\n  {cipher.decrypt(bulk_db_ctxt, sec_key=sec_key_stream)[0:10]}")
 
 
 if __name__ == "__main__":

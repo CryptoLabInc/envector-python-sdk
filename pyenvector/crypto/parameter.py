@@ -610,6 +610,10 @@ class KeyParameter:
         eval_key: Optional[Union[bytes, str]] = None,
         sec_key: Optional[Union[bytes, str]] = None,
         metadata_key: Optional[Union[bytes, str]] = None,
+        key_store: Optional[str] = None,
+        region_name: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+        secret_prefix: Optional[str] = None,
     ):
         """
         Initializes the KeyParameter class.
@@ -626,6 +630,10 @@ class KeyParameter:
             eval_key (str or bytes, optional): Evaluation key stream when ``use_key_stream`` is enabled.
             sec_key (str or bytes, optional): Secret key stream when ``use_key_stream`` is enabled.
             metadata_key (str or bytes, optional): Metadata key stream when ``use_key_stream`` is enabled.
+            key_store (str, optional): External key storage provider (e.g., "aws").
+            region_name (str, optional): External key store region (for AWS).
+            bucket_name (str, optional): S3 bucket name for AWS key storage.
+            secret_prefix (str, optional): Secrets Manager prefix for AWS key storage.
         """
         self.use_key_stream = use_key_stream
         self.key_path = key_path
@@ -638,6 +646,10 @@ class KeyParameter:
         self.eval_key_stream = eval_key
         self.sec_key_stream = sec_key
         self.metadata_key_stream = metadata_key
+        self.key_store = key_store
+        self.region_name = region_name
+        self.bucket_name = bucket_name
+        self.secret_prefix = secret_prefix
 
     #     self._init_keys()
 
@@ -652,6 +664,54 @@ class KeyParameter:
     #         self.eval_key = self.eval_key_path
     #         self.sec_key = self.sec_key_path
     #         self.metadata_key = self.metadata_key_path
+
+    @property
+    def key_store(self):
+        """
+        Returns the key store type.
+        Returns:
+            str: The key store type.
+        """
+        return self._key_store
+
+    @key_store.setter
+    def key_store(self, key_store: Optional[str]):
+        """
+        Sets the key store type.
+        Args:
+            key_store (str): The key store type.
+        """
+        if key_store is None:
+            key_store = None
+        elif key_store == "aws":
+            key_store = "aws"
+        else:
+            raise ValueError(f"Unsupported key store type: {key_store}. Supported types are: aws.")
+        self._key_store = key_store
+
+    @property
+    def region_name(self):
+        return getattr(self, "_region_name", None)
+
+    @region_name.setter
+    def region_name(self, region_name: Optional[str]):
+        self._region_name = region_name
+
+    @property
+    def bucket_name(self):
+        return getattr(self, "_bucket_name", None)
+
+    @bucket_name.setter
+    def bucket_name(self, bucket_name: Optional[str]):
+        self._bucket_name = bucket_name
+
+    @property
+    def secret_prefix(self):
+        return getattr(self, "_secret_prefix", None)
+
+    @secret_prefix.setter
+    def secret_prefix(self, secret_prefix: Optional[str]):
+        self._secret_prefix = secret_prefix
 
     @property
     def key_path(self):
@@ -804,6 +864,17 @@ class KeyParameter:
         """
         if self.key_dir is None:
             return None
+        return self.key_dir + "/MetadataKey.json"
+
+    @property
+    def metadata_key_bin_path(self):
+        """
+        Returns whether metadata encryption key is used.
+        Returns:
+            bool: True if metadata encryption key is used, False otherwise.
+        """
+        if self.key_dir is None:
+            return None
         if self.seal_info.mode == evi.SealMode.AES_KEK:
             return self.key_dir + "/MetadataKey_sealed.bin"
         elif self.seal_info.mode == evi.SealMode.NONE:
@@ -828,6 +899,17 @@ class KeyParameter:
         """
         if self.key_dir is None:
             return None
+        return self.key_dir + "/EvalKey.json"
+
+    @property
+    def eval_key_bin_path(self):
+        """
+        Returns the file path to the evaluation key.
+        Returns:
+            str: The file path to the evaluation key.
+        """
+        if self.key_dir is None:
+            return None
         return self.key_dir + "/EvalKey.bin"
 
     @property
@@ -839,14 +921,25 @@ class KeyParameter:
         """
         if self.key_dir is None:
             return None
+        return self.key_dir + "/EncKey.json"
+
+    @property
+    def enc_key_bin_path(self):
+        """
+        Returns the file path to the encryption key.
+        Returns:
+            str: The file path to the encryption key.
+        """
+        if self.key_dir is None:
+            return None
         return self.key_dir + "/EncKey.bin"
 
     @property
-    def evi_sec_key_path(self):
+    def sec_key_bin_path(self):
         """
-        Returns the file path to the secret key for EVI.
+        Returns the file path to the secret key for evi.
         Returns:
-            str: The file path to the secret key for EVI.
+            str: The file path to the secret key for evi.
         """
         if self.key_dir is None:
             return None
@@ -856,13 +949,15 @@ class KeyParameter:
             return self.key_dir + "/SecKey.bin"
 
     @property
-    def sec_key_d16_path(self):
+    def evi_sec_key_path(self):
         """
-        Returns the file path to the secret key for D16.
+        Returns the file path to the secret key for evi.
         Returns:
-            str: The file path to the secret key for D16.
+            str: The file path to the secret key for evi.
         """
-        return self.key_dir + "/SecKeyD16.bin"
+        if self.key_dir is None:
+            return None
+        return self.key_dir + "/SecKey.json"
 
     @property
     def sec_key_path(self):
@@ -890,8 +985,9 @@ class KeyParameter:
     def enc_key(self):
         if self.enc_key_stream:
             return utils.get_key_stream(self.enc_key_stream)
-        else:
+        if self.enc_key_path:
             return utils.get_key_stream(self.enc_key_path)
+        return None
 
     @enc_key.setter
     def enc_key(self, enc_key):
@@ -901,8 +997,9 @@ class KeyParameter:
     def eval_key(self):
         if self.eval_key_stream:
             return utils.get_key_stream(self.eval_key_stream)
-        else:
+        if self.eval_key_path:
             return utils.get_key_stream(self.eval_key_path)
+        return None
 
     @eval_key.setter
     def eval_key(self, eval_key):
@@ -912,8 +1009,9 @@ class KeyParameter:
     def sec_key(self):
         if self.sec_key_stream:
             return utils.get_key_stream(self.sec_key_stream)
-        else:
+        if self.sec_key_path:
             return utils.get_key_stream(self.sec_key_path)
+        return None
 
     @sec_key.setter
     def sec_key(self, sec_key):
@@ -923,8 +1021,9 @@ class KeyParameter:
     def metadata_key(self):
         if self.metadata_key_stream:
             return utils.get_key_stream(self.metadata_key_stream)
-        else:
+        if self.metadata_key_path:
             return utils.get_key_stream(self.metadata_key_path)
+        return None
 
     @metadata_key.setter
     def metadata_key(self, metadata_key):
@@ -951,12 +1050,12 @@ class KeyParameter:
             return False
 
         # Check for required files in the key_id directory
-        required_files = ["EncKey.bin", "EvalKey.bin"]
+        required_files = ["EncKey.json", "EvalKey.json"]
         for file_name in required_files:
             file_path = key_dir / file_name
             if not file_path.exists():
                 raise ValueError(f"[ERROR] Required file '{file_name}' is missing in '{key_dir}'.")
-        optional_files = ["SecKey.bin", "SecKey_sealed.bin"]
+        optional_files = ["SecKey.json"]
         if not any((key_dir / file_name).exists() for file_name in optional_files):
             raise ValueError(f"[ERROR] At least one of {optional_files} must exist in '{key_dir}'.")
 

@@ -19,6 +19,7 @@ import numpy as np
 
 import pyenvector as ev
 from pyenvector.crypto import KeyGenerator
+from pyenvector.utils.utils import get_key_stream
 
 PRESET = "IP"  # Preset for the context
 KEYPATH = "./keys"
@@ -40,22 +41,6 @@ def get_random_vector(dim, seed=None):
     return vec
 
 
-def get_key_stream(key_path):
-    if isinstance(key_path, str):
-        if not key_path.endswith(".bin"):
-            import ast
-
-            key_bytes = ast.literal_eval(key_path)
-        else:
-            with open(key_path, "rb") as key_file:
-                key_bytes = key_file.read()
-    elif isinstance(key_path, bytes):
-        key_bytes = key_path
-    else:
-        raise TypeError("key_path must be a file path (str) or bytes")
-    return key_bytes
-
-
 def main(args):
     # Check Key
     key_dir = f"{KEYPATH}/{KEYID}"
@@ -71,10 +56,10 @@ def main(args):
     ENVECTOR_ADDRESS = f"{args.host}:{args.port}"
     DIM = args.dim
 
-    enc_key = get_key_stream(key_dir + "/EncKey.bin")
-    eval_key = get_key_stream(key_dir + "/EvalKey.bin")
-    sec_key = get_key_stream(key_dir + "/SecKey.bin")
-    metadata_key = get_key_stream(key_dir + "/MetadataKey.bin")
+    enc_key = get_key_stream(key_dir + "/EncKey.json")
+    eval_key = get_key_stream(key_dir + "/EvalKey.json")
+    sec_key = get_key_stream(key_dir + "/SecKey.json")
+    metadata_key = get_key_stream(key_dir + "/MetadataKey.json")
     ev.init(
         address=ENVECTOR_ADDRESS,
         key_id=KEYID,

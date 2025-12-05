@@ -13,5 +13,6 @@ from pyenvector import api, crypto, utils
 from pyenvector.client import *
 from pyenvector.crypto import Cipher, KeyGenerator
 from pyenvector.index import Index
+from pyenvector.utils import AWSClient
 
 __version__ = "1.2.0"

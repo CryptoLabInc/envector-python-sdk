@@ -64,7 +64,7 @@ def main(args):
     index.insert(vectors, metadata=db_metadata)
 
     # Encrypt Query
-    cipher = Cipher(f"{KEYPATH}/{KEYID}/EncKey.bin", preset=PRESET, dim=DIM)
+    cipher = Cipher(f"{KEYPATH}/{KEYID}/EncKey.json", preset=PRESET, dim=DIM)
     query = [cipher.encrypt(np.array(vectors[0]), encode_type="query")]
 
     # Do CC Search

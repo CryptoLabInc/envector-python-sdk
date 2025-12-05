@@ -34,6 +34,7 @@ from pyenvector.utils.logging_config import logger
 from pyenvector.utils.utils import topk
 
 ENCRYPTION_BATCH_SIZE = 4096
+KNN_BATCH_SIZE = 4096
 
 
 class IndexConfig:
@@ -68,6 +69,14 @@ class IndexConfig:
         The encryption type for metadata, e.g. True, False.
     description : str, optional
         Human-readable text describing the index.
+    key_store : str, optional
+        External key storage provider (currently only ``"aws"``).
+    region_name : str, optional
+        Region used by the external key store.
+    bucket_name : str, optional
+        S3 bucket for AWS key storage.
+    secret_prefix : str, optional
+        Secret prefix for AWS Secrets Manager.
 
     Examples
     --------
@@ -109,6 +118,10 @@ class IndexConfig:
         sec_key: Optional[bytes] = None,
         metadata_key: Optional[bytes] = None,
         seal_kek: Optional[bytes] = None,
+        key_store: Optional[str] = None,
+        region_name: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+        secret_prefix: Optional[str] = None,
     ):
         """
         Initializes the IndexConfig class.
@@ -128,6 +141,10 @@ class IndexConfig:
             sec_key=sec_key,
             metadata_key=metadata_key,
             seal_kek=seal_kek,
+            key_store=key_store,
+            region_name=region_name,
+            bucket_name=bucket_name,
+            secret_prefix=secret_prefix,
         )
         if index_params is None and index_type is not None:
             index_params = {"index_type": index_type}
@@ -474,6 +491,22 @@ class IndexConfig:
         return self
 
     @property
+    def key_store(self) -> Optional[str]:
+        return self.key_param.key_store
+
+    @property
+    def region_name(self) -> Optional[str]:
+        return self.key_param.region_name
+
+    @property
+    def bucket_name(self) -> Optional[str]:
+        return self.key_param.bucket_name
+
+    @property
+    def secret_prefix(self) -> Optional[str]:
+        return self.key_param.secret_prefix
+
+    @property
     def seal_info(self) -> SealInfo:
         """
         Returns the seal mode.
@@ -648,6 +681,10 @@ class IndexConfig:
         sec_key: Optional[bytes] = None,
         metadata_key: Optional[bytes] = None,
         seal_kek: Optional[bytes] = None,
+        key_store: Optional[str] = None,
+        region_name: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+        secret_prefix: Optional[str] = None,
     ) -> "IndexConfig":
         """
         Creates a deep copy of the index configuration.
@@ -677,6 +714,10 @@ class IndexConfig:
             sec_key=self.key_param.sec_key if sec_key is None else sec_key,
             metadata_key=self.key_param.metadata_key if metadata_key is None else metadata_key,
             seal_kek=seal_kek if seal_kek is not None else None,
+            key_store=self.key_param.key_store if key_store is None else key_store,
+            region_name=self.key_param.region_name if region_name is None else region_name,
+            bucket_name=self.key_param.bucket_name if bucket_name is None else bucket_name,
+            secret_prefix=self.key_param.secret_prefix if secret_prefix is None else secret_prefix,
         )
         return new_config
 
@@ -1028,8 +1069,12 @@ class Index:
         if self.index_config.index_encryption not in ["cipher", "hybrid"]:
             raise ValueError("Received unencrypted data, but index encryption is disabled.")
 
-        close_pair = np.array(data) @ self.index_config.centroids.T
-        close_idxs = list(map(np.argmax, close_pair))
+        close_idxs = self._knn(data, k=1)
+        close_idxs = [
+            idx[0] if isinstance(idx, (list, np.ndarray)) else (idx.item() if isinstance(idx, np.generic) else idx)
+            for idx in close_idxs
+        ]
+
         close_vector_idx = dict()
         for i, idx in enumerate(close_idxs):
             if idx not in close_vector_idx:
@@ -1237,13 +1282,8 @@ class Index:
                         else self.index_config.index_param.default_nprobe
                     )
                     encrypted_query = [self.cipher.encrypt(i, encode_type="query") for i in query]
-                    info = query @ self.index_config.index_param.centroids.T
-                    search_topk = list(
-                        map(
-                            lambda a: np.argpartition(a, -nprobe)[-nprobe:],
-                            info,
-                        )
-                    )
+
+                    search_topk = self._knn(query, k=nprobe)
 
                 else:
                     raise Exception("IVF_FLAT need to closet centriod info before encryption")
@@ -1261,9 +1301,8 @@ class Index:
                     if search_params
                     else self.index_config.index_param.default_nprobe
                 )
-                info = query @ self.index_config.index_param.centroids.T
 
-                search_topk = np.argpartition(info, -nprobe, axis=1)[:, -nprobe:].tolist()
+                search_topk = self._knn(query, k=nprobe)
 
                 assert nprobe == len(search_topk[0])
                 logger.debug(f"Search on {nprobe} clusters by IVF-FLAT: {search_topk}")
@@ -1448,6 +1487,31 @@ class Index:
         self.index_config = None
         self.num_entities = 0
         return self
+
+    def _knn(self, data: Union[List[List[float]], List[np.ndarray], np.ndarray], k: int = 1):
+        """
+        Find k-nearest neighbors for each vector in the index.
+        """
+        dim = self.index_config.centroids.shape[1]
+        nearest_indices: List[np.ndarray] = []
+
+        # batch inner product to find nearest centroids
+        for i in range(0, len(data), KNN_BATCH_SIZE):
+            data_matrix = np.asarray(data[i : i + KNN_BATCH_SIZE], dtype=np.float32)
+            if data_matrix.shape[1] != dim:
+                raise ValueError(f"Centroid dimension {dim} does not match data dimension {data_matrix.shape[1]}.")
+
+            dist_matrix = data_matrix @ self.index_config.centroids.T
+
+            # Efficiently get top-k indices for each row using np.argpartition
+            search_topk = np.argpartition(dist_matrix, -k, axis=1)[:, -k:]
+
+            nearest_indices.append(search_topk)
+
+        if not nearest_indices:
+            return []
+
+        return np.concatenate(nearest_indices, axis=0).tolist()
 
     @property
     def is_connected(self) -> bool:

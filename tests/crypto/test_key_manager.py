@@ -1,4 +1,4 @@
-import json
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -55,23 +55,19 @@ def test_generate_keys_creates_metadata(
             # Call generate_keys
             keygen.generate_keys()
 
-            # Verify metadata file
-            metadata_path = Path(keygen._key_param.key_dir) / "metadata.json"
-            assert metadata_path.exists()
+            # Validate internal configuration stayed consistent
+            assert keygen._context_param.preset_name == expected_preset
+            assert keygen._context_param.eval_mode_name == eval_mode
+            assert keygen._key_param.seal_mode_name == expected_seal_mode
+            assert keygen._dim_list == dim_list
 
-            with open(metadata_path, "r") as f:
-                metadata = json.load(f)
+            # Ensure metadata key file aligns with encryption flag
+            metadata_key_path = Path(keygen._key_param.metadata_enc_key_path)
+            if metadata_encryption:
+                assert metadata_key_path.exists()
+                metadata_key_path.unlink()
+            else:
+                assert not metadata_key_path.exists()
 
-            assert metadata["preset"] == expected_preset
-            assert metadata["eval_mode"] == eval_mode
-            assert metadata["seal_mode"] == expected_seal_mode
-            assert metadata["dim_list"] == dim_list
-            assert metadata["metadata_encryption"] == keygen._key_param.metadata_encryption
-
-            # Cleanup
-            metadata_path.unlink()
-            # Remove MetadataKey.bin if it exists (created when metadata_encryption is enabled)
-            metadata_enc_key_path = Path(keygen._key_param.metadata_enc_key_path)
-            if metadata_enc_key_path.exists():
-                metadata_enc_key_path.unlink()
-            Path(key_path).rmdir()
+            # Cleanup generated directory tree if created
+            shutil.rmtree(key_path, ignore_errors=True)

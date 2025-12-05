@@ -32,6 +32,7 @@ from typing import Optional
 
 from pyenvector.api import Indexer
 from pyenvector.crypto import KeyGenerator
+from pyenvector.crypto.key_manager import KeyManager
 from pyenvector.crypto.parameter import ContextParameter, KeyParameter
 from pyenvector.index import Index, IndexConfig
 from pyenvector.utils import utils
@@ -255,6 +256,58 @@ class EnvectorClient:
         """
         return self.indexer.get_index_list()
 
+    def generate_and_store_aws(self, key_id: Optional[str] = None):
+        """
+        Retrieves the key from AWS using KeyManager.
+
+        Args:
+            key_id (str, optional): Override for ``index_config.key_id`` when retrieving the key.
+        """
+        if key_id is not None:
+            self.index_config.key_id = key_id
+        km = KeyManager(
+            key_id=self.index_config.key_id,
+            key_store="aws",
+            region_name=self.index_config.region_name,
+            bucket_name=self.index_config.bucket_name,
+            secret_prefix=self.index_config.secret_prefix,
+        )
+        if km.verify_key_id():
+            raise ValueError(f"Key ID {self.index_config.key_id} already exists in AWS.")
+        else:
+            keygen = KeyGenerator._create_from_parameter(
+                context_param=self.index_config.context_param, key_param=self.index_config.key_param
+            )
+            key_dict = keygen.generate_keys_stream()
+            km.save(key_dict)
+        return key_dict
+
+    @staticmethod
+    def _extract_key_streams(key_bundle: Optional[dict]):
+        """
+        Normalize key payload dictionaries (e.g., AWS blobs) into streams expected by IndexConfig.
+
+        Args:
+            key_bundle (dict, optional): Key payload containing ``*_blob`` or ``*_key`` entries.
+
+        Returns:
+            tuple: (enc_key, eval_key, sec_key, metadata_key)
+        """
+        if not key_bundle:
+            return None, None, None, None
+
+        def pick(*names):
+            for name in names:
+                if name in key_bundle and key_bundle[name] is not None:
+                    return key_bundle[name]
+            return None
+
+        enc_key = pick("enc_blob", "enc_key")
+        eval_key = pick("eval_blob", "eval_key")
+        sec_key = pick("sec_blob", "sec_key")
+        metadata_key = pick("metadata_blob", "metadata_key")
+        return enc_key, eval_key, sec_key, metadata_key
+
     def generate_key(self, key_id: Optional[str] = None):
         """
         Generates a key using the KeyGenerator.
@@ -417,6 +470,10 @@ class EnvectorClient:
         sec_key: Optional[bytes] = None,
         metadata_key: Optional[bytes] = None,
         seal_kek: Optional[bytes] = None,
+        key_store: Optional[str] = None,
+        region_name: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+        secret_prefix: Optional[str] = None,
     ):
         """
         Initializes the index configuration.
@@ -463,9 +520,29 @@ class EnvectorClient:
                 ... )
         """
         auto_key_setup = True if auto_key_setup is None else auto_key_setup
+        _generate_keys_stream_required = False
         if key_path is None:
             use_key_stream = True
-            if auto_key_setup:
+            if key_store == "aws":
+                if (
+                    enc_key is None
+                    or eval_key is None
+                    or sec_key is None
+                    or (metadata_encryption and metadata_key is None)
+                ):
+                    km = KeyManager(
+                        key_id=key_id,
+                        key_store=key_store,
+                        region_name=region_name,
+                        bucket_name=bucket_name,
+                        secret_prefix=secret_prefix,
+                    )
+                    if not km.verify_key_id():
+                        _generate_keys_stream_required = True
+                    else:
+                        key_dict = km.load_from_aws()
+                        enc_key, eval_key, sec_key, metadata_key = self._extract_key_streams(key_dict)
+            elif auto_key_setup:
                 if enc_key is None:
                     if os.environ.get("ENVECTOR_ENC_KEY", None):
                         enc_key = utils.get_key_stream(os.environ["ENVECTOR_ENC_KEY"])
@@ -548,22 +625,25 @@ class EnvectorClient:
             sec_key=sec_key,
             metadata_key=metadata_key,
             seal_kek=seal_kek,
+            key_store=key_store,
+            region_name=region_name,
+            bucket_name=bucket_name,
+            secret_prefix=secret_prefix,
         )
         if auto_key_setup:
             if self.index_config.key_id is None:
                 raise ValueError("Key ID must be provided to generate a key.")
-            if not use_key_stream:
+            elif _generate_keys_stream_required:
+                key_dict = self.generate_and_store_aws(key_id=self.index_config.key_id)
+                enc_key, eval_key, sec_key, metadata_key = self._extract_key_streams(key_dict)
+                self.index_config = self.index_config.deepcopy(
+                    enc_key=enc_key,
+                    eval_key=eval_key,
+                    sec_key=sec_key,
+                    metadata_key=metadata_key,
+                )
+            elif not use_key_stream:
                 self.generate_key()
-                with open(f"{self.index_config.key_dir}/metadata.json", "r") as f:
-                    config = json.load(f)
-                if config["seal_mode"] == "AES_KEK" and not self.index_config.seal_kek_path:
-                    raise ValueError("Seal KEK path must be provided for AES_KEK seal mode.")
-                if not os.path.exists(self.index_config.enc_key_path):
-                    raise ValueError(f"Encryption key not found in {self.index_config.enc_key_path}.")
-                if not os.path.exists(self.index_config.eval_key_path):
-                    raise ValueError(f"Evaluation key not found in {self.index_config.eval_key_path}.")
-                if config["metadata_encryption"] and not os.path.exists(self.index_config.metadata_key_path):
-                    raise ValueError(f"Metadata key not found in {self.index_config.metadata_key_path}.")
             self.register_key()
             key_list = self.indexer.get_key_list()
             for key in key_list:
@@ -602,6 +682,10 @@ class EnvectorClient:
         sec_key: Optional[bytes] = None,
         metadata_key: Optional[bytes] = None,
         seal_kek: Optional[bytes] = None,
+        key_store: Optional[str] = None,
+        region_name: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+        secret_prefix: Optional[str] = None,
     ):
         """
         Initializes the EnvectorClient environment (connection, key, and index config).
@@ -719,6 +803,10 @@ class EnvectorClient:
             sec_key=sec_key,
             metadata_key=metadata_key,
             seal_kek=seal_kek,
+            key_store=key_store,
+            region_name=region_name,
+            bucket_name=bucket_name,
+            secret_prefix=secret_prefix,
         )
         return self
 
@@ -744,6 +832,10 @@ class EnvectorClient:
         sec_key: Optional[bytes] = None,
         metadata_key: Optional[bytes] = None,
         seal_kek: Optional[bytes] = None,
+        key_store: Optional[str] = None,
+        region_name: Optional[str] = None,
+        bucket_name: Optional[str] = None,
+        secret_prefix: Optional[str] = None,
     ):
         """
         Creates a new index.
@@ -815,6 +907,10 @@ class EnvectorClient:
             sec_key=sec_key,
             metadata_key=metadata_key,
             seal_kek=seal_kek,
+            key_store=key_store,
+            region_name=region_name,
+            bucket_name=bucket_name,
+            secret_prefix=secret_prefix,
         )
 
         return Index.create_index(indexer=self.indexer, index_config=index_config)

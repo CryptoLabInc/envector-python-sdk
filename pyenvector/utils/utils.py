@@ -9,12 +9,14 @@
 #  For licensing inquiries or permission requests, please contact: pypi@cryptolab.co.kr
 # ========================================================================================
 
+import base64
+import binascii
 import hashlib
 import heapq
 import json
 import os
 from pathlib import Path
-from typing import List, TypedDict, Union
+from typing import List, Optional, TypedDict, Union
 
 import evi
 from evi import SealInfo, SealMode
@@ -27,7 +29,7 @@ class Position(TypedDict):
     row_idx: int
 
 
-def is_empty_dir(path_str: str) -> None:
+def is_empty_dir(path_str: str) -> bool:
     p = Path(path_str).expanduser().resolve()
 
     if p.exists() and p.is_file():
@@ -62,60 +64,53 @@ def check_key_dir(key_path: str, key_id: str) -> bool:
         return False
 
     # Check for required files in the key_id directory
-    required_files = ["EncKey.bin", "EvalKey.bin"]
+    required_files = ["EncKey.json", "EvalKey.json"]
     for file_name in required_files:
         file_path = key_dir / file_name
         if not file_path.exists():
             return False
-    optional_files = ["SecKey.bin", "SecKey_sealed.bin"]
+    optional_files = ["SecKey.json"]
     if not any((key_dir / file_name).exists() for file_name in optional_files):
         return False
 
     return True
 
 
-def is_empty_key_metadata(key_path: str) -> bool:
-    """
-    Check if the key metadata file exists and is empty.
-
-    :param key_path: The path where the keys are stored.
-    :return: True if the metadata file does not exist or is empty, False otherwise.
-    """
-    metadata_file = Path(key_path) / "metadata.json"
-    if not metadata_file.exists():
-        return True
-    return metadata_file.stat().st_size == 0
+def _encode_blob(value):
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8")
+            return json.loads(decoded)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return base64.b64encode(value).decode("ascii")
+    return value
 
 
-def is_registered_key(key_id: str, key_path: str) -> bool:
-    """
-    Check if the key with the given key_id is registered in the specified key_path.
-
-    :param key_id: The ID of the key to check.
-    :param key_path: The path where the keys are stored.
-    :return: True if the key is registered, False otherwise.
-    """
-    return check_key_metadata(key_id, key_path)
+def _decode_blob(value):
+    if isinstance(value, str):
+        return base64.b64decode(value)
+    elif isinstance(value, (dict, list)):
+        return json.dumps(value).encode("utf-8")
+    return value
 
 
-def generate_metadata(
-    key_id: str,
-    key_path: str,
-):
-    metadata_file = Path(key_path) / "metadata.json"
+def _metadata_bytes_to_serializable(metadata_key_bytes: bytes):
+    try:
+        decoded = metadata_key_bytes.decode("utf-8")
+        return json.loads(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return base64.b64encode(metadata_key_bytes).decode("ascii")
 
-    if metadata_file.exists():
-        with open(metadata_file, "r") as f:
-            data = json.load(f)
-        if "registered_id" in data:
-            data["registered_id"].append(key_id)
-        else:
-            data["registered_id"] = [key_id]
-    else:
-        data = {"registered_id": [key_id]}
 
-    with open(metadata_file, "w") as f:
-        json.dump(data, f, indent=2)
+def _metadata_serializable_to_bytes(metadata_serializable):
+    if isinstance(metadata_serializable, (dict, list)):
+        return json.dumps(metadata_serializable).encode("utf-8")
+    if isinstance(metadata_serializable, str):
+        try:
+            return base64.b64decode(metadata_serializable)
+        except binascii.Error:
+            return metadata_serializable.encode("utf-8")
+    return metadata_serializable
 
 
 def check_key_metadata(key_id: str, key_path: str) -> bool:
@@ -184,88 +179,6 @@ def convert_to_search_type(preset):
         raise ValueError(f"Invalid type for search_type: {type(search_type)}.")
 
     return search_type
-
-
-def check_sec_key(key_dir: str, is_ip: bool = True):
-    """
-    Checks if the secret key file exists in the specified directory.
-
-    Args:
-        key_dir (str): The directory where the secret key file is expected.
-        is_ip (bool): If True, checks for 'SecKey.bin'; otherwise, checks for 'SecKeyD16.bin'.
-
-    Returns:
-        bool: True if the secret key file exists, False otherwise.
-    """
-    key_dir = Path(key_dir).expanduser().resolve()
-
-    if not key_dir.exists() or not key_dir.is_dir():
-        return False
-
-    sec_key_file = "SecKey.bin" if is_ip else "SecKeyD16.bin"
-    sec_key_path = key_dir / sec_key_file
-
-    return sec_key_path.exists()
-
-
-def check_enc_key(key_dir: str):
-    """
-    Checks if the encrypted key file exists in the specified directory.
-
-    Args:
-        key_dir (str): The directory where the encrypted key file is expected.
-
-    Returns:
-        bool: True if the encrypted key file exists, False otherwise.
-    """
-    key_dir = Path(key_dir).expanduser().resolve()
-
-    if not key_dir.exists() or not key_dir.is_dir():
-        return False
-
-    enc_key_file = "EncKey.bin"
-    enc_key_path = key_dir / enc_key_file
-
-    return enc_key_path.exists()
-
-
-def get_enc_key_path(key_dir: str):
-    """
-    Returns the path to the encrypted key file.
-
-    Args:
-        key_dir (str): The directory where the encrypted key file is expected.
-
-    Returns:
-        str: The full path to the encrypted key file.
-    """
-    key_dir = Path(key_dir).expanduser().resolve()
-
-    if not key_dir.exists() or not key_dir.is_dir():
-        raise FileNotFoundError(f"The directory {key_dir} does not exist or is not a directory.")
-
-    enc_key_file = "EncKey.bin"
-    return str(key_dir / enc_key_file)
-
-
-def get_sec_key_path(key_dir: str, is_ip: bool = True):
-    """
-    Returns the path to the secret key file based on the specified directory and type.
-
-    Args:
-        key_dir (str): The directory where the secret key file is expected.
-        is_ip (bool): If True, returns the path for 'SecKey.bin'; otherwise, returns the path for 'SecKeyD16.bin'.
-
-    Returns:
-        str: The full path to the secret key file.
-    """
-    key_dir = Path(key_dir).expanduser().resolve()
-
-    if not key_dir.exists() or not key_dir.is_dir():
-        raise FileNotFoundError(f"The directory {key_dir} does not exist or is not a directory.")
-
-    sec_key_file = "SecKey.bin" if is_ip else "SecKeyD16.bin"
-    return str(key_dir / sec_key_file)
 
 
 def _get_seal_info(seal_mode, seal_kek_path):
@@ -343,25 +256,96 @@ def get_seal_kek() -> Union[bytes, None]:
     return bytes(kek, "utf-8") if kek is not None else None
 
 
-def get_key_stream(key_path: str) -> bytes:
+_EVI_KEY_MANAGER: Optional["evi.KeyManager"] = None
+
+
+def _get_evi_key_manager():
+    global _EVI_KEY_MANAGER
+    if _EVI_KEY_MANAGER is None:
+        _EVI_KEY_MANAGER = evi.KeyManager()
+    return _EVI_KEY_MANAGER
+
+
+def _load_wrapped_metadata_key(raw_bytes: bytes):
+    payload = json.loads(raw_bytes.decode("utf-8"))
+    serialized = payload.get("metadata_blob", payload)
+    return _metadata_serializable_to_bytes(serialized)
+
+
+def _unwrap_key_dict_payload(payload: dict) -> bytes:
+    metadata_blob = payload.get("metadata_blob")
+    if metadata_blob is not None:
+        return _metadata_serializable_to_bytes(metadata_blob)
+    raw_bytes = json.dumps(payload).encode("utf-8")
+    km = _get_evi_key_manager()
+    for unwrap in (km.unwrap_sec_key_bytes, km.unwrap_enc_key_bytes, km.unwrap_eval_key_bytes):
+        try:
+            return unwrap(raw_bytes)
+        except Exception:
+            continue
+    raise ValueError("Unsupported JSON key payload.")
+
+
+def _load_wrapped_key_from_json(path: Path) -> bytes:
+    raw_bytes = path.read_bytes()
+    filename = path.name.lower()
+    if filename.endswith("metadatakey.json"):
+        return _load_wrapped_metadata_key(raw_bytes)
+    km = _get_evi_key_manager()
+    if filename.endswith("seckey.json"):
+        return km.unwrap_sec_key_bytes(raw_bytes)
+    if filename.endswith("enckey.json"):
+        return km.unwrap_enc_key_bytes(raw_bytes)
+    if filename.endswith("evalkey.json"):
+        return km.unwrap_eval_key_bytes(raw_bytes)
+    raise ValueError(f"Unsupported key file: {path}")
+
+
+def get_key_stream(key_path: Union[str, bytes, dict]) -> bytes:
     """
-    Reads and returns the bytes of the key file at the specified path.
+    Reads and returns the bytes of the key file or key stream.
 
     Args:
-        key_path (str): The path to the key file.
+        key_path (Union[str, bytes]): The key source.
     Returns:
-        bytes: The bytes of the key file.
+        bytes: The bytes of the key file or provided data.
     """
-    if isinstance(key_path, str):
-        if not key_path.endswith(".bin"):
-            import ast
-
-            key_bytes = ast.literal_eval(key_path)
+    if isinstance(key_path, dict):
+        key_bytes = _unwrap_key_dict_payload(key_path)
+    elif isinstance(key_path, (bytes, bytearray)):
+        key_bytes = bytes(key_path)
+    elif isinstance(key_path, str):
+        potential_path = Path(key_path).expanduser()
+        if potential_path.exists():
+            if potential_path.suffix == ".bin":
+                key_bytes = potential_path.read_bytes()
+            elif potential_path.suffix == ".json":
+                key_bytes = _load_wrapped_key_from_json(potential_path)
+            else:
+                with open(potential_path, "rb") as key_file:
+                    key_bytes = key_file.read()
         else:
-            with open(key_path, "rb") as key_file:
-                key_bytes = key_file.read()
-    elif isinstance(key_path, bytes):
-        key_bytes = key_path
+            stripped = key_path.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    data = json.loads(stripped)
+                except json.JSONDecodeError:
+                    raw_bytes = stripped.encode("utf-8")
+                else:
+                    return _unwrap_key_dict_payload(data)
+                km = _get_evi_key_manager()
+                for unwrap in (km.unwrap_sec_key_bytes, km.unwrap_enc_key_bytes, km.unwrap_eval_key_bytes):
+                    try:
+                        key_bytes = unwrap(raw_bytes)
+                        break
+                    except Exception:
+                        continue
+                else:
+                    raise ValueError("Unsupported JSON key payload.")
+            else:
+                import ast
+
+                key_bytes = ast.literal_eval(key_path)
     else:
         raise TypeError("key_path must be a file path (str) or bytes")
     return key_bytes

@@ -11,5 +11,5 @@
 
 from pyenvector.crypto.block import CipherBlock
 from pyenvector.crypto.cipher import Cipher
-from pyenvector.crypto.key_manager import KeyGenerator
+from pyenvector.crypto.key_manager import KeyGenerator, KeyManager
 from pyenvector.crypto.parameter import ContextParameter, EncodingType

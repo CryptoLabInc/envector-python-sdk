@@ -66,7 +66,7 @@ def main(args):
     search_index = ev.Index(index_name)
     query = [vectors[0]]
     score_ctxt = search_index.scoring(query)[0]
-    dec_score = search_index.decrypt_score(score_ctxt, sec_key_path="./keys/test-key/SecKey.bin")
+    dec_score = search_index.decrypt_score(score_ctxt, sec_key_path="./keys/test-key/SecKey.json")
     output_metadata = search_index.get_topk_metadata_results(dec_score, top_k=2, output_fields=["metadata"])
     print("\nTest PC Search")
     print(output_metadata)
