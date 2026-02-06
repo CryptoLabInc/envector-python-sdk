@@ -1194,37 +1194,139 @@ class Index:
     def search(
         self,
         query: Union[List[float], np.ndarray, List[List[float]], List[np.ndarray], List[CipherBlock]],
-        top_k: int,
+        top_k: int = None,
         output_fields: List[str] = None,
         search_params: dict = None,
+        decrypt: bool = True,
     ):
         """
         Searches the index.
+
+        When ``decrypt=True`` (default), runs the full pipeline: scoring →
+        decryption → top-k → metadata retrieval.  When ``decrypt=False``,
+        returns serialized encrypted score blobs that can be forwarded to
+        Vault(Separated Key Management System) for secure decryption.
 
         Parameters
         ----------
         query : list of float or np.ndarray
             Query vector.
         top_k : int, optional
-            Number of top results to return (default 3).
+            Number of top results to return. Required when ``decrypt=True``.
         output_fields : list of str, optional
             Fields to include in the output.
+        search_params : dict, optional
+            Additional search-time parameters.
+        decrypt : bool, optional
+            If True (default), decrypt scores locally and return full results.
+            If False, return serialized encrypted blobs for Vault decryption.
+            ``top_k`` and ``output_fields`` are ignored in this case.
+
+        Returns
+        -------
+        list of dict  (when ``decrypt=True``)
+            Search results with id, score, and metadata.
+        list of bytes  (when ``decrypt=False``)
+            Serialized encrypted blobs (one per query).
+            Each blob can be base64-encoded and sent to Vault's
+            ``decrypt_search_results()`` tool.
+
+        Examples
+        --------
+        >>> # Full pipeline (default)
+        >>> query = [0.001, 0.02, 0.03, ..., 0.127]
+        >>> results = index.search(query=query, top_k=3, output_fields=["metadata"])
+        >>> print(results)
+        >>>
+        >>> # Vault mode: get encrypted blobs
+        >>> import base64
+        >>> blobs = index.search(query=query, decrypt=False)
+        >>> blob_b64 = base64.b64encode(blobs[0]).decode()
+        """
+        result_ctxt_list = self.scoring(query, search_params=search_params)
+
+        if not decrypt:
+            return [ctxt.serialize() for ctxt in result_ctxt_list]
+
+        if top_k is None:
+            raise ValueError("top_k is required when decrypt=True")
+
+        result_list = [self.decrypt_score(result_ctxt) for result_ctxt in result_ctxt_list]
+        output_result_list = self._multiquery_get_topk_metadata_results(result_list, top_k, output_fields)
+        return output_result_list
+
+    def get_metadata_by_indices(
+        self,
+        indices: List[dict],
+        output_fields: List[str] = None,
+        scores: List[float] = None,
+    ) -> List[dict]:
+        """
+        Fetches metadata for specific vector indices returned by Vault
+        after decryption and top-k selection.
+
+        This method is the second half of the split search pipeline:
+        1. search_encrypted() → encrypted blobs
+        2. [Vault decrypts and returns top-k indices]
+        3. get_metadata_by_indices() → metadata (this method)
+
+        Parameters
+        ----------
+        indices : list of dict
+            List of position dicts from Vault's top-k response.
+            Each dict should have:
+            - "index": int (flat index within the shard/partition)
+            - "score": float (decrypted similarity score)
+            Optionally:
+            - "shard_idx": int (shard/partition index, default 0)
+
+        output_fields : list of str, optional
+            Metadata fields to include in the output (default: all).
+
+        scores : list of float, optional
+            Decrypted scores corresponding to each index.
+            If not provided, scores from the indices dicts are used.
 
         Returns
         -------
         list of dict
-            Search results.
+            List of results with keys: "id", "score", "metadata".
 
         Examples
         --------
-        >>> query = [0.001, 0.02, ..., 0.127]
-        >>> results = index.search(query=query, top_k=3, output_fields=["metadata"])
-        >>> print(results)
+        >>> # After Vault returns decrypted top-k indices
+        >>> vault_results = [{"index": 42, "score": 0.95}, {"index": 7, "score": 0.87}]
+        >>> metadata = index.get_metadata_by_indices(vault_results, output_fields=["metadata"])
         """
-        result_ctxt_list = self.scoring(query, search_params=search_params)
-        result_list = [self.decrypt_score(result_ctxt) for result_ctxt in result_ctxt_list]
-        output_result_list = self._multiquery_get_topk_metadata_results(result_list, top_k, output_fields)
-        return output_result_list
+        # Convert Vault's index format to SDK's Position format
+        position_list = []
+        score_list = []
+        for i, item in enumerate(indices):
+            position = {
+                "shard_idx": item.get("shard_idx", 0),
+                "row_idx": item.get("index", item.get("row_idx", 0)),
+            }
+            position_list.append(position)
+            if scores:
+                score_list.append(scores[i])
+            else:
+                score_list.append(item.get("score", 0.0))
+
+        # Fetch metadata from server
+        metadata_result = self.indexer.get_metadata(
+            self.index_config.index_name, position_list, fields=output_fields
+        )
+
+        # Build output results
+        output = []
+        for i, meta in enumerate(metadata_result):
+            output.append({
+                "id": meta.id,
+                "score": score_list[i] if i < len(score_list) else 0.0,
+                "metadata": self._decrypt_metadata(meta.data),
+            })
+
+        return output
 
     def scoring(
         self,
