@@ -4,8 +4,9 @@ import os
 import numpy as np
 
 from pyenvector.crypto import Cipher, KeyGenerator
+from pyenvector.utils import utils
 
-PRESET = "ip"  # Preset for the context
+PRESET = "ip1"  # Preset for the context
 DIM = 512  # Dimension for the context
 
 
@@ -24,10 +25,10 @@ def get_random_vector(dim, seed=None):
     return vec
 
 
-def main(args):
+def _run_example(eval_mode: str):
     # Key Path
     key_path = "./keys"
-    key_id = "test-key-mm" if args.eval_mode.upper() == "MM" else "test-key"
+    key_id = "test-key-mm" if eval_mode.upper() == "MM" else "test-key"
     key_dir = f"{key_path}/{key_id}"
 
     # Skip key generation if keys already exist
@@ -35,7 +36,7 @@ def main(args):
         print(f"Keys already exist in {key_dir}. Skipping key generation.")
     else:
         # Generate keys
-        keygen = KeyGenerator(key_dir, eval_mode=args.eval_mode)
+        keygen = KeyGenerator(key_dir, eval_mode=eval_mode)
         keygen.generate_keys()
 
     # Generate random vector
@@ -44,26 +45,34 @@ def main(args):
     vectors = [get_random_vector(DIM, seed=seed + i) for i in range(num_data)]
 
     # Encrypt vector
-    cipher = Cipher(dim=DIM, preset=PRESET, eval_mode=args.eval_mode)
+    enc_key_path = f"{key_dir}/EncKey.json"
     sec_key_path = f"{key_dir}/SecKey.json"
+    cipher = Cipher(dim=DIM, preset=PRESET, eval_mode=eval_mode, enc_key_path=enc_key_path, sec_key_path=sec_key_path)
+    sec_key_stream = utils.get_key_stream(sec_key_path)
 
-    db_ctxt = [cipher.encrypt(vec, "item", key_dir + "/EncKey.json") for vec in vectors]
+    single_ctxt = cipher.encrypt_multiple([vectors[0]], "item")
     print("Vector encrypted successfully.")
 
     print(f"Get plaintext vector: first 10:\n  {vectors[0][0:10]}")
-    print(f"Get Serialized CipherText: first 100 bytes:\n  {db_ctxt[0].serialize()[0:100]}")
-    print(f"Get Decrypted Vector: first 10:\n  {cipher.decrypt(db_ctxt[0], sec_key_path=sec_key_path)[0:10]}")
+    print(f"Get Serialized CipherText: first 100 bytes:\n  {single_ctxt.serialize()[0:100]}")
+    dec_single = cipher.decryptor.decrypt(single_ctxt.data[0], sec_key=sec_key_stream)
+    print(f"Get Decrypted Vector: first 10:\n  {dec_single[0:10]}")
 
-    bulk_db_ctxt = cipher.encrypt_multiple(vectors, "item", key_dir + "/EncKey.json")
+    bulk_db_ctxt = cipher.encrypt_multiple(vectors, "item")
     print("Bulk vector encrypted successfully.")
 
     print(f"Get plaintext vector: first 10:\n  {vectors[0][0:10]}")
     print(f"Get Serialized CipherText: first 100 bytes:\n  {bulk_db_ctxt.serialize()[0:100]}")
-    print(f"Get Decrypted Vector: first 10:\n  {cipher.decrypt(bulk_db_ctxt, sec_key_path=sec_key_path)[0:10]}")
+    dec_bulk = cipher.decryptor.decrypt(bulk_db_ctxt.data[0], sec_key=sec_key_stream)
+    print(f"Get Decrypted Vector: first 10:\n  {dec_bulk[0:10]}")
+
+
+def main(args):
+    _run_example(args.eval_mode)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="enVector Encryption/Decryption Example")
-    parser.add_argument("--eval_mode", type=str, default="RMP", help="Evaluation mode (RMP or MM)")
+    parser.add_argument("--eval_mode", type=str, choices=["mm32"], default="mm32", help="Evaluation mode (MM32)")
     args = parser.parse_args()
     main(args)

@@ -28,15 +28,15 @@ class Context:
     Parameters
     ----------
     preset : str
-        The parameter preset to use for the context. Currently, only "ip" is supported.
+        The parameter preset to use for the context. Currently, only "ip1" is supported.
     dim : int
         The dimension of the context, which should be a power of 2 (e.g., 32, 64, ..., 4096).
     eval_mode : str, optional
-        The evaluation mode for the context. Defaults to "RMP".
+        The evaluation mode for the context. Defaults to "MM".
 
     Example
     --------
-    >>> context = Context("ip", dim=128)
+    >>> context = Context("ip1", dim=128)
     """
 
     def __init__(self, preset: str, dim: int, eval_mode: Optional[str] = None):
@@ -108,7 +108,7 @@ class Context:
         Returns the evaluation mode for the context.
 
         Returns:
-            str: The evaluation mode, either NONE, MS, RMP, or RMS.
+            str: The evaluation mode, e.g., RMP or MM.
         """
         return self.parameter.eval_mode
 

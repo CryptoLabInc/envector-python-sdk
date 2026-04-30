@@ -28,7 +28,7 @@ import grpc
 # Connection Class
 ###################################
 
-MAX_MESSAGE_LENGTH = 1024 * 1024 * 100  # 10 MB
+MAX_MESSAGE_LENGTH = 1024 * 1024 * 1536  # 1.5 GB
 
 
 @contextlib.contextmanager

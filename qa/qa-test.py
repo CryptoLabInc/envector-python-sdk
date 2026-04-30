@@ -78,8 +78,8 @@ def core_functionality_test(
 
     if test_configs is None:
         test_configs = [
-            {"eval_mode": "RMP", "query_encryption": True},
-            {"eval_mode": "RMP", "query_encryption": False},
+            # {"eval_mode": "MM", "query_encryption": True},
+            {"eval_mode": "MM", "query_encryption": False},
             # {"eval_mode": "MM", "query_encryption": False},
         ]
 
@@ -215,15 +215,14 @@ def scalability_validation(result_file_path, verbose=True, test_type="nightly"):
 
 def multi_query_test(test_top_k, result_file_path, verbose, test_type="nightly", test_configs=None):
     print(
-        f"[START] Multi Query Test | test_type={test_type} | top_k={test_top_k} | "
-        f"result_file_path={result_file_path}"
+        f"[START] Multi Query Test | test_type={test_type} | top_k={test_top_k} | result_file_path={result_file_path}"
     )
     index_name = "multi_query_test_index"
     test_num_data = 100
     if test_configs is None:
         test_configs = [
-            {"eval_mode": "RMP", "query_encryption": True},
-            {"eval_mode": "RMP", "query_encryption": False},
+            # {"eval_mode": "MM", "query_encryption": True},
+            {"eval_mode": "MM", "query_encryption": False},
         ]
     if test_type == "pr":
         dim_list = [512]

@@ -10,5 +10,7 @@
 # ========================================================================================
 
 from pyenvector.utils.aws import AWSClient
+from pyenvector.utils.gcp import GCPClient
 from pyenvector.utils.logging_config import logger
 from pyenvector.utils.utils import topk
+from pyenvector.utils.vault import VaultClient

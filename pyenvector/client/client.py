@@ -28,15 +28,19 @@ Functions:
 import json
 import os
 import warnings
-from typing import Optional
+from typing import Callable, Optional, Union
 
 from pyenvector.api import Indexer
 from pyenvector.crypto import KeyGenerator
 from pyenvector.crypto.key_manager import KeyManager
 from pyenvector.crypto.parameter import ContextParameter, KeyParameter
+from pyenvector.errors import KeyManagementError
 from pyenvector.index import Index, IndexConfig
+from pyenvector.proto_gen.v2.common import type_pb2 as _type_pb2
 from pyenvector.utils import utils
 from pyenvector.utils.logging_config import logger
+
+AccessTokenInput = Optional[Union[str, Callable[[], Optional[str]]]]
 
 
 class _PrettyInfo(str):
@@ -72,6 +76,7 @@ class EnvectorClient:
         """
         self._indexer = None
         self._index_config = None
+        self._kms_client = None
 
     @property
     def indexer(self):
@@ -130,6 +135,16 @@ class EnvectorClient:
         return self
 
     @property
+    def kms_client(self):
+        """
+        Returns the KMS client, if configured.
+
+        Returns:
+            KMSClient or None: The KMS client instance.
+        """
+        return self._kms_client
+
+    @property
     def is_connected(self):
         """
         Checks if the EnvectorClient client is connected to the server.
@@ -143,11 +158,101 @@ class EnvectorClient:
         """
         Disconnects the EnvectorClient client from the server.
         """
+        if self._kms_client is not None:
+            self._kms_client.close()
+            self._kms_client = None
+            Index._default_kms_client = None
         if self.indexer:
             self.indexer.disconnect()
             logger.info("Disconnected from enVector server.")
         else:
             logger.warning("No active connection to disconnect.")
+
+    def _is_kms_managed_mode(self) -> bool:
+        return self._kms_client is not None
+
+    @staticmethod
+    def _is_recoverable_kms_duplicate_error(exc: KeyManagementError) -> bool:
+        if exc.return_code != _type_pb2.Fail:
+            return False
+
+        message = (getattr(exc, "message", "") or str(exc)).lower()
+        duplicate_markers = (
+            "already exists",
+            "already in progress",
+            "duplicate",
+            "in-progress",
+            "in progress",
+        )
+        return any(marker in message for marker in duplicate_markers)
+
+    def _sync_kms_public_keys(self, key_id: str) -> None:
+        if not self._is_kms_managed_mode():
+            return
+
+        key_manager = KeyManager()
+        key_changed = self.index_config.key_id not in (None, key_id)
+        enc_key = None if key_changed else self.index_config.enc_key
+        eval_key = None if key_changed else self.index_config.eval_key
+
+        if enc_key is None:
+            try:
+                enc_key = key_manager.unwrap_enc_key_bytes(self._kms_client.download_enc_key(key_id))
+            except Exception as exc:
+                raise KeyManagementError(f"Failed to unwrap EncKey for key_id={key_id!r}: {exc}") from exc
+        if eval_key is None:
+            try:
+                eval_key = key_manager.unwrap_eval_key_bytes(self._kms_client.download_eval_key(key_id))
+            except Exception as exc:
+                raise KeyManagementError(f"Failed to unwrap EvalKey for key_id={key_id!r}: {exc}") from exc
+
+        self.index_config = self.index_config.deepcopy(
+            key_id=key_id,
+            use_key_stream=True,
+            enc_key=enc_key,
+            eval_key=eval_key,
+            sec_key=None,
+            metadata_key=None,
+        )
+        Index._default_index_config = self.index_config
+
+    def _ensure_kms_key_ready(self, key_id: str) -> None:
+        if not self._is_kms_managed_mode():
+            return
+
+        try:
+            details = self._kms_client.get_key_details(key_id)
+        except KeyManagementError as exc:
+            logger.info("KMS key details lookup failed for key_id=%s (%s). Falling back to GenerateKey.", key_id, exc)
+            self.generate_key(key_id)
+            return
+
+        versions = details.get("versions", [])
+        if not versions:
+            logger.info("KMS key_id=%s does not exist yet. Generating managed key bundle.", key_id)
+            self.generate_key(key_id)
+            return
+
+        status = self._kms_client.get_key_status(key_id)
+        status_str = str(status.get("status", ""))
+        if "READY" in status_str:
+            logger.info("KMS key_id=%s is READY. Downloading public keys.", key_id)
+            self._sync_kms_public_keys(key_id)
+            return
+        if "PENDING" in status_str:
+            logger.info("KMS key_id=%s is PENDING. Waiting for READY before downloading public keys.", key_id)
+            self._kms_client.wait_for_key(key_id)
+            self._sync_kms_public_keys(key_id)
+            return
+        if "FAILED" in status_str:
+            raise KeyManagementError(f"KMS key generation failed for {key_id}: {status}")
+
+        logger.info(
+            "KMS key_id=%s returned unexpected status=%s with existing versions. Downloading public keys.",
+            key_id,
+            status_str,
+        )
+        self._sync_kms_public_keys(key_id)
 
     def register_key(
         self,
@@ -166,29 +271,33 @@ class EnvectorClient:
             key_id = self.index_config.key_id
         if key_id is not None:
             self.index_config.key_id = key_id
-        if self.index_config.use_key_stream or self.index_config.key_param.check_key_dir():
-            logger.info(
-                f"Keys in {self.index_config.key_path} with key_id: {self.index_config.key_id} "
-                f"already exists. Checking for registered keys."
-            )
-            key_list = self.indexer.get_key_list()
-            if key_list and self.index_config.key_id in key_list:
-                logger.info(f"Key {self.index_config.key_id} already registered in {self.index_config.key_path}.")
-            else:
-                logger.info(f"Registering key {self.index_config.key_id} from {self.index_config.key_path}.")
-                self.indexer.register_key(
-                    self.index_config.key_id,
-                    self.index_config.eval_key,
-                    key_type="EvalKey",
-                    preset=self.index_config.preset,
-                    eval_mode=self.index_config.eval_mode,
-                )
+
+        if self._is_kms_managed_mode():
+            self._sync_kms_public_keys(key_id)
+
+        if self._is_key_registered(key_id):
+            logger.info(f"Key {self.index_config.key_id} already registered in {self.index_config.key_path}.")
             return
+
+        if self.index_config.use_key_stream:
+            logger.info(f"Registering key {self.index_config.key_id} from in-memory key stream.")
         else:
-            raise ValueError(
-                f"Keys in {self.index_config.key_path} with key_id: {self.index_config.key_id} do not exist. "
-                "Please generate keys first."
-            )
+            key_dir_exists = self.index_config.key_param.check_key_dir(strict=True)
+            if not key_dir_exists:
+                raise ValueError(
+                    f"Keys in {self.index_config.key_path} with key_id: {self.index_config.key_id} do not exist. "
+                    "Please generate keys first."
+                )
+            logger.info(f"Registering key {self.index_config.key_id} from {self.index_config.key_path}.")
+
+        self.indexer.register_key(
+            self.index_config.key_id,
+            self.index_config.eval_key,
+            key_type="EvalKey",
+            preset=self.index_config.preset,
+            eval_mode=self.index_config.eval_mode,
+        )
+        return
 
     def load_key(self, key_id: Optional[str] = None):
         """
@@ -244,6 +353,20 @@ class EnvectorClient:
             key_id = self.index_config.key_id
         return self.indexer.get_key_info(key_id)
 
+    def _is_key_registered(self, key_id: Optional[str] = None) -> bool:
+        """
+        Helper to check whether the given key ID is already registered on the server.
+        """
+        if key_id is None:
+            key_id = self.index_config.key_id
+        if key_id is None or self.indexer is None:
+            return False
+        try:
+            key_list = self.indexer.get_key_list()
+        except Exception:
+            return False
+        return bool(key_list and key_id in key_list)
+
     def get_index_list(self):
         """
         Retrieves the list of registered index.
@@ -256,30 +379,65 @@ class EnvectorClient:
         """
         return self.indexer.get_index_list()
 
-    def generate_and_store_aws(self, key_id: Optional[str] = None):
+    def get_index_summary(self, index_name: str):
         """
-        Retrieves the key from AWS using KeyManager.
+        Retrieves lightweight summary information for a registered index.
 
         Args:
+            index_name (str): The target index name.
+
+        Returns:
+            dict: A dictionary containing summary index information.
+
+        Raises:
+            ValueError: If the indexer is not initialized.
+        """
+        return self.indexer.get_index_summary(index_name)
+
+    def clone_index(self, source_index_name: str, target_index_name: str):
+        """
+        Clone an existing index on the server.
+
+        Args:
+            source_index_name (str): The source index name.
+            target_index_name (str): The target index name to create.
+
+        Returns:
+            dict: A dictionary containing the source and target index names.
+
+        Raises:
+            ValueError: If the indexer is not initialized.
+        """
+        return self.indexer.clone_index(source_index_name, target_index_name)
+
+    def generate_and_store_remote(self, key_store: str, key_id: Optional[str] = None):
+        """
+        Retrieves the key from a remote key store using KeyManager.
+
+        Args:
+            key_store (str): Remote key store name ("aws" or "gcp" or "vault").
             key_id (str, optional): Override for ``index_config.key_id`` when retrieving the key.
         """
+        if key_store not in {"aws", "gcp", "vault"}:
+            raise ValueError(f"Unsupported key store '{key_store}'.")
         if key_id is not None:
             self.index_config.key_id = key_id
         km = KeyManager(
             key_id=self.index_config.key_id,
-            key_store="aws",
+            key_store=key_store,
             region_name=self.index_config.region_name,
             bucket_name=self.index_config.bucket_name,
             secret_prefix=self.index_config.secret_prefix,
+            vault_addr=self.index_config.vault_addr,
+            vault_mount=self.index_config.vault_mount,
         )
         if km.verify_key_id():
-            raise ValueError(f"Key ID {self.index_config.key_id} already exists in AWS.")
-        else:
-            keygen = KeyGenerator._create_from_parameter(
-                context_param=self.index_config.context_param, key_param=self.index_config.key_param
-            )
-            key_dict = keygen.generate_keys_stream()
-            km.save(key_dict)
+            raise ValueError(f"Key ID {self.index_config.key_id} already exists in {key_store.upper()}.")
+        keygen = KeyGenerator._create_from_parameter(
+            context_param=self.index_config.context_param, key_param=self.index_config.key_param
+        )
+        key_dict = keygen.generate_keys_stream()
+        km.save(key_dict)
         return key_dict
 
     @staticmethod
@@ -320,7 +478,46 @@ class EnvectorClient:
         """
         if key_id is not None:
             self.index_config.key_id = key_id
-        if self.index_config.key_param.check_key_dir() and not self.index_config.use_key_stream:
+        if self._is_kms_managed_mode():
+            logger.info("Generating KMS-managed key bundle for key_id=%s", self.index_config.key_id)
+            try:
+                ctx = self.index_config.context_param
+                result = self._kms_client.generate_key(
+                    self.index_config.key_id,
+                    metadata_encryption=self.index_config.metadata_encryption,
+                    preset=ctx.preset_name,
+                    eval_mode=ctx.eval_mode_name,
+                )
+                if "READY" not in str(result.get("status", "")):
+                    self._kms_client.wait_for_key(self.index_config.key_id)
+            except KeyManagementError as exc:
+                # Only treat duplicate or in-progress key generation as recoverable.
+                # A generic Fail return code can also mean a real server-side error.
+                if not self._is_recoverable_kms_duplicate_error(exc):
+                    raise
+                warnings.warn(
+                    f"KMS key_id '{self.index_config.key_id}' already exists. Reusing existing key material.",
+                    stacklevel=2,
+                )
+                try:
+                    status = self._kms_client.get_key_status(self.index_config.key_id)
+                    if "READY" not in str(status.get("status", "")):
+                        self._kms_client.wait_for_key(self.index_config.key_id)
+                except Exception:
+                    logger.info(
+                        "Duplicate KMS key_id=%s detected; proceeding to sync public keys without waiting.",
+                        self.index_config.key_id,
+                    )
+            self._sync_kms_public_keys(self.index_config.key_id)
+            return
+        if self._is_key_registered(self.index_config.key_id):
+            logger.info(
+                f"Key {self.index_config.key_id} already registered in server. Skipping key generation at "
+                f"{self.index_config.key_path}."
+            )
+            return
+        key_dir_exists = self.index_config.key_param.check_key_dir(strict=False)
+        if key_dir_exists and not self.index_config.use_key_stream:
             logger.info(
                 f"Keys in {self.index_config.key_path} with key_id: {self.index_config.key_id} "
                 f"already exists. Skipping key generation."
@@ -343,27 +540,29 @@ class EnvectorClient:
         """
         Generates and registers a key.
         """
-        if self.index_config.key_param.check_key_dir() or self.index_config.use_key_stream:
-            logger.info(
-                f"Keys in {self.index_config.key_path} with key_id: {self.index_config.key_id} "
-                f"already exists. Checking for existing keys."
-            )
-            key_list = self.indexer.get_key_list()
-            if key_list and self.index_config.key_id in key_list:
-                logger.info(f"Key {self.index_config.key_id} already registered in {self.index_config.key_path}.")
-                return
-            else:
-                logger.info(f"Registering key {self.index_config.key_id} from {self.index_config.key_path}.")
-                self.register_key()
+        key_registered = self._is_key_registered(self.index_config.key_id)
+        key_material_exists = self.index_config.use_key_stream or self.index_config.key_param.check_key_dir(
+            strict=False
+        )
+
+        if key_registered:
+            logger.info(f"Key {self.index_config.key_id} already registered in {self.index_config.key_path}.")
             return
 
-        else:
+        if key_material_exists:
             logger.info(
-                f"Generating keys in {self.index_config.key_path} with key_id: {self.index_config.key_id} "
-                f"using preset: {self.index_config.context_param}. "
+                f"Keys in {self.index_config.key_path} with key_id: {self.index_config.key_id} "
+                f"already exist locally. Registering key."
             )
-            self.generate_key()
             self.register_key()
+            return
+
+        logger.info(
+            f"Generating keys in {self.index_config.key_path} with key_id: {self.index_config.key_id} "
+            f"using preset: {self.index_config.context_param}. "
+        )
+        self.generate_key()
+        self.register_key()
 
     @property
     def context_param(self) -> "ContextParameter":
@@ -390,8 +589,14 @@ class EnvectorClient:
         host: Optional[str] = None,
         port: Optional[int] = None,
         address: Optional[str] = None,
-        access_token: Optional[str] = None,
+        access_token: AccessTokenInput = None,
         secure: Optional[bool] = None,
+        refresh_token: Optional[str] = None,
+        oidc_issuer: Optional[str] = None,
+        token_endpoint: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        scope: Optional[str] = None,
     ):
         """
         Initializes the connection to the enVector server.
@@ -400,9 +605,16 @@ class EnvectorClient:
             host (str, optional): The host address.
             port (int, optional): The port number.
             address (str, optional): The full address.
-            access_token (str, optional): The access token.
+            access_token (str or callable, optional): Bearer token string, or a callable returning
+                the current token for refreshable auth flows.
             secure (bool, optional): Whether to use a secure connection. If None,
-                (defaults to True when access_token is provided, otherwise False.)
+                (defaults to True when access_token or refresh_token is provided, otherwise False.)
+            refresh_token (str, optional): OIDC refresh token used by the SDK to renew bearer tokens.
+            oidc_issuer (str, optional): OIDC issuer URL used to discover the token endpoint.
+            token_endpoint (str, optional): Explicit token endpoint used for refresh token exchange.
+            client_id (str, optional): OIDC client ID for refresh token exchange.
+            client_secret (str, optional): OIDC client secret for refresh token exchange.
+            scope (str, optional): Optional scope value included in refresh requests.
 
         Returns:
             EnvectorClient: The initialized EnvectorClient object.
@@ -436,6 +648,12 @@ class EnvectorClient:
             address=address,
             access_token=access_token,
             secure=secure,
+            refresh_token=refresh_token,
+            oidc_issuer=oidc_issuer,
+            token_endpoint=token_endpoint,
+            client_id=client_id,
+            client_secret=client_secret,
+            scope=scope,
         )
         self.indexer = indexer
 
@@ -474,6 +692,8 @@ class EnvectorClient:
         region_name: Optional[str] = None,
         bucket_name: Optional[str] = None,
         secret_prefix: Optional[str] = None,
+        vault_addr: Optional[str] = None,
+        vault_mount: Optional[str] = None,
     ):
         """
         Initializes the index configuration.
@@ -493,7 +713,7 @@ class EnvectorClient:
             e.g. "plain", "cipher", "hybrid". Defaults to None.
             index_params (dict, optional): The parameters for the index. Defaults to None.
             index_type (str, optional): The type of index.
-            Currently, ``flat`` and ``ivf_flat`` index types are supported.
+            Currently, ``flat``, ``ivf_flat`` and ``ivf_vct`` index types are supported.
             metadata_encryption (bool, optional): The encryption type for metadata,
             e.g. True, False. Defaults to None.
             description (str, optional): A human-readable description for the index.
@@ -511,7 +731,7 @@ class EnvectorClient:
                 >>> pyenvector_client.init_index_config(
                 ...     key_path="./keys",
                 ...     key_id="example_key",
-                ...     preset="ip",
+                ...     preset="ip1",
                 ...     query_encryption="plain",
                 ...     index_encryption="cipher",
                 ...     index_params={"index_type": "flat"}
@@ -521,9 +741,12 @@ class EnvectorClient:
         """
         auto_key_setup = True if auto_key_setup is None else auto_key_setup
         _generate_keys_stream_required = False
+        kms_managed_mode = self._is_kms_managed_mode()
         if key_path is None:
             use_key_stream = True
-            if key_store == "aws":
+            if kms_managed_mode:
+                pass
+            elif key_store in {"aws", "gcp", "vault"}:
                 if (
                     enc_key is None
                     or eval_key is None
@@ -536,11 +759,13 @@ class EnvectorClient:
                         region_name=region_name,
                         bucket_name=bucket_name,
                         secret_prefix=secret_prefix,
+                        vault_addr=vault_addr,
+                        vault_mount=vault_mount,
                     )
                     if not km.verify_key_id():
                         _generate_keys_stream_required = True
                     else:
-                        key_dict = km.load_from_aws()
+                        key_dict = km.load()
                         enc_key, eval_key, sec_key, metadata_key = self._extract_key_streams(key_dict)
             elif auto_key_setup:
                 if enc_key is None:
@@ -629,12 +854,21 @@ class EnvectorClient:
             region_name=region_name,
             bucket_name=bucket_name,
             secret_prefix=secret_prefix,
+            vault_addr=vault_addr,
+            vault_mount=vault_mount,
         )
         if auto_key_setup:
             if self.index_config.key_id is None:
                 raise ValueError("Key ID must be provided to generate a key.")
             elif _generate_keys_stream_required:
-                key_dict = self.generate_and_store_aws(key_id=self.index_config.key_id)
+                if self.index_config.key_store == "aws":
+                    key_dict = self.generate_and_store_remote("aws", key_id=self.index_config.key_id)
+                elif self.index_config.key_store == "gcp":
+                    key_dict = self.generate_and_store_remote("gcp", key_id=self.index_config.key_id)
+                elif self.index_config.key_store == "vault":
+                    key_dict = self.generate_and_store_remote("vault", key_id=self.index_config.key_id)
+                else:
+                    raise ValueError(f"Unsupported key store: {self.index_config.key_store}")
                 enc_key, eval_key, sec_key, metadata_key = self._extract_key_streams(key_dict)
                 self.index_config = self.index_config.deepcopy(
                     enc_key=enc_key,
@@ -642,6 +876,8 @@ class EnvectorClient:
                     sec_key=sec_key,
                     metadata_key=metadata_key,
                 )
+            elif kms_managed_mode:
+                self._ensure_kms_key_ready(self.index_config.key_id)
             elif not use_key_stream:
                 self.generate_key()
             self.register_key()
@@ -659,8 +895,14 @@ class EnvectorClient:
         host: Optional[str] = None,
         port: Optional[int] = None,
         address: Optional[str] = None,
-        access_token: Optional[str] = None,
+        access_token: AccessTokenInput = None,
         secure: Optional[bool] = None,
+        refresh_token: Optional[str] = None,
+        oidc_issuer: Optional[str] = None,
+        token_endpoint: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        scope: Optional[str] = None,
         index_name: Optional[str] = None,
         dim: Optional[int] = None,
         key_path: Optional[str] = None,
@@ -686,6 +928,9 @@ class EnvectorClient:
         region_name: Optional[str] = None,
         bucket_name: Optional[str] = None,
         secret_prefix: Optional[str] = None,
+        vault_addr: Optional[str] = None,
+        vault_mount: Optional[str] = None,
+        kms_address: Optional[str] = None,
     ):
         """
         Initializes the EnvectorClient environment (connection, key, and index config).
@@ -698,11 +943,24 @@ class EnvectorClient:
             The port number to connect to enVector server.
         address : str, optional
             The full address to connect to enVector server.
-        access_token : str, optional
-            The access token to connect to enVector server.
+        access_token : str or callable, optional
+            Bearer token string, or a callable returning the current token to connect to enVector
+            server.
         secure : bool, optional
             Whether to use a secure connection. If None, defaults to True when access_token is
-            provided, otherwise False.
+            provided or refresh_token is configured, otherwise False.
+        refresh_token : str, optional
+            OIDC refresh token used by the SDK to renew bearer tokens.
+        oidc_issuer : str, optional
+            OIDC issuer URL used to discover the token endpoint.
+        token_endpoint : str, optional
+            Explicit token endpoint used for refresh token exchange.
+        client_id : str, optional
+            OIDC client ID for refresh token exchange.
+        client_secret : str, optional
+            OIDC client secret for refresh token exchange.
+        scope : str, optional
+            Optional scope value included in refresh requests.
         index_name : str, optional
             The name of the index.
         dim : int, optional
@@ -727,10 +985,10 @@ class EnvectorClient:
             The encryption type for database, e.g. "plain", "cipher", "hybrid". Defaults to ``cipher``.
         index_params : dict, optional
             The parameters for the index. Defaults to {"index_type": "flat"}.
-            Currently, ``flat`` and ``ivf_flat`` index types are supported.
+            Currently, ``flat``, ``ivf_flat`` and ``ivf_vct`` index types are supported.
         index_type : str, optional
             The type of index.
-            Currently, ``flat`` and ``ivf_flat`` index types are supported.
+            Currently, ``flat``, ``ivf_flat`` and ``ivf_vct`` index types are supported.
         metadata_encryption : bool, optional
             The encryption type for metadata, e.g. True, False. Defaults to None.
         description : str, optional
@@ -748,6 +1006,10 @@ class EnvectorClient:
         metadata_key : bytes, optional
             Metadata encryption key bytes used when ``metadata_encryption`` is True and
             ``use_key_stream`` is enabled.
+        kms_address : str, optional
+            ``host:port`` of the KMS combined service (gRPC). When provided,
+            the KMS client is activated for key generation, secret management,
+            and TopK operations.
 
         Returns
         -------
@@ -779,7 +1041,42 @@ class EnvectorClient:
             address=address,
             access_token=access_token,
             secure=secure,
+            refresh_token=refresh_token,
+            oidc_issuer=oidc_issuer,
+            token_endpoint=token_endpoint,
+            client_id=client_id,
+            client_secret=client_secret,
+            scope=scope,
         )
+        if kms_address is not None:
+            from pyenvector.kms.client import KMSClient
+
+            kms_secure = bool(secure) if secure is not None else False
+            reuse_kms_client = (
+                self._kms_client is not None
+                and self._kms_client._address == kms_address
+                and self._kms_client._secure == kms_secure
+                and self._kms_client._access_token == access_token
+            )
+            if not reuse_kms_client:
+                if self._kms_client is not None:
+                    self._kms_client.close()
+                self._kms_client = KMSClient(
+                    address=kms_address,
+                    secure=kms_secure,
+                    access_token=access_token,
+                )
+            Index._default_kms_client = self._kms_client
+            logger.info(
+                "KMS client %s (kms_address=%s)",
+                "reused" if reuse_kms_client else "initialized",
+                kms_address,
+            )
+        else:
+            if self._kms_client is not None:
+                self._kms_client.close()
+                self._kms_client = None
+            Index._default_kms_client = None
         Index.init_key_path(key_path)
         self.init_index_config(
             index_name=index_name,
@@ -807,7 +1104,10 @@ class EnvectorClient:
             region_name=region_name,
             bucket_name=bucket_name,
             secret_prefix=secret_prefix,
+            vault_addr=vault_addr,
+            vault_mount=vault_mount,
         )
+
         return self
 
     def create_index(
@@ -836,6 +1136,8 @@ class EnvectorClient:
         region_name: Optional[str] = None,
         bucket_name: Optional[str] = None,
         secret_prefix: Optional[str] = None,
+        vault_addr: Optional[str] = None,
+        vault_mount: Optional[str] = None,
     ):
         """
         Creates a new index.
@@ -875,14 +1177,14 @@ class EnvectorClient:
                 ...     port=50050,
                 ...     key_path="./keys",
                 ...     key_id="example_key",
-                ...     preset="ip",
+                ...     preset="ip1",
                 ...     query_encryption="plain",
                 ...     index_encryption="cipher",
                 ...     index_params={"index_type": "flat"}
                 ... )
                 >>> index = pyenvector_client.create_index(
                 ...     index_name="test_index",
-                ...     dim=128
+                ...     dim=128,
                 ... )
         """
         if index_type is not None and not index_params:
@@ -911,6 +1213,8 @@ class EnvectorClient:
             region_name=region_name,
             bucket_name=bucket_name,
             secret_prefix=secret_prefix,
+            vault_addr=vault_addr,
+            vault_mount=vault_mount,
         )
 
         return Index.create_index(indexer=self.indexer, index_config=index_config)
@@ -1458,7 +1762,7 @@ class EnvectorClient:
             return info
         for index_name in index_names or []:
             try:
-                info["registered"].append(self._indexer.get_index_info(index_name))
+                info["registered"].append(self._indexer.get_index_summary(index_name))
             except Exception as exc:
                 info["registered"].append({"index_name": index_name, "error": str(exc)})
         info["registered_count"] = len(info["registered"])
@@ -1496,7 +1800,12 @@ class EnvectorClient:
 
     def reset(self):
         """
-        Resets the EnvectorClient by deleting all index and registered key in Server.
+        Reset the enVector server state for this client session.
+
+        This helper performs a best-effort cleanup by:
+        1) Dropping all indexes
+        2) Unloading keys (best-effort; may be a no-op)
+        3) Deleting keys
 
         Returns:
             EnvectorClient: The reset EnvectorClient object.
@@ -1508,8 +1817,12 @@ class EnvectorClient:
             for index_name in index_list:
                 self.drop_index(index_name)
         if key_list:
-            logger.info(f"Keys {key_list} will be deleted.")
+            logger.info(f"Keys {key_list} will be unloaded and deleted.")
             for key_id in key_list:
+                try:
+                    self.unload_key(key_id=key_id)
+                except Exception as e:
+                    logger.debug(f"Failed to unload key '{key_id}' during reset (best-effort): {e}")
                 self.delete_key(key_id)
         self._indexer = None
         self._index_config = None
@@ -1543,11 +1856,23 @@ def init_connect(*args, **kwargs):
         The port number to connect to enVector server.
     address : str, optional
         The full address (overrides host/port) to connect to enVector server.
-    access_token : str, optional
-        The access token to connect to enVector server.
+    access_token : str or callable, optional
+        Bearer token string, or a callable returning the current token to connect to enVector server.
     secure : bool, optional
-        Whether to use a secure connection. If None, defaults to True when access_token is provided,
-        otherwise False.
+        Whether to use a secure connection. If None, defaults to True when access_token is provided
+        or refresh_token is configured, otherwise False.
+    refresh_token : str, optional
+        OIDC refresh token used by the SDK to renew bearer tokens.
+    oidc_issuer : str, optional
+        OIDC issuer URL used to discover the token endpoint.
+    token_endpoint : str, optional
+        Explicit token endpoint used for refresh token exchange.
+    client_id : str, optional
+        OIDC client ID for refresh token exchange.
+    client_secret : str, optional
+        OIDC client secret for refresh token exchange.
+    scope : str, optional
+        Optional scope value included in refresh requests.
 
     Returns
     -------
@@ -1681,11 +2006,23 @@ def init(*args, **kwargs):
         The port number to connect to enVector server.
     address : str, optional
         The full address to connect to enVector server.
-    access_token : str, optional
-        The access token to connect to enVector server.
+    access_token : str or callable, optional
+        Bearer token string, or a callable returning the current token to connect to enVector server.
     secure : bool, optional
-        Whether to use a secure connection. If None, defaults to True when access_token is provided,
-        otherwise False.
+        Whether to use a secure connection. If None, defaults to True when access_token is provided
+        or refresh_token is configured, otherwise False.
+    refresh_token : str, optional
+        OIDC refresh token used by the SDK to renew bearer tokens.
+    oidc_issuer : str, optional
+        OIDC issuer URL used to discover the token endpoint.
+    token_endpoint : str, optional
+        Explicit token endpoint used for refresh token exchange.
+    client_id : str, optional
+        OIDC client ID for refresh token exchange.
+    client_secret : str, optional
+        OIDC client secret for refresh token exchange.
+    scope : str, optional
+        Optional scope value included in refresh requests.
     index_name : str, optional
         The name of the index.
     dim : int, optional
@@ -1728,6 +2065,9 @@ def init(*args, **kwargs):
         Metadata key bytes when ``use_key_stream`` is enabled.
     auto_key_setup : bool, optional
         Whether to automatically generate and register the key. Defaults to ``True``.
+    kms_address : str, optional
+        ``host:port`` of the KMS combined service (gRPC). When provided,
+        the KMS client is activated.
 
     Returns
     -------
@@ -1943,6 +2283,42 @@ def get_index_info(index_name: str):
         A dictionary containing index information.
     """
     return pyenvector_client.indexer.get_index_info(index_name)
+
+
+def get_index_summary(index_name: str):
+    """
+    Retrieve lightweight summary information of the registered index.
+
+    Parameters
+    ----------
+    index_name : str
+        The name of the index.
+
+    Returns
+    -------
+    dict
+        A dictionary containing summary index information.
+    """
+    return pyenvector_client.get_index_summary(index_name)
+
+
+def clone_index(source_index_name: str, target_index_name: str):
+    """
+    Clone a registered index.
+
+    Parameters
+    ----------
+    source_index_name : str
+        The source index name.
+    target_index_name : str
+        The target index name to create.
+
+    Returns
+    -------
+    dict
+        A dictionary containing the source and target index names.
+    """
+    return pyenvector_client.clone_index(source_index_name, target_index_name)
 
 
 def load_key(key_id: str):

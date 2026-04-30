@@ -14,6 +14,8 @@ from __future__ import annotations
 import re
 from typing import Optional, Tuple
 
+HOTFIX_COMPAT_MIN_VERSION = (1, 2, 0)
+
 
 def parse_version(version: Optional[str]) -> Optional[Tuple[int, int, int, Optional[str], Optional[int]]]:
     """
@@ -91,7 +93,49 @@ def is_equal(v1: Optional[str], v2: Optional[str]) -> bool:
 
 
 def should_check(server_version: Optional[str]) -> bool:
-    """Return True only if server version explicitly starts with 'v' or 'V'."""
+    """
+    Return True only if server version explicitly starts with a semver core.
+
+    Accepted examples:
+    - v1.2.3
+    - V1.2.3-rc.1
+    - v1.2.3rc1
+    - 1.2.3
+    - 1.2.3-rc.1
+    - 1.2.3rc1
+    """
     if not server_version:
         return False
-    return server_version.strip().lower().startswith("v")
+    v = server_version.strip()
+    # Must start with X.Y.Z or vX.Y.Z (case-insensitive) and must not continue with another '.' digit segment.
+    return re.match(r"(?i)^v?\d+\.\d+\.\d+(?!\.\d)", v) is not None
+
+
+def is_hotfix_compatible(
+    sdk_version: Optional[str],
+    server_version: Optional[str],
+    min_version: Tuple[int, int, int] = HOTFIX_COMPAT_MIN_VERSION,
+) -> bool:
+    """
+    Return True if sdk/server are considered compatible via hotfix policy.
+
+    Hotfix compatibility rules:
+    - Both versions must parse successfully and have no pre-release tags.
+    - Both must be >= ``min_version`` (default v1.2.0).
+    - Major/minor numbers must match; patch may differ.
+    """
+    sdk = parse_version(sdk_version)
+    server = parse_version(server_version)
+    if not sdk or not server:
+        return False
+    sdk_major, sdk_minor, sdk_patch, sdk_pre, _ = sdk
+    server_major, server_minor, server_patch, server_pre, _ = server
+    if sdk_pre or server_pre:
+        return False
+    sdk_sem = (sdk_major, sdk_minor, sdk_patch)
+    server_sem = (server_major, server_minor, server_patch)
+    if sdk_sem < min_version or server_sem < min_version:
+        return False
+    if sdk_major != server_major or sdk_minor != server_minor:
+        return False
+    return True

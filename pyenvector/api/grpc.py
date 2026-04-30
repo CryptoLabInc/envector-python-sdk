@@ -9,9 +9,16 @@
 #  For licensing inquiries or permission requests, please contact: pypi@cryptolab.co.kr
 # ========================================================================================
 
+import json
+import logging as _stdlib_logging
 import os
 import secrets
-from typing import Any, List, Optional, Tuple, Union
+import threading
+import time
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 import evi
 import grpc
@@ -19,16 +26,215 @@ import numpy as np
 
 from pyenvector.api.connection import Connection
 from pyenvector.crypto import CipherBlock
-from pyenvector.proto_gen import type_pb2 as envector_type_pb
-from pyenvector.proto_gen.es2e import es2e_api_pb2_grpc as envector_grpc
-from pyenvector.proto_gen.es2e import es2e_message_pb2 as envector_msg_pb2
+from pyenvector.errors import (
+    AuthError,
+    DependencyError,
+    EnvectorApplicationError,
+    EnvectorTimeoutError,
+    EnvectorTransportError,
+    EnvectorValidationError,
+    InternalError,
+    InvalidInputError,
+    KeyManagementError,
+    NotReadyError,
+    ResourceLimitError,
+)
+from pyenvector.helpers import CHUNK_SIZE_1MB, CHUNK_SIZE_257MB
+from pyenvector.proto_gen.v2.common import index_operation_message_pb2 as envector_op_pb2
+from pyenvector.proto_gen.v2.common import type_pb2 as envector_type_pb
+from pyenvector.proto_gen.v2.endpoint import endpoint_api_pb2_grpc as envector_grpc
+from pyenvector.proto_gen.v2.endpoint import endpoint_message_pb2 as envector_msg_pb2
 from pyenvector.utils import version as version_utils
 from pyenvector.utils.logging_config import logger
 from pyenvector.utils.utils import _calculate_file_sha256
 
+_error_logger = _stdlib_logging.getLogger("pyenvector")
+
 ###################################
 # Indexer Class
 ###################################
+
+MAX_REQUEST_ID_LENGTH = 30
+_INDEX_OPERATION_STATE_RANK = {
+    envector_op_pb2.INDEX_OPERATION_STATE_UNSPECIFIED: -1,
+    envector_op_pb2.SPLIT_PENDING: 0,
+    envector_op_pb2.SPLITTING: 1,
+    envector_op_pb2.SPLIT_COMPLETED: 2,
+    envector_op_pb2.MERGE_PENDING: 3,
+    envector_op_pb2.MERGING: 4,
+    envector_op_pb2.MERGED_SAVED: 5,
+    envector_op_pb2.SEARCHABLE: 6,
+    envector_op_pb2.FAILED: 99,
+}
+
+AccessTokenProvider = Callable[[], Optional[str]]
+AccessTokenInput = Optional[Union[str, AccessTokenProvider]]
+
+
+class _AuthSession:
+    def __init__(
+        self,
+        access_token: AccessTokenInput = None,
+        refresh_token: Optional[str] = None,
+        oidc_issuer: Optional[str] = None,
+        token_endpoint: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        scope: Optional[str] = None,
+    ):
+        if callable(access_token) and refresh_token:
+            raise EnvectorValidationError(
+                message=(
+                    "access_token callable cannot be combined with refresh_token; "
+                    "either let the callable manage refresh, or omit it and use the "
+                    "SDK's OIDC refresh flow"
+                ),
+            )
+        if refresh_token and not (client_id and (token_endpoint or oidc_issuer)):
+            raise EnvectorValidationError(
+                message=(
+                    "refresh_token requires client_id and either token_endpoint or "
+                    "oidc_issuer to perform OIDC refresh"
+                ),
+            )
+        self._access_token_input = access_token
+        self._current_access_token = None if callable(access_token) else access_token
+        self._refresh_token = refresh_token
+        self._oidc_issuer = oidc_issuer.rstrip("/") if oidc_issuer else None
+        self._token_endpoint = token_endpoint
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._scope = scope
+        self._lock = threading.Lock()
+
+    def uses_auth(self) -> bool:
+        return bool(self._access_token_input or self._refresh_token)
+
+    def can_refresh(self) -> bool:
+        return bool(self._refresh_token and (self._token_endpoint or self._oidc_issuer) and self._client_id)
+
+    def get_access_token(self) -> Optional[str]:
+        token_input = self._access_token_input if callable(self._access_token_input) else self._current_access_token
+        token = Indexer._resolve_access_token(token_input)
+        if token and not callable(self._access_token_input):
+            self._current_access_token = token
+        return token
+
+    def refresh_access_token(self) -> Optional[str]:
+        if not self.can_refresh():
+            return None
+        # Resolve the token endpoint outside the lock so a slow OIDC discovery
+        # I/O on cold start does not block other threads waiting to refresh.
+        # Discovery is idempotent and the resolved endpoint is cached on the
+        # instance, so concurrent first-time resolves race benignly.
+        token_endpoint = self._resolve_token_endpoint()
+        # Snapshot before acquiring the lock. If another thread refreshes while we
+        # wait, skip the network round-trip — critical for IdPs that enforce
+        # single-use refresh tokens or reuse detection.
+        pre_refresh_access_token = self._current_access_token
+        with self._lock:
+            if self._current_access_token != pre_refresh_access_token:
+                return self._current_access_token
+            form = {
+                "grant_type": "refresh_token",
+                "refresh_token": self._refresh_token,
+                "client_id": self._client_id,
+            }
+            if self._client_secret:
+                form["client_secret"] = self._client_secret
+            if self._scope:
+                form["scope"] = self._scope
+
+            body = urllib_parse.urlencode(form).encode("utf-8")
+            request = urllib_request.Request(
+                token_endpoint,
+                data=body,
+                headers={"content-type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            try:
+                with urllib_request.urlopen(request, timeout=10) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, ValueError) as e:
+                raise EnvectorTransportError(
+                    message=f"Failed to refresh access token: {e}",
+                    retryable=True,
+                    action="Check OIDC token endpoint, refresh token, and client credentials",
+                ) from e
+
+            refreshed_access_token = payload.get("access_token") or payload.get("id_token")
+            if not isinstance(refreshed_access_token, str) or not refreshed_access_token.strip():
+                raise EnvectorTransportError(
+                    message="Failed to refresh access token: token endpoint response missing access_token",
+                    action="Check OIDC client scope and token response fields",
+                )
+
+            refreshed_refresh_token = payload.get("refresh_token")
+            self._current_access_token = refreshed_access_token.strip()
+            self._access_token_input = self._current_access_token
+            if isinstance(refreshed_refresh_token, str) and refreshed_refresh_token.strip():
+                self._refresh_token = refreshed_refresh_token.strip()
+            return self._current_access_token
+
+    def _resolve_token_endpoint(self) -> str:
+        if self._token_endpoint:
+            return self._token_endpoint
+        if not self._oidc_issuer:
+            raise EnvectorValidationError(
+                message="token_endpoint or oidc_issuer must be provided when refresh_token is configured",
+            )
+        discovery_url = f"{self._oidc_issuer}/.well-known/openid-configuration"
+        try:
+            with urllib_request.urlopen(discovery_url, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, ValueError) as e:
+            raise EnvectorTransportError(
+                message=f"Failed to discover OIDC token endpoint: {e}",
+                retryable=True,
+                action="Check OIDC issuer URL and discovery endpoint availability",
+            ) from e
+
+        token_endpoint = payload.get("token_endpoint")
+        if not isinstance(token_endpoint, str) or not token_endpoint.strip():
+            raise EnvectorTransportError(
+                message="Failed to discover OIDC token endpoint: discovery response missing token_endpoint",
+                action="Check OIDC issuer discovery document",
+            )
+        self._token_endpoint = token_endpoint.strip()
+        return self._token_endpoint
+
+
+def _validate_index_operation_target_state(target_state: int) -> str:
+    if target_state not in _INDEX_OPERATION_STATE_RANK:
+        raise EnvectorValidationError(message="target_state must be a valid IndexOperationState value")
+    return envector_op_pb2.IndexOperationState.Name(target_state)
+
+
+def _normalize_cluster_id_sequence(
+    cluster_ids: Optional[Union[int, Sequence[int]]],
+    field_name: str,
+) -> Optional[List[int]]:
+    if cluster_ids is None:
+        return None
+    if isinstance(cluster_ids, int):
+        return [cluster_ids]
+    if isinstance(cluster_ids, Sequence) and not isinstance(cluster_ids, (str, bytes)):
+        normalized = list(cluster_ids)
+        if not all(isinstance(cluster_id, int) for cluster_id in normalized):
+            raise EnvectorValidationError(message=f"{field_name} must contain only ints")
+        return normalized
+    raise EnvectorValidationError(message=f"{field_name} must be an int or a sequence of ints")
+
+
+def _validate_row_insert_lengths(
+    enc_vecs: Sequence[bytes],
+    metadata_list: Sequence[str],
+    cluster_ids: Optional[Sequence[int]] = None,
+) -> None:
+    if len(metadata_list) != len(enc_vecs):
+        raise EnvectorValidationError(message="metadata_list length must match enc_vecs length")
+    if cluster_ids is not None and len(cluster_ids) != len(enc_vecs):
+        raise EnvectorValidationError(message="cluster_ids length must match enc_vecs length")
 
 
 class Indexer:
@@ -59,22 +265,358 @@ class Indexer:
 
     """
 
-    _REGISTERED_ADDRS = None
+    # FIX: Changed from None to set() to enable proper membership checking
+    # Previously assigned as string, causing substring match bugs
+    _REGISTERED_ADDRS: set = set()
 
-    def __init__(self, connection: Connection, access_token: str = None):
+    # ReturnCode to exception class mapping (lazy-init)
+    _RETURN_CODE_EXCEPTION_MAP = None
+
+    # gRPC StatusCode to (return_code, retryable, action) mapping (lazy-init)
+    _GRPC_STATUS_MAP = None
+
+    @classmethod
+    def _get_return_code_map(cls):
+        """Lazy-init return code to exception class mapping."""
+        if cls._RETURN_CODE_EXCEPTION_MAP is None:
+            rc = envector_type_pb.ReturnCode
+            cls._RETURN_CODE_EXCEPTION_MAP = {
+                rc.InvalidInput: InvalidInputError,
+                rc.NoSuchIndex: NotReadyError,
+                rc.NotFoundError: InvalidInputError,
+                rc.InvalidKeyURL: KeyManagementError,
+                rc.InvalidKeyAuthInfo: AuthError,
+                rc.FailedToUnpackKey: KeyManagementError,
+                rc.InsufficientDIskSpace: ResourceLimitError,
+                rc.Fail: InternalError,
+                rc.UnknownError: InternalError,
+                rc.Warning: EnvectorApplicationError,
+            }
+            # Add v2.1 codes if available (after T1 proto extension)
+            for attr, exc_cls in [
+                ("Timeout", EnvectorTimeoutError),
+                ("DependencyError", DependencyError),
+                ("NotReady", NotReadyError),
+                ("AuthenticationError", AuthError),
+                ("ResourceLimitError", ResourceLimitError),
+            ]:
+                code = getattr(rc, attr, None)
+                if code is not None:
+                    cls._RETURN_CODE_EXCEPTION_MAP[code] = exc_cls
+        return cls._RETURN_CODE_EXCEPTION_MAP
+
+    @classmethod
+    def _get_grpc_status_map(cls):
+        """Lazy-init gRPC StatusCode to (return_code, retryable, action) mapping."""
+        if cls._GRPC_STATUS_MAP is None:
+            rc = envector_type_pb.ReturnCode
+            cls._GRPC_STATUS_MAP = {
+                grpc.StatusCode.UNAVAILABLE: (
+                    getattr(rc, "DependencyError", rc.Fail),
+                    True,
+                    "Check server connectivity",
+                ),
+                grpc.StatusCode.DEADLINE_EXCEEDED: (
+                    getattr(rc, "Timeout", rc.Fail),
+                    True,
+                    "Retry with longer timeout",
+                ),
+                grpc.StatusCode.INVALID_ARGUMENT: (rc.InvalidInput, False, "Check input parameters"),
+                grpc.StatusCode.NOT_FOUND: (rc.NotFoundError, False, "Verify resource exists"),
+                grpc.StatusCode.UNAUTHENTICATED: (
+                    getattr(rc, "AuthenticationError", rc.Fail),
+                    False,
+                    "Check credentials",
+                ),
+                grpc.StatusCode.PERMISSION_DENIED: (
+                    getattr(rc, "AuthenticationError", rc.Fail),
+                    False,
+                    "Check permissions",
+                ),
+            }
+        return cls._GRPC_STATUS_MAP
+
+    def _to_application_error(self, header, operation):
+        """Convert ResponseHeader with error return_code to typed exception."""
+        exc_map = self._get_return_code_map()
+        exc_class = exc_map.get(header.return_code, InternalError)
+
+        # Parse retryable/action if server provides them (after T1 proto extension)
+        retryable = getattr(header, "retryable", False)
+        action = getattr(header, "action", None) or None
+
+        error = exc_class(
+            message=header.error_message or f"{operation} failed",
+            return_code=header.return_code,
+            retryable=retryable,
+            action=action,
+            request_id=header.id if header.id else None,
+        )
+
+        _error_logger.error(
+            "Application error from server",
+            extra={
+                "operation": operation,
+                "return_code": str(header.return_code),
+                "error_message": header.error_message,
+                "request_id": header.id if header.id else None,
+                "trace_id": header.id if header.id else None,
+                "target_address": getattr(getattr(self, "connection", None), "server_address", None),
+                "exception_class": exc_class.__name__,
+                "retryable": retryable,
+                "sdk_version": self._get_sdk_version(),
+            },
+        )
+
+        return error
+
+    def _normalize_transport_error(self, error, operation, request_id=None):
+        """Map gRPC status to EnvectorTransportError."""
+        code = error.code()
+        status_map = self._get_grpc_status_map()
+        rc = envector_type_pb.ReturnCode
+        return_code, retryable, action = status_map.get(code, (rc.Fail, False, "Contact support with request ID"))
+
+        _error_logger.error(
+            "gRPC transport error",
+            extra={
+                "operation": operation,
+                "grpc_code": code.name,
+                "grpc_details": str(error.details()) if hasattr(error, "details") else None,
+                "return_code": str(return_code),
+                "request_id": request_id,
+                "trace_id": request_id,
+                "target_address": getattr(getattr(self, "connection", None), "server_address", None),
+                "sdk_version": self._get_sdk_version(),
+            },
+        )
+
+        return EnvectorTransportError(
+            message=f"{operation} failed: {code.name}",
+            return_code=return_code,
+            retryable=retryable,
+            action=action,
+            request_id=request_id,
+        )
+
+    @staticmethod
+    def _get_sdk_version():
+        """Return SDK version string for structured logging."""
+        try:
+            import pyenvector as _pkg
+
+            return getattr(_pkg, "__version__", "unknown")
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _resolve_access_token(access_token: AccessTokenInput) -> Optional[str]:
+        if access_token is None:
+            return None
+        if callable(access_token):
+            try:
+                access_token = access_token()
+            except Exception as e:
+                raise EnvectorValidationError(message=f"access_token provider failed: {e}") from e
+        if access_token is None:
+            return None
+        if not isinstance(access_token, str):
+            raise EnvectorValidationError(
+                message="access_token must be a str, None, or a callable returning str or None",
+            )
+        token = access_token.strip()
+        return token or None
+
+    @classmethod
+    def _build_auth_metadata(cls, access_token: AccessTokenInput) -> Optional[List[Tuple[str, str]]]:
+        token = cls._resolve_access_token(access_token)
+        if not token:
+            return None
+        return [("authorization", f"Bearer {token}")]
+
+    @classmethod
+    def _is_auth_return_code(cls, return_code: Optional[int]) -> bool:
+        auth_code = getattr(envector_type_pb.ReturnCode, "AuthenticationError", None)
+        return auth_code is not None and return_code == auth_code
+
+    @staticmethod
+    def _is_auth_rpc_error(error: grpc.RpcError) -> bool:
+        try:
+            return error.code() in (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED)
+        except Exception:
+            return False
+
+    def _refresh_access_token(self) -> bool:
+        if self._auth_session is None or not self._auth_session.can_refresh():
+            return False
+        refreshed_token = self._auth_session.refresh_access_token()
+        logger.info(
+            "Refreshed access token for %s",
+            getattr(self.connection, "server_address", "<unknown>"),
+        )
+        return bool(refreshed_token)
+
+    def _call_unary_with_refresh(self, rpc, request, operation: str, request_id: Optional[str] = None):
+        allow_refresh = self._auth_session is not None and self._auth_session.can_refresh()
+        attempt = 0
+        while True:
+            try:
+                response = rpc(
+                    request,
+                    metadata=self.grpc_metadata,
+                )
+            except grpc.RpcError as e:
+                if attempt == 0 and allow_refresh and self._is_auth_rpc_error(e):
+                    try:
+                        refreshed = self._refresh_access_token()
+                    except EnvectorTransportError as refresh_err:
+                        # Preserve the originating gRPC error context — without
+                        # `from e`, the cause chain would only show the refresh
+                        # failure and the originating UNAUTHENTICATED trace would
+                        # be lost.
+                        raise refresh_err from e
+                    if refreshed:
+                        attempt += 1
+                        continue
+                raise self._normalize_transport_error(e, operation, request_id=request_id) from e
+
+            if (
+                attempt == 0
+                and allow_refresh
+                and hasattr(response, "header")
+                and self._is_auth_return_code(getattr(response.header, "return_code", None))
+                and self._refresh_access_token()
+            ):
+                attempt += 1
+                continue
+            return response
+
+    def _call_unary_with_call_and_refresh(self, rpc, request, operation: str, request_id: Optional[str] = None):
+        allow_refresh = self._auth_session is not None and self._auth_session.can_refresh()
+        attempt = 0
+        while True:
+            try:
+                response, call = rpc.with_call(
+                    request,
+                    metadata=self.grpc_metadata,
+                )
+            except grpc.RpcError as e:
+                if attempt == 0 and allow_refresh and self._is_auth_rpc_error(e):
+                    try:
+                        refreshed = self._refresh_access_token()
+                    except EnvectorTransportError as refresh_err:
+                        raise refresh_err from e
+                    if refreshed:
+                        attempt += 1
+                        continue
+                raise self._normalize_transport_error(e, operation, request_id=request_id) from e
+
+            if (
+                attempt == 0
+                and allow_refresh
+                and hasattr(response, "header")
+                and self._is_auth_return_code(getattr(response.header, "return_code", None))
+                and self._refresh_access_token()
+            ):
+                attempt += 1
+                continue
+            return response, call
+
+    def _is_safe_memory_mode(self):
+        """
+        Checks if the safe memory enforcement mode is enabled via environment variables.
+        Returns True if ENVECTOR_SAFE_MEMORY is set to '1', 'true', or 'yes' (default is '1').
+        """
+        enabled = str(os.getenv("ENVECTOR_SAFE_MEMORY", "1")).lower()
+        return enabled in ("1", "true", "yes")
+
+    def _check_insertable(self, index_name):
+        """
+        Validates if the index can accept new insertions based on available shards.
+        Raises ValueError if memory safety is enabled and no insertable shards remain.
+        """
+        if not self._is_safe_memory_mode():
+            return
+
+        # Check if there is at least one shard available for insertion
+        shards = self.get_index_summary(index_name).get("remaining_insertable_shards", 0)
+        logger.debug(f"Remaining insertable shards for index '{index_name}': {shards}")
+        if shards < 1:
+            raise ValueError(
+                f"Index '{index_name}' is not insertable: No remaining shards available. "
+                "To bypass this check, set ENVECTOR_SAFE_MEMORY=0."
+            )
+
+    def _check_loadable(self, index_name):
+        """
+        Validates if the index can be loaded into memory.
+        Raises ValueError if memory safety is enabled and the index cannot be loaded.
+        """
+        if not self._is_safe_memory_mode():
+            return
+
+        # Check the loadable status from the index summary
+        if not self.get_index_summary(index_name).get("can_load_now", False):
+            raise ValueError(
+                f"Index '{index_name}' is not loadable: Memory constraints detected. "
+                "To bypass this check, set ENVECTOR_SAFE_MEMORY=0."
+            )
+
+    def __init__(
+        self,
+        connection: Connection,
+        access_token: AccessTokenInput = None,
+        refresh_token: Optional[str] = None,
+        oidc_issuer: Optional[str] = None,
+        token_endpoint: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        scope: Optional[str] = None,
+    ):
         self.connection = connection
-        self.stub = envector_grpc.ES2EServiceStub(connection.get_channel())
-        self.access_token = access_token
-        self.grpc_metadata = []
-        if self.access_token:
-            self.grpc_metadata.append(("authorization", f"Bearer {self.access_token}"))
+        self.stub = envector_grpc.EndpointServiceStub(connection.get_channel())
+        self._auth_session = _AuthSession(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            oidc_issuer=oidc_issuer,
+            token_endpoint=token_endpoint,
+            client_id=client_id,
+            client_secret=client_secret,
+            scope=scope,
+        )
+
+    @property
+    def access_token(self) -> Optional[str]:
+        # Resolves to the live access token (post-refresh value if rotated, or the
+        # current return of the configured callable provider). Returns the input
+        # string when no refresh/provider is configured, or None if unauthenticated.
+        if self._auth_session is None:
+            return None
+        return self._auth_session.get_access_token()
+
+    @property
+    def grpc_metadata(self) -> List[Tuple[str, str]]:
+        token = self._auth_session.get_access_token() if self._auth_session else None
+        metadata = self._build_auth_metadata(token)
+        return metadata or []
 
     ###################################
     # Connection Management
     ###################################
 
     @classmethod
-    def connect(cls, address: str, access_token: str = None, secure: Optional[bool] = None) -> "Indexer":
+    def connect(
+        cls,
+        address: str,
+        access_token: AccessTokenInput = None,
+        secure: Optional[bool] = None,
+        refresh_token: Optional[str] = None,
+        oidc_issuer: Optional[str] = None,
+        token_endpoint: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> "Indexer":
         """
         Establishes a connection to the enVector service.
 
@@ -82,26 +624,55 @@ class Indexer:
         ----------
         address : str
             The address of the enVector service endpoint (e.g., "localhost:50050").
-        access_token : str, optional
-            Access token for authentication (default: None).
+        access_token : str or callable, optional
+            Access token for authentication. You may provide a string token or a callable returning
+            the current token. The callable form is useful when tokens need to be refreshed during
+            long-running operations.
         secure : bool, optional
-            Whether to use a secure connection (default: True if access_token is provided, else False)
-
-        Parameters
-        ----------
-        None
+            Whether to use a secure connection (default: True if access_token or refresh_token is provided,
+            else False)
+        refresh_token : str, optional
+            OIDC refresh token. When provided with ``client_id`` and ``token_endpoint`` or
+            ``oidc_issuer``, the SDK refreshes the bearer token internally on authentication failures.
+        oidc_issuer : str, optional
+            OIDC issuer URL used to discover the token endpoint.
+        token_endpoint : str, optional
+            Explicit OIDC token endpoint used for refresh.
+        client_id : str, optional
+            OIDC client ID used for refresh token exchange.
+        client_secret : str, optional
+            OIDC client secret used for refresh token exchange.
+        scope : str, optional
+            Optional scope value included in refresh requests.
 
         Returns
         -------
         Indexer
             An instance of the Indexer class connected to the specified address.
         """
+        if access_token is None and refresh_token and client_id and (token_endpoint or oidc_issuer):
+            bootstrap = _AuthSession(
+                refresh_token=refresh_token,
+                oidc_issuer=oidc_issuer,
+                token_endpoint=token_endpoint,
+                client_id=client_id,
+                client_secret=client_secret,
+                scope=scope,
+            )
+            access_token = bootstrap.refresh_access_token()
+            # IdPs with rotation hand back a new refresh_token on every exchange;
+            # propagate it so the Indexer's session does not re-use the consumed one.
+            refresh_token = bootstrap._refresh_token
         if secure is None:
-            secure = True if access_token else False
+            secure = True if (access_token or refresh_token) else False
         logger.info(f"Connecting to enVector service at {address} with secure={secure}")
         conn = Connection(address, secure=secure)
         if not conn.is_connected():
-            raise RuntimeError(f"Failed to connect to {address}")
+            raise EnvectorTransportError(
+                message=f"Failed to connect to {address}",
+                retryable=True,
+                action="Check server connectivity",
+            )
 
         # Optional gRPC Health Check (enabled by default)
         # Env vars:
@@ -129,7 +700,7 @@ class Indexer:
                     health_stub = health_pb2_grpc.HealthStub(conn.get_channel())
                     req = health_pb2.HealthCheckRequest(service=health_service)
                     # Include authorization metadata if an access token is provided
-                    auth_md = [("authorization", f"Bearer {access_token}")] if access_token else None
+                    auth_md = cls._build_auth_metadata(access_token)
                     resp = health_stub.Check(
                         req,
                         timeout=timeout_s,
@@ -141,34 +712,56 @@ class Indexer:
                             status_name = health_pb2.HealthCheckResponse.ServingStatus.Name(resp.status)
                         except Exception:
                             status_name = str(resp.status)
-                        raise RuntimeError(f"gRPC health status for service '{health_service}' is '{status_name}'")
+                        raise EnvectorTransportError(
+                            message=f"gRPC health status for service '{health_service}' is '{status_name}'",
+                            action="Ensure enVector server is healthy",
+                        )
                     # Mark as checked on success
-                    cls._REGISTERED_ADDRS = address
+                    cls._REGISTERED_ADDRS.add(address)
                 except ImportError as e:
                     msg = (
                         "grpcio-health-checking is not installed; cannot perform gRPC health check. "
                         "Install 'grpcio-health-checking' or set ES2_GRPC_HEALTH_CHECK=0 to disable."
                     )
                     if health_required:
-                        raise RuntimeError(msg) from e
+                        raise EnvectorTransportError(
+                            message=msg,
+                            action="Install grpcio-health-checking or set ES2_GRPC_HEALTH_CHECK=0",
+                        ) from e
                     else:
                         logger.warning(msg)
                         # Consider health waived for this address to avoid repeated attempts
-                        cls._REGISTERED_ADDRS = address
+                        cls._REGISTERED_ADDRS.add(address)
                 except grpc.RpcError as e:
                     code = e.code()
                     if code == grpc.StatusCode.UNIMPLEMENTED:
                         msg = "Server does not implement gRPC health service"
                         if health_required:
-                            raise RuntimeError(msg) from e
+                            raise EnvectorTransportError(
+                                message=msg,
+                                action="Set ES2_GRPC_HEALTH_REQUIRED=0 or implement gRPC health service",
+                            ) from e
                         else:
                             logger.warning(msg + "; proceeding without health validation")
                             # Consider health waived for this address to avoid repeated attempts
-                            cls._REGISTERED_ADDRS = address
+                            cls._REGISTERED_ADDRS.add(address)
                     else:
-                        raise RuntimeError(f"Health check RPC failed: {code.name}") from e
+                        raise EnvectorTransportError(
+                            message=f"Health check RPC failed: {code.name}",
+                            retryable=True,
+                            action="Check server connectivity",
+                        ) from e
 
-        return cls(conn, access_token)
+        return cls(
+            conn,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            oidc_issuer=oidc_issuer,
+            token_endpoint=token_endpoint,
+            client_id=client_id,
+            client_secret=client_secret,
+            scope=scope,
+        )
 
     def is_connected(self):
         """
@@ -215,16 +808,17 @@ class Indexer:
             request = envector_msg_pb2.GetKeyListRequest()
             request.header.type = envector_type_pb.MessageType.GetKeyList
             # use with_call to access metadata
-            response, call = self.stub.get_key_list.with_call(
+            response, call = self._call_unary_with_call_and_refresh(
+                self.stub.get_key_list,
                 request,
-                metadata=self.grpc_metadata,
+                "get server version",
             )
             # prefer trailing metadata
             md = dict(call.trailing_metadata()) if hasattr(call, "trailing_metadata") else {}
-            server_version = md.get("x-es2e-server-version")
+            server_version = md.get("x-envector-endpoint-version") or md.get("x-es2e-server-version")
             if not server_version and hasattr(call, "initial_metadata"):
                 imd = dict(call.initial_metadata())
-                server_version = imd.get("x-es2e-server-version")
+                server_version = imd.get("x-envector-endpoint-version") or imd.get("x-es2e-server-version")
             return server_version
         except Exception as e:
             logger.warning(f"Failed to retrieve server version from metadata: {e}")
@@ -236,7 +830,7 @@ class Indexer:
 
         Policy:
         - If ES2_VERSION_CHECK is 0/false/no, skip.
-        - If server version does not start with 'v', skip (non-versioned server).
+        - If server version does not start with 'vX.Y.Z', skip (non-versioned server).
         - Otherwise compare using semantic parsing incl. pre-release tags.
           If mismatch and ES2_VERSION_CHECK_STRICT is on (default), raise; else warn.
         """
@@ -261,10 +855,16 @@ class Indexer:
 
         if sdk_version and server_version:
             if not version_utils.should_check(server_version):
-                logger.debug("Server version '%s' has no 'v' prefix; skipping version check.", server_version)
+                logger.debug(
+                    "Server version '%s' is not a valid semver (X.Y.Z or vX.Y.Z); skipping version check.",
+                    server_version,
+                )
                 return
             strict = os.getenv("ES2_VERSION_CHECK_STRICT", "1").lower() not in ("0", "false", "no")
-            if not version_utils.is_equal(sdk_version, server_version):
+            compatible = version_utils.is_equal(sdk_version, server_version) or version_utils.is_hotfix_compatible(
+                sdk_version, server_version
+            )
+            if not compatible:
                 server_pep440 = version_utils.to_pep440(server_version)
                 msg = (
                     f"SDK/Server version mismatch: sdk={sdk_version}, server={server_version}"
@@ -272,7 +872,10 @@ class Indexer:
                     f"Set ES2_VERSION_CHECK=0 to skip, or ES2_VERSION_CHECK_STRICT=0 to warn only."
                 )
                 if strict:
-                    raise RuntimeError(msg)
+                    raise EnvectorTransportError(
+                        message=msg,
+                        action="Set ES2_VERSION_CHECK=0 to skip or ES2_VERSION_CHECK_STRICT=0 to warn only",
+                    )
                 else:
                     logger.warning(msg)
         else:
@@ -287,7 +890,7 @@ class Indexer:
     ###################################
 
     def register_key(
-        self, key_id: str, key: bytes, key_type: str = "EvalKey", preset: str = "IP", eval_mode: str = "RMP"
+        self, key_id: str, key: bytes, key_type: str = "EvalKey", preset: str = "IP2", eval_mode: str = "MM32"
     ):
         """
         Registers a public key from the specified file path to enVector server.
@@ -299,20 +902,25 @@ class Indexer:
         key_path : str
             The file path to the key to be registered.
         preset : str
-            The preset to use for the key. Default is "IP".
+            The preset to use for the key. Default is "IP2".
         eval_mode : str
-            The evaluation mode to use for the key. Default is "RMP".
+            The evaluation mode to use for the key. Default is "MM32".
 
         Returns
         -------
         None
         """
-        CHUNK_SIZE = 1 * 1024 * 1024  # 1MB
+        CHUNK_SIZE = CHUNK_SIZE_1MB  # 1MB
+
+        # Use a unique header ID as an API request identifier
+        header_id = secrets.token_hex(10)
 
         try:
             sha256sum = _calculate_file_sha256(key)
         except Exception as exc:
-            raise ValueError(f"Failed to compute SHA256 for key '{key_id}': {exc}") from exc
+            raise EnvectorValidationError(
+                message=f"Failed to compute SHA256 for key '{key_id}': {exc}",
+            ) from exc
 
         def register_key_request_generator():
             try:
@@ -320,6 +928,7 @@ class Indexer:
                     chunk = key[offset : offset + CHUNK_SIZE]
                     request = envector_msg_pb2.RegisterKeyRequest()
                     request.header.type = envector_type_pb.MessageType.RegisterKey
+                    request.header.id = header_id
 
                     request.key_info.key_id = key_id
                     request.key_info.type = key_type
@@ -329,21 +938,23 @@ class Indexer:
 
                     request.key.value = chunk
                     request.key.size = len(chunk)
+                    request.total_size = len(key)
                     yield request
 
             except Exception as e:
                 logger.error(f"Error reading key file : {e}")
                 return
 
-        response = self.stub.register_key(
-            register_key_request_generator(),
-            metadata=self.grpc_metadata,
-        )
+        try:
+            response = self.stub.register_key(
+                register_key_request_generator(),
+                metadata=self.grpc_metadata,
+            )
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "register key", request_id=header_id) from e
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to register key with error code {response.header.return_code}: {response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "register key")
         else:
             logger.info(f"Key '{key_id}' registered successfully.")
 
@@ -359,16 +970,17 @@ class Indexer:
         request = envector_msg_pb2.GetKeyListRequest()
 
         request.header.type = envector_type_pb.MessageType.GetKeyList
+        request.header.id = secrets.token_hex(10)  # unique header ID
 
-        response = self.stub.get_key_list(
+        response = self._call_unary_with_refresh(
+            self.stub.get_key_list,
             request,
-            metadata=self.grpc_metadata,
+            "list keys",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to list keys with error code {response.header.return_code}: {response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "list keys")
         else:
             logger.info("Get key list successfully.")
             key_list = list(response.key_id)
@@ -393,17 +1005,18 @@ class Indexer:
         request = envector_msg_pb2.GetKeyInfoRequest()
 
         request.header.type = envector_type_pb.MessageType.GetKeyInfo
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.key_id = key_id
 
-        response = self.stub.get_key_info(
+        response = self._call_unary_with_refresh(
+            self.stub.get_key_info,
             request,
-            metadata=self.grpc_metadata,
+            "get key info",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to get key info with error code {response.header.return_code}: {response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "get key info")
         else:
             logger.info(f"Key info for '{key_id}' received successfully.")
 
@@ -427,17 +1040,18 @@ class Indexer:
         """
         request = envector_msg_pb2.DeleteKeyRequest()
         request.header.type = envector_type_pb.MessageType.DeleteKey
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.key_id = key_id
 
-        response = self.stub.delete_key(
+        response = self._call_unary_with_refresh(
+            self.stub.delete_key,
             request,
-            metadata=self.grpc_metadata,
+            "delete key",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to delete key with error code {response.header.return_code}: {response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "delete key")
         else:
             logger.info(f"Key '{key_id}' deleted successfully.")
 
@@ -452,17 +1066,18 @@ class Indexer:
         """
         request = envector_msg_pb2.LoadKeyRequest()
         request.header.type = envector_type_pb.MessageType.LoadKey
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.key_id = key_id
 
-        response = self.stub.load_key(
+        response = self._call_unary_with_refresh(
+            self.stub.load_key,
             request,
-            metadata=self.grpc_metadata,
+            "load key",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to load key with error code {response.header.return_code}: {response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "load key")
         else:
             logger.info(f"Key '{key_id}' loaded successfully.")
 
@@ -477,17 +1092,18 @@ class Indexer:
         """
         request = envector_msg_pb2.UnloadKeyRequest()
         request.header.type = envector_type_pb.MessageType.UnloadKey
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.key_id = key_id
 
-        response = self.stub.unload_key(
+        response = self._call_unary_with_refresh(
+            self.stub.unload_key,
             request,
-            metadata=self.grpc_metadata,
+            "unload key",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to unload key with error code {response.header.return_code}: {response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "unload key")
         else:
             logger.info(f"Key '{key_id}' unloaded successfully.")
 
@@ -514,7 +1130,7 @@ class Indexer:
         index_name: str,
         key_id: str,
         dim: int,
-        search_type: str = "ip",
+        search_type: str = "ip1",
         index_encryption: str = "cipher",
         query_encryption: str = "plain",
         metadata_encryption: bool = True,
@@ -537,13 +1153,13 @@ class Indexer:
         dim : int
             Vector dimension to be stored in the index.
         search_type : Union[str, envector_type_pb.SearchType], optional
-            The type of search to be performed on the index (default: "ip").
+            The type of search to be performed on the index (default: "ip1").
         index_encryption : str, optional
             The type of index to be created (default: "cipher"). Options are "plain" or "cipher".
         query_encryption : str, optional
             The type of query to be performed on the index (default: "plain"). Options are "plain" or "cipher".
         index_type : str, optional
-            The type of index to be created (default: "flat"). Options are "flat" or "ivf_flat".
+            The type of index to be created (default: "flat"). Options are "flat", "ivf_flat" and "ivf_vct".
         description : str, optional
             A human-readable description for the index.
 
@@ -552,15 +1168,19 @@ class Indexer:
         Dict
             A dictionary containing index information.
         """
+        # Use a unique header ID as an API request identifier
+        header_id = secrets.token_hex(10)
         request = envector_msg_pb2.CreateIndexRequest()
         request.header.type = envector_type_pb.MessageType.CreateIndex
+        request.header.id = header_id
+
         logger.debug(
             f"Creating index with name: {index_name}, dim: {dim}, search_type: {search_type}, "
             f"key_id: {key_id}, index_encryption: {index_encryption}, "
             f"query_encryption: {query_encryption}, index_type: {index_params.get('index_type', None)}"
         )
         if isinstance(search_type, str):
-            if search_type.lower() == "iponly" or search_type.lower() == "ip":
+            if search_type.lower() == "iponly" or search_type.lower() == "ip1":
                 search_type = envector_type_pb.SearchType.IPOnly
             elif search_type.lower() == "ipandqf" or search_type.lower() == "qf":
                 search_type = envector_type_pb.SearchType.IPAndQF
@@ -575,34 +1195,51 @@ class Indexer:
             else:
                 search_type = search_type
         else:
-            raise ValueError(f"Invalid type for search_type: {type(search_type)}.")
+            raise EnvectorValidationError(
+                message=f"Invalid type for search_type: {type(search_type)}.",
+            )
 
         if isinstance(index_encryption, str) and index_encryption.lower() in ["plain", "cipher", "hybrid"]:
             index_encryption = index_encryption.lower()
         else:
-            raise ValueError(f"Invalid index_encryption: {index_encryption}. Expected 'plain' or 'cipher'.")
+            raise EnvectorValidationError(
+                message=f"Invalid index_encryption: {index_encryption}. Expected 'plain' or 'cipher'.",
+            )
 
         if isinstance(index_params["index_type"], str):
             if index_params["index_type"].upper() == "FLAT":
                 index_type = envector_type_pb.IndexType.FLAT
-            elif index_params["index_type"].upper() == "IVF_FLAT":
+            elif index_params["index_type"].upper() == "IVF_FLAT" or index_params["index_type"].upper() == "IVF_VCT":
                 logger.debug(
                     f"{index_params['index_type']} params with values: "
                     f"nlist: {index_params['nlist']}, default_nprobe: {index_params['default_nprobe']}"
                 )
-                index_type = envector_type_pb.IndexType.IVF_FLAT
+                if index_params["index_type"].upper() == "IVF_FLAT":
+                    index_type = envector_type_pb.IndexType.IVF_FLAT
+                elif index_params["index_type"].upper() == "IVF_VCT":
+                    index_type = envector_type_pb.IndexType.IVF_VCT
                 if index_params.get("nlist") is None:
-                    raise ValueError("nlist must be provided for IVF_FLAT index type.")
+                    raise EnvectorValidationError(
+                        message="nlist must be provided for IVF index type.",
+                    )
                 if index_params.get("default_nprobe") is None:
-                    raise ValueError("default_nprobe must be provided for IVF_FLAT index type.")
+                    raise EnvectorValidationError(
+                        message="default_nprobe must be provided for IVF index type.",
+                    )
                 centroids = index_params.get("centroids")
                 if centroids is None:
-                    logger.info("Centroids not provided for IVF_FLAT index type. Generating random centroids locally.")
-                    centroids = np.random.rand(index_params["nlist"], dim).astype(np.float32)
-                    centroids /= np.sum(centroids, axis=1, keepdims=True)
+                    logger.info("Centroids not provided for IVF index type. Generating random centroids locally.")
+                    # FIX: Use seeded RNG for deterministic centroid generation
+                    # Previously np.random.rand() without seed caused non-reproducible benchmarks
+                    seed = index_params.get("centroid_seed", 42)
+                    rng = np.random.default_rng(seed)
+                    centroids = rng.random((index_params["nlist"], dim)).astype(np.float32)
+                    # FIX: Add epsilon to prevent division by zero on zero-sum rows
+                    # Previously zero rows caused NaN which corrupted KNN search
+                    centroids /= np.sum(centroids, axis=1, keepdims=True) + 1e-10
                 if len(centroids) != index_params["nlist"]:
-                    raise ValueError(
-                        f"Centroids size ({len(centroids)}) does not match nlist ({index_params['nlist']})"
+                    raise EnvectorValidationError(
+                        message=f"Centroids size ({len(centroids)}) does not match nlist ({index_params['nlist']})",
                     )
                 for centroid in centroids:
                     dt = envector_type_pb.DataType()
@@ -626,13 +1263,16 @@ class Indexer:
         def request_generator():
             yield request
 
-        response = self.stub.create_index(
-            request_generator(),
-            metadata=self.grpc_metadata,
-        )
+        try:
+            response = self.stub.create_index(
+                request_generator(),
+                metadata=self.grpc_metadata,
+            )
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "create index", request_id=header_id) from e
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(f"Failed to create index with error code {response.header.return_code}: {response.header}")
+            raise self._to_application_error(response.header, "create index")
         else:
             logger.info(f"Index '{index_name}' created successfully.")
             return {
@@ -662,18 +1302,18 @@ class Indexer:
         """
         request = envector_msg_pb2.GetIndexListRequest()
         request.header.type = envector_type_pb.MessageType.GetIndexList
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.loaded_only = loaded_only
 
-        response = self.stub.get_index_list(
+        response = self._call_unary_with_refresh(
+            self.stub.get_index_list,
             request,
-            metadata=self.grpc_metadata,
+            "get index list",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to get index list with error code {response.header.return_code}: "
-                f"{response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "get index list")
         else:
             logger.info("Get Index list received successfully.")
             return list(response.index_names)
@@ -695,60 +1335,466 @@ class Indexer:
         """
         request = envector_msg_pb2.GetIndexInfoRequest()
         request.header.type = envector_type_pb.MessageType.GetIndexInfo
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.index_name = index_name
 
-        for stream_idx, response in enumerate(
-            self.stub.get_index_info(
+        try:
+            response_iter = self.stub.get_index_info(
                 request,
                 metadata=self.grpc_metadata,
             )
-        ):
-            if response.header.return_code != envector_type_pb.ReturnCode.Success:
-                raise ValueError(
-                    f"Failed to get index info with error code "
-                    f"{response.header.return_code}: {response.header.error_message}"
-                )
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "get index info", request_id=request.header.id) from e
 
-            if stream_idx == 0:
-                assert response.index_info.index_name == index_name, "Index name mismatch in response."
+        try:
+            for stream_idx, response in enumerate(response_iter):
+                if response.header.return_code != envector_type_pb.ReturnCode.Success:
+                    raise self._to_application_error(response.header, "get index info")
 
-                res = {
-                    "index_name": index_name,
-                    "dim": response.index_info.dim,
-                    "row_count": response.index_info.row_count,
-                    "search_type": envector_type_pb.SearchType.Name(response.index_info.search_type),
-                    "key_id": response.index_info.key_id,
-                    "index_encryption": response.index_info.index_encryption,
-                    "query_encryption": response.index_info.query_encryption,
-                    "metadata_encryption": getattr(response.index_info, "metadata_encryption", None),
-                    "description": getattr(response.index_info, "description", None),
-                    "created_time": response.index_info.created_time,
-                    "is_loaded": response.index_info.is_loaded,
-                    "is_key_loaded": response.index_info.is_key_loaded,
-                    "index_type": envector_type_pb.IndexType.Name(response.index_info.index_type),
-                    "state": self._describe_index_state(
-                        response.index_info.is_loaded,
-                        response.index_info.is_key_loaded,
-                    ),
-                }
+                if stream_idx == 0:
+                    assert response.index_info.index_name == index_name, "Index name mismatch in response."
 
-                if res["index_type"].upper() == "IVF_FLAT":
-                    ivf_detail = response.index_info.index_detail.ivf_detail
+                    res = {
+                        "index_name": index_name,
+                        "dim": response.index_info.dim,
+                        "row_count": response.index_info.row_count,
+                        "search_type": envector_type_pb.SearchType.Name(response.index_info.search_type),
+                        "key_id": response.index_info.key_id,
+                        "index_encryption": response.index_info.index_encryption,
+                        "query_encryption": response.index_info.query_encryption,
+                        "metadata_encryption": getattr(response.index_info, "metadata_encryption", None),
+                        "description": getattr(response.index_info, "description", None),
+                        "created_time": response.index_info.created_time,
+                        "is_loaded": response.index_info.is_loaded,
+                        "is_key_loaded": response.index_info.is_key_loaded,
+                        "index_type": envector_type_pb.IndexType.Name(response.index_info.index_type),
+                        "state": self._describe_index_state(
+                            response.index_info.is_loaded,
+                            response.index_info.is_key_loaded,
+                        ),
+                    }
 
-                    res["ivf_detail"] = envector_type_pb.IvfDetail()
+                    if res["index_type"].upper() == "IVF_FLAT" or res["index_type"].upper() == "IVF_VCT":
+                        ivf_detail = response.index_info.index_detail.ivf_detail
 
-                    res["ivf_detail"].nlist = ivf_detail.nlist
-                    res["ivf_detail"].default_nprobe = ivf_detail.default_nprobe
+                        res["ivf_detail"] = envector_type_pb.IvfDetail()
 
-                    res["ivf_detail"].centroids.extend(ivf_detail.centroids)
+                        res["ivf_detail"].nlist = ivf_detail.nlist
+                        res["ivf_detail"].default_nprobe = ivf_detail.default_nprobe
 
-            else:
-                if res["index_type"].upper() == "IVF_FLAT":
-                    res["ivf_detail"].centroids.extend(response.index_info.index_detail.ivf_detail.centroids)
+                        res["ivf_detail"].centroids.extend(ivf_detail.centroids)
+
+                else:
+                    if res["index_type"].upper() == "IVF_FLAT" or res["index_type"].upper() == "IVF_VCT":
+                        res["ivf_detail"].centroids.extend(response.index_info.index_detail.ivf_detail.centroids)
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "get index info (stream)", request_id=request.header.id) from e
 
         logger.info(f"Index info for '{index_name}' received successfully.")
 
         return res
+
+    def get_index_summary(self, index_name: str):
+        """
+        Retrieves a lightweight summary for a specific index from enVector server.
+
+        Parameters
+        ----------
+        index_name : str
+            The name of the index to retrieve summary information for.
+
+        Returns
+        -------
+        Dict
+            A dictionary containing summary index information without heavy index detail payloads.
+        """
+        request = envector_msg_pb2.GetIndexSummaryRequest()
+        request.header.type = envector_type_pb.MessageType.GetIndexSummary
+        request.header.id = secrets.token_hex(10)  # unique header ID
+        request.index_name = index_name
+
+        response = self._call_unary_with_refresh(
+            self.stub.get_index_summary,
+            request,
+            "get index summary",
+            request_id=request.header.id,
+        )
+
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "get index summary")
+
+        summary = response.index_summary
+        logger.info(f"Index summary for '{index_name}' received successfully.")
+
+        return {
+            "index_name": summary.index_name or index_name,
+            "dim": summary.dim,
+            "row_count": summary.row_count,
+            "saved_row_count": summary.saved_row_count,
+            "search_type": envector_type_pb.SearchType.Name(summary.search_type),
+            "key_id": summary.key_id,
+            "index_encryption": summary.index_encryption,
+            "query_encryption": summary.query_encryption,
+            "metadata_encryption": getattr(summary, "metadata_encryption", None),
+            "description": getattr(summary, "description", None),
+            "created_time": summary.created_time,
+            "is_loaded": summary.is_loaded,
+            "is_key_loaded": summary.is_key_loaded,
+            "index_type": envector_type_pb.IndexType.Name(summary.index_type),
+            "state": self._describe_index_state(
+                summary.is_loaded,
+                summary.is_key_loaded,
+            ),
+            "can_load_now": summary.can_load_now,
+            "remaining_insertable_shards": summary.remaining_insertable_shards,
+            "remaining_insertable_vectors_guaranteed": summary.remaining_insertable_vectors_guaranteed,
+            "remaining_insertable_vectors_best_effort": summary.remaining_insertable_vectors_best_effort,
+        }
+
+    _SUPPORTED_OPERATION_TYPES = frozenset({
+        envector_type_pb.IndexOperationType.INSERT,
+        envector_type_pb.IndexOperationType.DELETE,
+    })
+
+    def get_index_operation_status(
+        self,
+        index_name: str,
+        request_id: str,
+        operation_type: Union[str, int] = "INSERT",
+    ) -> envector_op_pb2.GetIndexOperationStatusResponse:
+        """
+        Retrieve completion status for a specific index operation.
+
+        This API is request-scoped. To track an INSERT or DELETE completion, capture the
+        server-generated ``request_id`` from the response ``header.id``, and then poll this
+        API until ``done=true``.
+
+        Parameters
+        ----------
+        index_name : str
+            Target index name.
+        request_id : str
+            Server-generated request identifier. This is returned in the response ``header.id``
+            from insert or delete operations.
+            Must be non-empty and at most ``MAX_REQUEST_ID_LENGTH`` characters.
+        operation_type : Union[str, int], optional
+            Operation type. You may pass either the proto enum value (int) or a string such as
+            ``"INSERT"`` or ``"DELETE"``. Supported types: INSERT, DELETE.
+
+        Notes
+        -----
+        - ``done`` is computed by the server. For INSERT, ``done`` becomes true when all rows
+          are searchable. For DELETE, ``done`` becomes true when shard rebuild is complete.
+        - Search requests are not tracked.
+
+        Returns
+        -------
+        GetIndexOperationStatusResponse
+            Status response containing (at least) ``total_row_count``, ``searchable_row_count``, and ``done``.
+
+        Raises
+        ------
+        EnvectorValidationError
+            If parameters are invalid.
+        EnvectorApplicationError
+            If the server returns a failure status.
+        """
+        self._validate_request_id(request_id)
+        if isinstance(operation_type, str):
+            try:
+                operation_type = envector_type_pb.IndexOperationType.Value(operation_type.upper())
+            except ValueError as e:
+                raise EnvectorValidationError(
+                    message="operation_type must be a valid IndexOperationType name (e.g. 'INSERT', 'DELETE')",
+                ) from e
+        elif not isinstance(operation_type, int):
+            raise EnvectorValidationError(
+                message="operation_type must be a str or an int",
+            )
+
+        if operation_type not in self._SUPPORTED_OPERATION_TYPES:
+            raise EnvectorValidationError(
+                message=f"Unsupported operation_type: {operation_type}. Supported: INSERT, DELETE",
+            )
+
+        request = envector_op_pb2.GetIndexOperationStatusRequest()
+        request.header.type = envector_type_pb.MessageType.GetIndexOperationStatus
+        request.header.id = secrets.token_hex(10)  # unique header ID for this status request
+        request.index_name = index_name
+        request.request_id = request_id
+        request.operation_type = operation_type
+
+        response = self._call_unary_with_refresh(
+            self.stub.get_index_operation_status,
+            request,
+            "get index operation status",
+            request_id=request.header.id,
+        )
+
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "get index operation status")
+
+        return response
+
+    def wait_for_insert_searchable(
+        self,
+        index_name: str,
+        request_id: str,
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 1.0,
+    ) -> envector_op_pb2.GetIndexOperationStatusResponse:
+        """
+        Wait until an INSERT operation becomes searchable (merge completed).
+
+        This helper polls :meth:`get_index_operation_status` until the server reports ``done=true``.
+        Use this only with a ``request_id`` captured from an insert response ``header.id``.
+
+        Parameters
+        ----------
+        index_name : str
+            Target index name.
+        request_id : str
+            Server-generated insert request identifier (insert response ``header.id``). Must be non-empty
+            and at most ``MAX_REQUEST_ID_LENGTH`` characters.
+        timeout_s : float, optional
+            Maximum time to wait (seconds).
+        poll_interval_s : float, optional
+            Poll interval (seconds). Increase this value for longer waits to reduce server load.
+
+        Returns
+        -------
+        GetIndexOperationStatusResponse
+            The last status response where ``done=true``.
+
+        Raises
+        ------
+        EnvectorTimeoutError
+            If the operation does not become searchable within ``timeout_s``.
+        EnvectorValidationError
+            If parameters are invalid.
+        """
+        return self.wait_for_index_operation_state(
+            index_name=index_name,
+            request_id=request_id,
+            target_state=envector_op_pb2.SEARCHABLE,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+
+    def wait_for_insert_persist_completed(
+        self,
+        index_name: str,
+        request_id: str,
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 1.0,
+    ) -> envector_op_pb2.GetIndexOperationStatusResponse:
+        """Wait until an INSERT-backed operation reaches persist completion."""
+        return self.wait_for_index_operation_state(
+            index_name=index_name,
+            request_id=request_id,
+            target_state=envector_op_pb2.SPLIT_COMPLETED,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+
+    def wait_for_merge_complete(
+        self,
+        index_name: str,
+        request_id: str,
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 1.0,
+    ) -> envector_op_pb2.GetIndexOperationStatusResponse:
+        """Wait until a manual merge reaches its terminal state."""
+        return self.wait_for_index_operation_state(
+            index_name=index_name,
+            request_id=request_id,
+            target_state=envector_op_pb2.MERGED_SAVED,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+
+    def wait_for_index_operation_state(
+        self,
+        index_name: str,
+        request_id: str,
+        target_state: int,
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 1.0,
+        operation_type: Union[str, int] = "INSERT",
+    ) -> envector_op_pb2.GetIndexOperationStatusResponse:
+        """Wait until a request reaches the target lifecycle state.
+
+        Parameters
+        ----------
+        operation_type : Union[str, int], optional
+            Operation type for status polling (e.g. ``"INSERT"`` or ``"DELETE"``).
+        """
+        self._validate_request_id(request_id)
+        if timeout_s <= 0:
+            raise EnvectorValidationError(message="timeout_s must be > 0")
+        if poll_interval_s <= 0:
+            raise EnvectorValidationError(message="poll_interval_s must be > 0")
+
+        start_time = time.monotonic()
+        deadline = start_time + timeout_s
+        target_state_name = _validate_index_operation_target_state(target_state)
+        logger.debug(
+            f"wait_for_index_operation_state: target_state={target_state_name}, timeout_s={timeout_s}, "
+            f"start_time={start_time}, deadline={deadline}"
+        )
+        last = None
+        while True:
+            last = self.get_index_operation_status(
+                index_name=index_name,
+                request_id=request_id,
+                operation_type=operation_type,
+            )
+            state = getattr(last, "state", envector_op_pb2.INDEX_OPERATION_STATE_UNSPECIFIED)
+            if state == envector_op_pb2.FAILED:
+                raise InternalError(
+                    message=(
+                        f"Index operation failed while waiting for {target_state_name} "
+                        f"(index='{index_name}', request_id='{request_id}')."
+                    ),
+                    request_id=request_id,
+                )
+            if target_state == envector_op_pb2.SEARCHABLE and last.done:
+                return last
+            if _INDEX_OPERATION_STATE_RANK.get(state, -1) >= _INDEX_OPERATION_STATE_RANK.get(target_state, -1):
+                return last
+            now = time.monotonic()
+            if now >= deadline:
+                elapsed_s = now - start_time
+                logger.error(
+                    f"wait_for_index_operation_state TIMEOUT: target_state={target_state_name}, elapsed_s={elapsed_s:.2f}, "
+                    f"timeout_s={timeout_s}, start_time={start_time}, deadline={deadline}, now={now}"
+                )
+                raise EnvectorTimeoutError(
+                    message=(
+                        f"Timed out waiting for index operation state {target_state_name} (index='{index_name}', "
+                        f"request_id='{request_id}', total_row_count={last.total_row_count}, "
+                        f"searchable_row_count={last.searchable_row_count}, "
+                        f"elapsed={elapsed_s:.2f}s, timeout={timeout_s}s)."
+                    ),
+                    retryable=True,
+                    action="Retry with longer timeout",
+                    request_id=request_id,
+                )
+            time.sleep(poll_interval_s)
+
+    def wait_for_index_operations_state(
+        self,
+        index_name: str,
+        request_ids: Sequence[str],
+        target_state: int,
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 1.0,
+        operation_type: Union[str, int] = "INSERT",
+    ) -> List[envector_op_pb2.GetIndexOperationStatusResponse]:
+        """Wait until multiple requests reach the same target lifecycle state.
+
+        Parameters
+        ----------
+        operation_type : Union[str, int], optional
+            Operation type for status polling (e.g. ``"INSERT"`` or ``"DELETE"``).
+        """
+        if not request_ids:
+            raise EnvectorValidationError(message="request_ids must be non-empty")
+        if timeout_s <= 0:
+            raise EnvectorValidationError(message="timeout_s must be > 0")
+        if poll_interval_s <= 0:
+            raise EnvectorValidationError(message="poll_interval_s must be > 0")
+
+        request_ids_list = list(request_ids)
+        for req_id in request_ids_list:
+            self._validate_request_id(req_id)
+        if len(set(request_ids_list)) != len(request_ids_list):
+            raise EnvectorValidationError(message="request_ids must not contain duplicates")
+
+        start_time = time.monotonic()
+        deadline = start_time + timeout_s
+        target_state_name = envector_op_pb2.IndexOperationState.Name(target_state)
+        logger.debug(
+            f"wait_for_index_operations_state: target_state={target_state_name}, timeout_s={timeout_s}, "
+            f"start_time={start_time}, deadline={deadline}, num_request_ids={len(request_ids_list)}"
+        )
+
+        results: List[envector_op_pb2.GetIndexOperationStatusResponse] = []
+        for idx, req_id in enumerate(request_ids_list, start=1):
+            now = time.monotonic()
+            if now >= deadline:
+                elapsed_s = now - start_time
+                logger.error(
+                    f"wait_for_index_operations_state TIMEOUT: target_state={target_state_name}, "
+                    f"elapsed_s={elapsed_s:.2f}, timeout_s={timeout_s}, start_time={start_time}, "
+                    f"deadline={deadline}, now={now}"
+                )
+                raise EnvectorTimeoutError(
+                    message=(
+                        f"Timed out waiting for index operations to reach {target_state_name} "
+                        f"(index='{index_name}', next_request_id='{req_id}', completed={idx - 1}/{len(request_ids_list)}, "
+                        f"elapsed={elapsed_s:.2f}s, timeout={timeout_s}s)."
+                    ),
+                    retryable=True,
+                    action="Retry with longer timeout",
+                    request_id=req_id,
+                )
+            results.append(
+                self.wait_for_index_operation_state(
+                    index_name=index_name,
+                    request_id=req_id,
+                    target_state=target_state,
+                    timeout_s=deadline - now,
+                    poll_interval_s=poll_interval_s,
+                    operation_type=operation_type,
+                )
+            )
+
+        return results
+
+    def wait_for_inserts_searchable(
+        self,
+        index_name: str,
+        request_ids: Sequence[str],
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 1.0,
+    ) -> List[envector_op_pb2.GetIndexOperationStatusResponse]:
+        """
+        Wait until multiple INSERT operations become searchable (merge completed).
+
+        This helper polls :meth:`get_index_operation_status` until the server reports ``done=true`` for
+        every provided request_id. The ``timeout_s`` applies to the overall wait (not per operation).
+
+        Parameters
+        ----------
+        index_name : str
+            Target index name.
+        request_ids : Sequence[str]
+            Server-generated insert request identifiers (insert response ``header.id`` values).
+        timeout_s : float, optional
+            Maximum total time to wait (seconds).
+        poll_interval_s : float, optional
+            Poll interval (seconds).
+
+        Returns
+        -------
+        List[GetIndexOperationStatusResponse]
+            Status responses in the same order as ``request_ids``.
+
+        Raises
+        ------
+        EnvectorTimeoutError
+            If not all operations become searchable within ``timeout_s``.
+        EnvectorValidationError
+            If parameters are invalid.
+        """
+        return self.wait_for_index_operations_state(
+            index_name=index_name,
+            request_ids=request_ids,
+            target_state=envector_op_pb2.SEARCHABLE,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
 
     def load_index(self, index_name: str):
         """
@@ -765,18 +1811,19 @@ class Indexer:
         """
         request = envector_msg_pb2.LoadIndexRequest()
         request.header.type = envector_type_pb.MessageType.LoadIndex
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.index_name = index_name
 
-        response = self.stub.load_index(
+        logger.info(f"Index '{index_name}' loading...")
+        response = self._call_unary_with_refresh(
+            self.stub.load_index,
             request,
-            metadata=self.grpc_metadata,
+            "load index",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to load index with error code {response.header.return_code}: "
-                f"{response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "load index")
         else:
             logger.info(f"Index '{index_name}' loaded successfully.")
 
@@ -795,18 +1842,18 @@ class Indexer:
         """
         request = envector_msg_pb2.UnloadIndexRequest()
         request.header.type = envector_type_pb.MessageType.UnloadIndex
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.index_name = index_name
 
-        response = self.stub.unload_index(
+        response = self._call_unary_with_refresh(
+            self.stub.unload_index,
             request,
-            metadata=self.grpc_metadata,
+            "unload index",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to unload index with error code {response.header.return_code}: "
-                f"{response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "unload index")
         else:
             logger.info(f"Index '{index_name}' unloaded successfully.")
 
@@ -825,83 +1872,80 @@ class Indexer:
         """
         request = envector_msg_pb2.DeleteIndexRequest()
         request.header.type = envector_type_pb.MessageType.DeleteIndex
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.index_name = index_name
 
-        response = self.stub.delete_index(
+        response = self._call_unary_with_refresh(
+            self.stub.delete_index,
             request,
-            metadata=self.grpc_metadata,
+            "delete index",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to delete index with error code {response.header.return_code}: {response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "delete index")
         else:
             logger.info(f"Index '{index_name}' deleted successfully.")
+
+    def clone_index(self, source_index_name: str, target_index_name: str):
+        """
+        Clones an index on the enVector server.
+
+        Parameters
+        ----------
+        source_index_name : str
+            The source index name to clone from.
+        target_index_name : str
+            The target index name to create.
+
+        Returns
+        -------
+        Dict
+            A dictionary containing the source and target index names.
+        """
+        request = envector_msg_pb2.CloneIndexRequest()
+        request.header.type = envector_type_pb.MessageType.CloneIndex
+        request.header.id = secrets.token_hex(10)  # unique header ID
+        request.source_index_name = source_index_name
+        request.target_index_name = target_index_name
+
+        response = self._call_unary_with_refresh(
+            self.stub.clone_index,
+            request,
+            "clone index",
+            request_id=request.header.id,
+        )
+
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "clone index")
+
+        resolved_target_name = response.target_index_name or target_index_name
+        logger.info(f"Index '{source_index_name}' cloned successfully to '{resolved_target_name}'.")
+        return {
+            "source_index_name": source_index_name,
+            "target_index_name": resolved_target_name,
+        }
 
     ###################################
     # Data Management
     ###################################
-
-    def insert_data(self, index_name: str, enc_vec: List[evi.Query], metadata: List[str] = []) -> List[Any]:
-        """
-        Inserts encrypted data and their metadata into an index from enVector server.
-
-        Parameters
-        ----------
-        index_name : str
-            The name of the index where data will be inserted.
-        enc_vec : List[evi.Query]
-            A list of encrypted vectors to be inserted.
-        metadata : List[str], optional
-            A list of metadata strings associated with the data. The default is an empty list.
-
-        Returns
-        -------
-        List[Any]
-            Inserted item identifiers in the order they were provided.
-        """
-
-        def insert_data_request_generator():
-            for vec_idx, vec in enumerate(enc_vec):
-                data = evi.Query.serializeTo(vec)
-                chunk_size = 1024 * 1024 * 129  # 1MB
-                for offset in range(0, len(data), chunk_size):
-                    request = envector_msg_pb2.InsertDataRequest()
-                    request.header.type = envector_type_pb.MessageType.InsertData
-                    request.index_name = index_name
-                    chunk = data[offset : offset + chunk_size]
-                    packed_vector = request.packed_vectors.add()
-                    packed_vector.vector.cipher_vector.id = str(vec_idx)
-                    packed_vector.vector.cipher_vector.data = chunk
-                    packed_vector.num_vector = 1
-                    if metadata and offset == 0:
-                        packed_vector.metadata.append(metadata[vec_idx] if vec_idx < len(metadata) else "")
-                    yield request
-
-        response = self.stub.insert_data(
-            insert_data_request_generator(),
-            metadata=self.grpc_metadata,
-        )
-
-        if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to insert data with error code {response.header.return_code}: {response.header.error_message}"
-            )
-
-        logger.info(f"Data inserted successfully into index '{index_name}'.")
-        return list(response.item_ids)
 
     def insert_data_bulk(
         self,
         index_name: str,
         enc_vec: List[evi.Query],
         numitems: List[int],
-        metadata: List[List[str]] = [],
-        centroid_idx: int = 0,
+        metadata: Optional[List[List[str]]] = None,
+        centroid_idx: Optional[List[int]] = None,
+        out_request_id: Optional[List[str]] = None,
     ) -> List[Any]:
         """
-        Inserts encrypted data and their metadata into an index from enVector server.
+        Submit encrypted vectors to async split processing for bulk insert.
+
+        To enable request-scoped completion tracking (Index Operation Status v0), pass an empty list
+        as ``out_request_id``. The server-generated split request ID will be appended to it after the
+        async split request completes. Use this request ID with
+        :meth:`get_index_operation_status` / :meth:`wait_for_insert_persist_completed`.
 
         Parameters
         ----------
@@ -909,28 +1953,49 @@ class Indexer:
             The name of the index where data will be inserted.
         enc_vec : List[evi.Query]
             A list of encrypted vectors to be inserted.
-        metadata : List[str], optional
-            A list of metadata strings associated with the data. The default is an empty list.
+        numitems : List[int]
+            Number of items contained in each encrypted vector (per ``enc_vec`` entry).
+        metadata : Optional[List[List[str]]], optional
+            Metadata per encrypted vector and per item (same shape as ``numitems``). If provided, it is
+            attached only to the first chunk of each vector.
+        centroid_idx : Optional[List[int]], optional
+            Cluster/centroid ids to target for IVF index types. If ``None``, the request omits cluster IDs.
+        out_request_id : Optional[List[str]], optional
+            If provided, the server-generated request ID (from ``response.header.id``) will be appended
+            to this list after the insert completes.
 
         Returns
         -------
         List[Any]
             Inserted item identifiers in the order they were provided.
+
+        Raises
+        ------
+        EnvectorValidationError
+            If parameters are invalid.
+        EnvectorApplicationError
+            If the server returns a failure status.
         """
-        # Use a unique header ID as an BatchInsert API identifier
-        header_id = f"{secrets.token_hex(10)}"
+        # Use a unique header ID as an async split batch API identifier.
+        header_id = secrets.token_hex(10)
+        normalized_centroid_idx = _normalize_cluster_id_sequence(centroid_idx, "centroid_idx")
+        cluster_ids_sent = False
 
         def insert_data_request_generator():
+            nonlocal cluster_ids_sent
             for vec_idx, vec in enumerate(enc_vec):
                 data = evi.Query.serializeTo(vec)
-                chunk_size = 1024 * 1024 * 129  # 1MB
+                chunk_size = CHUNK_SIZE_257MB
                 for offset in range(0, len(data), chunk_size):
                     request = envector_msg_pb2.BatchInsertDataRequest()
-                    request.header.type = envector_type_pb.MessageType.BatchInsertData
+                    request.header.type = envector_type_pb.MessageType.PersistBatch
                     request.header.id = header_id
+
                     request.index_name = index_name
-                    if centroid_idx >= 0:
-                        request.cluster_id = centroid_idx
+                    # Send cluster ids only once per stream to reduce request payload size.
+                    if normalized_centroid_idx is not None and not cluster_ids_sent:
+                        request.cluster_ids.extend(normalized_centroid_idx)
+                        cluster_ids_sent = True
                     chunk = data[offset : offset + chunk_size]
 
                     packed_vector = request.packed_vectors.add()
@@ -938,7 +2003,7 @@ class Indexer:
                     packed_vector.vector.cipher_vector.data = chunk
                     packed_vector.num_vector = numitems[vec_idx] if vec_idx < len(numitems) else 1
 
-                    if metadata and offset == 0:
+                    if metadata is not None and offset == 0:
                         for idx in range(packed_vector.num_vector):
                             packed_vector.metadata.append(
                                 metadata[vec_idx][idx]
@@ -948,25 +2013,416 @@ class Indexer:
 
                     yield request
 
-        # print("time to batch insert")
-        response = self.stub.batch_insert_data(
-            insert_data_request_generator(),
-            metadata=self.grpc_metadata,
+        try:
+            response = self.stub.persist_batch(
+                insert_data_request_generator(),
+                metadata=self.grpc_metadata,
+            )
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "async split batch data", request_id=header_id) from e
+
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "async split batch data")
+
+        request_id = response.header.id
+        if out_request_id is not None:
+            out_request_id.append(request_id)
+
+        logger.info(f"Async split batch insert submitted for index '{index_name}'. request_id='{request_id}'")
+        return list(response.item_ids)
+
+    def async_persist_data_bulk(
+        self,
+        index_name: str,
+        enc_vec: List[evi.Query],
+        numitems: List[int],
+        metadata: Optional[List[List[str]]] = None,
+        centroid_idx: Optional[List[int]] = None,
+        out_request_id: Optional[List[str]] = None,
+    ) -> List[Any]:
+        """
+        Bulk insert encrypted vectors and stop at split completion.
+
+        This uses the async split endpoint, so the returned request IDs can later be merged
+        manually via :meth:`async_merge_by_request_ids`.
+        """
+        self._check_insertable(index_name)
+        header_id = secrets.token_hex(10)
+        normalized_centroid_idx = _normalize_cluster_id_sequence(centroid_idx, "centroid_idx")
+        cluster_ids_sent = False
+        def insert_data_request_generator():
+            nonlocal cluster_ids_sent
+            for vec_idx, vec in enumerate(enc_vec):
+                data = evi.Query.serializeTo(vec)
+                chunk_size = CHUNK_SIZE_257MB
+                for offset in range(0, len(data), chunk_size):
+                    request = envector_msg_pb2.BatchInsertDataRequest()
+                    request.header.type = envector_type_pb.MessageType.PersistBatch
+                    request.header.id = header_id
+
+                    request.index_name = index_name
+                    if normalized_centroid_idx is not None and not cluster_ids_sent:
+                        request.cluster_ids.extend(normalized_centroid_idx)
+                        cluster_ids_sent = True
+                    chunk = data[offset : offset + chunk_size]
+
+                    packed_vector = request.packed_vectors.add()
+                    packed_vector.vector.cipher_vector.id = str(vec_idx)
+                    packed_vector.vector.cipher_vector.data = chunk
+                    packed_vector.num_vector = numitems[vec_idx] if vec_idx < len(numitems) else 1
+
+                    if metadata is not None and offset == 0:
+                        for idx in range(packed_vector.num_vector):
+                            packed_vector.metadata.append(
+                                metadata[vec_idx][idx]
+                                if vec_idx < len(metadata) and idx < len(metadata[vec_idx])
+                                else ""
+                            )
+
+                    yield request
+
+        try:
+            response = self.stub.persist_batch(
+                insert_data_request_generator(),
+                metadata=self.grpc_metadata,
+            )
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "async split batch data", request_id=header_id) from e
+
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "async split batch data")
+
+        request_id = response.header.id
+        if out_request_id is not None:
+            out_request_id.append(request_id)
+
+        logger.info(f"Async split batch inserted data into index '{index_name}'. request_id='{request_id}'")
+        return list(response.item_ids)
+
+    def insert_data_rows_batch(
+        self,
+        index_name: str,
+        enc_vecs: List[bytes],
+        metadata_list: List[str],
+        cluster_ids: Optional[List[int]] = None,
+        out_request_id: Optional[List[str]] = None,
+    ) -> List[Any]:
+        """
+        Submit multiple row-encrypted vectors to async split processing in one streaming RPC call.
+
+        Parameters
+        ----------
+        index_name : str
+            The name of the index where data will be inserted.
+        enc_vecs : List[bytes]
+            List of serialized encrypted vectors (one per row).
+        metadata_list : List[str]
+            List of metadata strings, one per vector.
+        cluster_ids : Optional[List[int]]
+            List of cluster IDs for IVF index types (one per vector).
+
+        Returns
+        -------
+        List[Any]
+            Inserted item identifiers in order.
+        """
+        header_id = secrets.token_hex(10)
+        _validate_row_insert_lengths(enc_vecs, metadata_list, cluster_ids)
+
+        def insert_data_request_generator():
+            for vec_idx, enc_vec in enumerate(enc_vecs):
+                chunk_size = CHUNK_SIZE_257MB
+                # chunk_size should be larger than at least 511 * 1 Ciphertext size
+                # TODO Fix this temporary check
+                enc_vec_len = enc_vec.size() if hasattr(enc_vec, "size") else len(enc_vec)
+                if enc_vec_len > chunk_size:
+                    raise ValueError(
+                        f"Vector at index {vec_idx} exceeds chunk size ({enc_vec_len} bytes > {chunk_size} bytes). "
+                        "Please split the vector into smaller chunks."
+                    )
+                for offset in range(0, enc_vec_len, chunk_size):
+                    request = envector_msg_pb2.InsertDataRequest()
+                    request.header.type = envector_type_pb.MessageType.PersistRows
+                    request.header.id = header_id
+                    request.index_name = index_name
+
+                    if cluster_ids is not None:
+                        request.cluster_id = cluster_ids[vec_idx]
+
+                    chunk = enc_vec[offset : offset + chunk_size]
+                    packed_vector = request.packed_vectors.add()
+                    packed_vector.vector.cipher_vector.id = str(vec_idx)
+                    packed_vector.vector.cipher_vector.data = chunk
+                    packed_vector.num_vector = 1
+
+                    if offset == 0:
+                        packed_vector.metadata.append(metadata_list[vec_idx])
+
+                    yield request
+
+        try:
+            response = self.stub.persist_rows(
+                insert_data_request_generator(),
+                metadata=self.grpc_metadata,
+            )
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "async split data", request_id=header_id) from e
+
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "async split data")
+
+        request_id = response.header.id
+        if out_request_id is not None:
+            out_request_id.append(request_id)
+
+        logger.info(f"Async split row insert submitted for index '{index_name}'. request_id='{request_id}'")
+        return list(response.item_ids)
+
+    def async_persist_data_rows_batch(
+        self,
+        index_name: str,
+        enc_vecs: List[bytes],
+        metadata_list: List[str],
+        cluster_ids: Optional[List[int]] = None,
+        out_request_id: Optional[List[str]] = None,
+    ) -> List[Any]:
+        """
+        Insert multiple row-encrypted vectors and stop at split completion.
+
+        This uses the async split endpoint, so the returned request IDs can later be merged
+        manually via :meth:`async_merge_by_request_ids`.
+        """
+        header_id = secrets.token_hex(10)
+        _validate_row_insert_lengths(enc_vecs, metadata_list, cluster_ids)
+
+        def insert_data_request_generator():
+            for vec_idx, enc_vec in enumerate(enc_vecs):
+                chunk_size = CHUNK_SIZE_257MB
+                enc_vec_len = enc_vec.size() if hasattr(enc_vec, "size") else len(enc_vec)
+                if enc_vec_len > chunk_size:
+                    raise ValueError(
+                        f"Vector at index {vec_idx} exceeds chunk size ({enc_vec_len} bytes > {chunk_size} bytes). "
+                        "Please split the vector into smaller chunks."
+                    )
+                for offset in range(0, enc_vec_len, chunk_size):
+                    request = envector_msg_pb2.InsertDataRequest()
+                    request.header.type = envector_type_pb.MessageType.PersistRows
+                    request.header.id = header_id
+                    request.index_name = index_name
+
+                    if cluster_ids is not None:
+                        request.cluster_id = cluster_ids[vec_idx]
+
+                    chunk = enc_vec[offset : offset + chunk_size]
+                    packed_vector = request.packed_vectors.add()
+                    packed_vector.vector.cipher_vector.id = str(vec_idx)
+                    packed_vector.vector.cipher_vector.data = chunk
+                    packed_vector.num_vector = 1
+
+                    if offset == 0:
+                        packed_vector.metadata.append(metadata_list[vec_idx])
+
+                    yield request
+
+        try:
+            response = self.stub.persist_rows(
+                insert_data_request_generator(),
+                metadata=self.grpc_metadata,
+            )
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "async split data", request_id=header_id) from e
+
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "async split data")
+
+        request_id = response.header.id
+        if out_request_id is not None:
+            out_request_id.append(request_id)
+
+        logger.info(f"Async split inserted {len(enc_vecs)} rows into index '{index_name}'. request_id='{request_id}'")
+        return list(response.item_ids)
+
+    def async_merge_by_request_ids(
+        self,
+        index_name: str,
+        request_ids: Sequence[str],
+    ) -> str:
+        """Submit an async merge request for previously split insert request IDs."""
+        if not request_ids:
+            raise EnvectorValidationError(message="request_ids must be non-empty")
+        request_ids_list = list(request_ids)
+        for request_id in request_ids_list:
+            self._validate_request_id(request_id)
+        if len(set(request_ids_list)) != len(request_ids_list):
+            raise EnvectorValidationError(message="request_ids must not contain duplicates")
+
+        request = envector_msg_pb2.MergeByRequestIdsRequest()
+        request.header.type = envector_type_pb.MessageType.MergeByRequestIds
+        request.header.id = secrets.token_hex(10)
+        request.index_name = index_name
+        request.request_ids.extend(request_ids_list)
+
+        response = self._call_unary_with_refresh(
+            self.stub.merge_by_request_ids,
+            request,
+            "async merge by request ids",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to insert data with error code {response.header.return_code}: {response.header.error_message}"
+            raise self._to_application_error(response.header, "async merge by request ids")
+
+        merge_request_id = response.header.id
+        logger.info(
+            f"Async merge submitted for index '{index_name}' with {len(request_ids_list)} split request(s). "
+            f"request_id='{merge_request_id}'"
+        )
+        return merge_request_id
+
+    @staticmethod
+    def _validate_request_id(request_id: Optional[str]) -> None:
+        if request_id is None:
+            return
+        if not isinstance(request_id, str):
+            raise EnvectorValidationError(message="request_id must be a str")
+        if request_id == "":
+            raise EnvectorValidationError(message="request_id must be non-empty")
+        if len(request_id) > MAX_REQUEST_ID_LENGTH:
+            raise EnvectorValidationError(
+                message=f"request_id must be <= {MAX_REQUEST_ID_LENGTH} characters",
             )
 
-        logger.info(f"Data inserted successfully into index '{index_name}'.")
-        return list(response.item_ids)
+    ###################################
+    # Delete APIs
+    ###################################
+
+    def delete_data(
+        self,
+        index_name: str,
+        item_ids: List[int],
+    ) -> str:
+        """
+        Submit a DeleteData request to remove items from an index.
+
+        Items are identified by ``item_id`` values originally returned by InsertData responses.
+
+        The server returns as soon as Phase 1 completes: target items are marked
+        for search exclusion and merge tasks are registered for physical
+        destruction. Shard rebuild, S3 cleanup, and compute-memory unload proceed
+        asynchronously. Use :meth:`wait_for_delete_completion` to observe the
+        ``SEARCHABLE`` transition that marks full completion.
+
+        Parameters
+        ----------
+        index_name : str
+            The name of the index from which items will be deleted.
+        item_ids : List[int]
+            List of item IDs to delete. These are the ``item_id`` values returned by
+            :meth:`insert_data_bulk`, :meth:`insert_data_rows_batch`, or ``Index.insert()``.
+
+        Returns
+        -------
+        str
+            Server-generated ``request_id`` for tracking operation completion via
+            :meth:`get_index_operation_status` with ``operation_type="DELETE"``.
+
+        Raises
+        ------
+        EnvectorValidationError
+            If ``index_name`` is empty, ``item_ids`` is empty, contains duplicates,
+            or contains non-positive values.
+        EnvectorApplicationError
+            If the server returns a failure status.
+        EnvectorTransportError
+            If the gRPC call fails.
+        """
+        if not index_name:
+            raise EnvectorValidationError(message="index_name must be non-empty")
+        if not item_ids:
+            raise EnvectorValidationError(message="item_ids must be non-empty")
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in item_ids):
+            raise EnvectorValidationError(message="item_ids must contain only int values")
+        if not all(i > 0 for i in item_ids):
+            raise EnvectorValidationError(message="item_ids must contain only positive integers (> 0)")
+        if len(set(item_ids)) != len(item_ids):
+            raise EnvectorValidationError(message="item_ids must not contain duplicates")
+
+        request = envector_msg_pb2.DeleteDataRequest()
+        request.header.type = envector_type_pb.MessageType.DeleteData
+        request.header.id = secrets.token_hex(10)
+        request.index_name = index_name
+        # item_ids: values returned by InsertData response (auto-increment PK, must be > 0)
+        request.item_ids.extend(item_ids)
+
+        response = self._call_unary_with_refresh(
+            self.stub.delete_data,
+            request,
+            "delete data",
+            request_id=request.header.id,
+        )
+
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "delete data")
+
+        request_id = response.header.id
+        logger.info(f"DeleteData submitted for index '{index_name}' with {len(item_ids)} item(s). request_id='{request_id}'")
+        return request_id
+
+    def wait_for_delete_completion(
+        self,
+        index_name: str,
+        request_id: str,
+        timeout_s: float = 600.0,
+        poll_interval_s: float = 1.0,
+    ) -> envector_op_pb2.GetIndexOperationStatusResponse:
+        """
+        Wait until a DELETE operation completes (shard rebuild becomes searchable).
+
+        Polls :meth:`get_index_operation_status` with ``operation_type=DELETE`` until the
+        server reports the operation has reached SEARCHABLE state.
+
+        Parameters
+        ----------
+        index_name : str
+            Target index name.
+        request_id : str
+            Server-generated request identifier from :meth:`delete_data`.
+        timeout_s : float, optional
+            Maximum time to wait (seconds). Default: 600s.
+        poll_interval_s : float, optional
+            Poll interval (seconds). Default: 1s.
+
+        Returns
+        -------
+        GetIndexOperationStatusResponse
+            The last status response when the operation reaches SEARCHABLE.
+
+        Raises
+        ------
+        EnvectorTimeoutError
+            If the operation does not complete within ``timeout_s``.
+        """
+        return self.wait_for_index_operation_state(
+            index_name=index_name,
+            request_id=request_id,
+            target_state=envector_op_pb2.SEARCHABLE,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+            operation_type="DELETE",
+        )
 
     ###################################
     # Search APIs
     ###################################
 
-    def search(self, index_name: str, query: List[List[float]], topk: List[List[int]] = []):
+    def search(
+        self,
+        index_name: str,
+        query: List[List[float]],
+        topk: List[List[int]] = [],
+        nprobe: int = None,
+        level: Optional[int] = None,
+    ):
         """
         Performs encrypted similarity search on the specified index from enVector server.
         enVector server performs secure homomorphic encryption operations with the registered evaluation key.
@@ -986,38 +2442,48 @@ class Indexer:
         # PC Search gRPC call
         request = envector_msg_pb2.InnerProductRequest()
         request.header.type = envector_type_pb.MessageType.InnerProduct
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.index_name = index_name
+        if nprobe is not None:
+            request.nprobe = nprobe
 
         for i, q in enumerate(query):
             dt = envector_type_pb.DataType()
             dt.plain_vector.id = f"id-{secrets.token_hex(5)}"
             dt.plain_vector.data.extend(q)
             dt.plain_vector.dim = len(q)
+            if level is not None:
+                dt.plain_vector.level = int(level)
             request.query_vector.append(dt)
             if len(topk) > 0:
-                # print(topk)
                 request.cluster_infos.append(envector_type_pb.CentroidsList())
                 for idx in topk[i]:
                     request.cluster_infos[-1].centroids.append(idx)
-                # print(f"{request.cluster_infos=}")
 
         query_ids = [dt.plain_vector.id for dt in request.query_vector]
 
-        response_stream = self.stub.inner_product(
-            request,
-            metadata=self.grpc_metadata,
-        )
+        try:
+            response_stream = self.stub.inner_product(
+                request,
+                metadata=self.grpc_metadata,
+            )
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "search", request_id=request.header.id) from e
 
         shard_idx = {k: [] for k in query_ids}
         results = {k: [] for k in query_ids}
-        for response in response_stream:
-            if response.header.return_code != envector_type_pb.ReturnCode.Success:
-                raise ValueError(
-                    f"Failed to search with error code {response.header.return_code}: {response.header.error_message}"
-                )
-            output = list(response.ctxt_score)[0]
-            results[output.id].append(list(output.ctxt_score)[0])
-            shard_idx[output.id].extend(list(output.shard_idx))
+        try:
+            for response in response_stream:
+                if response.header.return_code != envector_type_pb.ReturnCode.Success:
+                    raise self._to_application_error(response.header, "search")
+                if len(response.ctxt_score) == 0:
+                    logger.warning(f"Index '{index_name}' returned empty scores. The index may be empty.")
+                    return []
+                output = response.ctxt_score[0]
+                results[output.id].append(output.ctxt_score[0])
+                shard_idx[output.id].extend(output.shard_idx)
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "search (stream)", request_id=request.header.id) from e
 
         outputs = [
             envector_type_pb.CiphertextScore(
@@ -1027,6 +2493,10 @@ class Indexer:
             )
             for query_id in query_ids
         ]
+
+        results.clear()
+        shard_idx.clear()
+        del results, shard_idx
 
         return outputs
 
@@ -1050,6 +2520,7 @@ class Indexer:
         # CC Search gRPC call
         request = envector_msg_pb2.InnerProductRequest()
         request.header.type = envector_type_pb.MessageType.InnerProduct
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.index_name = index_name
 
         for i, vec in enumerate(enc_query):
@@ -1064,21 +2535,28 @@ class Indexer:
 
         query_ids = [dt.cipher_vector.id for dt in request.query_vector]
 
-        response_stream = self.stub.inner_product(
-            request,
-            metadata=self.grpc_metadata,
-        )
+        try:
+            response_stream = self.stub.inner_product(
+                request,
+                metadata=self.grpc_metadata,
+            )
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "encrypted search", request_id=request.header.id) from e
 
         shard_idx = {k: [] for k in query_ids}
         results = {k: [] for k in query_ids}
-        for response in response_stream:
-            if response.header.return_code != envector_type_pb.ReturnCode.Success:
-                raise ValueError(
-                    f"Failed to search with error code {response.header.return_code}: {response.header.error_message}"
-                )
-            output = list(response.ctxt_score)[0]
-            results[output.id].append(list(output.ctxt_score)[0])
-            shard_idx[output.id].extend(list(output.shard_idx))
+        try:
+            for response in response_stream:
+                if response.header.return_code != envector_type_pb.ReturnCode.Success:
+                    raise self._to_application_error(response.header, "encrypted search")
+                if len(response.ctxt_score) == 0:
+                    logger.warning(f"Index '{index_name}' returned empty scores. The index may be empty.")
+                    return []
+                output = response.ctxt_score[0]
+                results[output.id].append(output.ctxt_score[0])
+                shard_idx[output.id].extend(output.shard_idx)
+        except grpc.RpcError as e:
+            raise self._normalize_transport_error(e, "encrypted search (stream)", request_id=request.header.id) from e
 
         outputs = [
             envector_type_pb.CiphertextScore(
@@ -1088,6 +2566,10 @@ class Indexer:
             )
             for query_id in query_ids
         ]
+
+        results.clear()
+        shard_idx.clear()
+        del results, shard_idx
 
         return outputs
 
@@ -1116,6 +2598,7 @@ class Indexer:
         """
         request = envector_msg_pb2.GetMetadataRequest()
         request.header.type = envector_type_pb.MessageType.GetMetadata
+        request.header.id = secrets.token_hex(10)  # unique header ID
         request.index_name = index_name
 
         if isinstance(idx, list) or isinstance(idx, tuple):
@@ -1132,21 +2615,23 @@ class Indexer:
                     pos.row_idx = position[1]
 
         else:
-            raise ValueError(f"Ambiguous format for idx: {type(idx)}.\nExpected 'List[Position]' or 'List[List[int]]'.")
+            raise EnvectorValidationError(
+                message=f"Ambiguous format for idx: {type(idx)}. Expected 'List[Position]' or 'List[List[int]]'.",
+            )
 
         if fields:
             for field in fields:
                 request.output_fields.append(field)
 
-        response = self.stub.get_metadata(
+        response = self._call_unary_with_refresh(
+            self.stub.get_metadata,
             request,
-            metadata=self.grpc_metadata,
+            "get metadata",
+            request_id=request.header.id,
         )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
-            raise ValueError(
-                f"Failed to get metadata with error code {response.header.return_code}: {response.header.error_message}"
-            )
+            raise self._to_application_error(response.header, "get metadata")
         else:
             logger.info(f"Metadata for index '{index_name}' received successfully.")
             return list(response.metadata)

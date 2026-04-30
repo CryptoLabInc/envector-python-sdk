@@ -162,7 +162,7 @@ def parse_args():
     parser.add_argument("--host", type=str, default="0.0.0.0", help="ES2 server host")
     parser.add_argument("--port", type=int, default=50050, help="ES2 server port")
     parser.add_argument("--random_centroid", action="store_true", help="Let server create centroids randomly")
-    parser.add_argument("--eval_mode", type=str, default="RMP", help="Evaluation mode for index creation")
+    parser.add_argument("--eval_mode", type=str, default="mm32", help="Evaluation mode for index creation")
     parser.add_argument("--compare_flat", action="store_true", help="Compare IVF_FLAT and FLAT index performance")
     parser.add_argument(
         "--nprobe_values",

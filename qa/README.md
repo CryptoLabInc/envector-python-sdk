@@ -73,5 +73,5 @@ python3 pcmm-ann-test.py --num_vectors 1000000 --dim 1536 --n_lists 250 --n_prob
 - `--port`: Port number for the enVector endpoint service (default: 50050)
 - `--host`: enVector server host (default: 0.0.0.0)
 - `--random_centroid`: Generate Centroid on server side
-- `--eval_mode`: Evaluation Mode (default: rmp)
+- `--eval_mode`: Evaluation Mode (default: mm32)
 ````
