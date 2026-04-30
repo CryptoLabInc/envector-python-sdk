@@ -64,7 +64,7 @@ colab = [
 ]
 
 [tool.scikit-build]
-cmake.source-dir = "./external/evi/crypto"
+cmake.source-dir = "./external/evi-crypto"
 
 cmake.version = ">=3.19"
 

@@ -120,7 +120,7 @@ Docker packaging is split into two phases under `sdk/python/docker/`:
 
 - **wheel build**: [`docker/buildpack/Dockerfile`](./docker/buildpack/Dockerfile)
   builds manylinux wheels from source using the private
-  `external/evi` submodule (cmake source-dir: `external/evi/crypto`).
+  `external/evi-crypto` submodule (cmake source-dir: `external/evi-crypto`).
 - **runtime packaging**:
   [`docker/dockerize/Dockerfile`](./docker/dockerize/Dockerfile)
   installs only prebuilt wheels into a minimal runtime image. Its build context

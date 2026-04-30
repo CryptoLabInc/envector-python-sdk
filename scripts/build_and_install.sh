@@ -108,7 +108,7 @@ if [[ "$TYPE" == "wheel" ]]; then
   pip wheel --no-deps . -w dist -v
 elif [[ "$TYPE" == "install" ]]; then
   echo "Installing package with CMAKE_ARGS:"
-  cd ./external/evi/crypto
+  cd ./external/evi-crypto
   echo "$CMAKE_ARGS"
   pip install . -v
 else

@@ -72,9 +72,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY pyproject.toml README_pypi.md MANIFEST.in LICENSE ./
 COPY pyenvector ./pyenvector
-COPY external/evi ./external/evi
+COPY external/evi-crypto ./external/evi-crypto
 
-# scikit-build-core reads cmake.source-dir = ./external/evi/crypto
+# scikit-build-core reads cmake.source-dir = ./external/evi-crypto
 RUN CXXFLAGS='-include cstdint' pip wheel --no-deps --wheel-dir /wheels/raw .
 
 RUN mkdir -p /wheels/out && \

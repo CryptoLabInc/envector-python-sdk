@@ -183,8 +183,8 @@ if [[ "$TARGET_ARCH" == "multiarch" || "$TARGET_ARCH" != "$(uname -m | sed 's/x8
 fi
 
 if [[ -z "${WHEELHOUSE_INPUT}" ]]; then
-  if [[ ! -f "${SDK_DIR}/external/evi/crypto/CMakeLists.txt" ]]; then
-    echo "[ERROR] external/evi is empty. Run:" >&2
+  if [[ ! -f "${SDK_DIR}/external/evi-crypto/CMakeLists.txt" ]]; then
+    echo "[ERROR] external/evi-crypto is empty. Run:" >&2
     echo "          git -C $(dirname "${SDK_DIR}") submodule update --init --recursive" >&2
     exit 1
   fi

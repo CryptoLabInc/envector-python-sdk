@@ -72,7 +72,7 @@ update_submodules() {
 
     # If running in CI with a token, ensure HTTPS URL is used for the submodule
     if [[ -n "${CI:-}" && -n "${GITHUB_TOKEN:-}" ]]; then
-        git config submodule.external/evi.url "https://${GITHUB_TOKEN}@github.com/CryptoLabInc/evi.git" || true
+        git config submodule.external/evi-crypto.url "https://${GITHUB_TOKEN}@github.com/CryptoLabInc/evi-crypto.git" || true
         git submodule sync --recursive || true
     fi
 
@@ -83,7 +83,7 @@ update_submodules() {
     if [[ -n "$EVI_COMMIT" ]]; then
         echo "Checking out provided EVI_COMMIT: $EVI_COMMIT"
         (
-          cd external/evi
+          cd external/evi-crypto
           # Ensure the desired commit is available: fetch all branches/tags with full history
           git fetch origin "+refs/heads/*:refs/remotes/origin/*" "+refs/tags/*:refs/tags/*" --prune || true
 
@@ -107,7 +107,7 @@ update_submodules() {
                   return 0
               fi
 
-              echo "Error: could not find commit/branch/tag '$target' in external/evi" >&2
+              echo "Error: could not find commit/branch/tag '$target' in external/evi-crypto" >&2
               return 1
           }
 
