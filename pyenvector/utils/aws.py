@@ -1,7 +1,10 @@
 import json
 import os
+from contextlib import closing
 
+import boto3
 import evi
+from botocore.exceptions import ClientError
 
 from pyenvector.utils.utils import _normalize_key_type
 
@@ -21,10 +24,10 @@ class AWSClient:
         self.s3_bucket = s3_bucket or self.DEFAULT_BUCKET
         self.secret_prefix = secret_prefix or self.DEFAULT_PREFIX
 
-        aws_cfg = evi.AwsConfig()
-        aws_cfg.region = self.region_name or ""
-        aws_cfg.bucket_name = self.s3_bucket
-        self._client = evi.KeyManager(evi.KeyStorageConfig.make_aws(aws_cfg))
+        session = boto3.session.Session(region_name=self.region_name)
+        self._sm = session.client("secretsmanager")
+        self._s3 = session.client("s3")
+        self._client_error_cls = ClientError
         self._codec = evi.KeyManager()
 
     def _secret_name(self, prefix: str, key_id: str, blob_type: str) -> str:
@@ -96,108 +99,159 @@ class AWSClient:
         )
         raise AWSKeyStorageError(message, original_error=error) from error
 
+    def _is_not_found(self, error: Exception) -> bool:
+        if not isinstance(error, self._client_error_cls):
+            return False
+        code = str(error.response.get("Error", {}).get("Code", ""))
+        return code in {"ResourceNotFoundException", "NoSuchKey", "404", "NotFound"}
+
     def list_keys(self):
+        prefix = (self.secret_prefix or "").rstrip("/")
+        keys = set()
         try:
-            return sorted(set(self._client.list_keys()))
+            paginator = self._s3.get_paginator("list_objects_v2")
+            kwargs = {"Bucket": self.s3_bucket}
+            if prefix:
+                kwargs["Prefix"] = f"{prefix}/"
+            for page in paginator.paginate(**kwargs):
+                for obj in page.get("Contents", []):
+                    key = obj.get("Key")
+                    if key:
+                        key_id = self._extract_key_id(key, prefix=prefix)
+                        if key_id:
+                            keys.add(key_id)
         except Exception as e:
             self._raise_storage_error("list keys", e)
+        return sorted(keys)
+
+    @staticmethod
+    def _extract_key_id(storage_key: str, *, prefix: str = ""):
+        base = f"{prefix}/" if prefix else ""
+        if base:
+            if not storage_key.startswith(base):
+                return None
+            storage_key = storage_key[len(base) :]
+        parts = storage_key.split("/")
+        if len(parts) != 2 or not parts[0] or not parts[1].endswith(".json"):
+            return None
+        return parts[0]
 
     def upload_to_storage(self, file_path, bucket, key):
-        """Upload a file from file_path to the specified storage bucket/key."""
         try:
             if bucket != self.s3_bucket:
                 raise ValueError(f"bucket '{bucket}' does not match configured bucket '{self.s3_bucket}'")
-            with open(file_path, "rb") as f:
-                payload = f.read()
-            self._client.put_pub_key(key, payload)
+            self._s3.upload_file(file_path, bucket, key)
         except Exception as e:
             self._raise_storage_error(f"upload file to s3 bucket '{bucket}' with key '{key}'", e)
 
     def download_from_storage(self, bucket, key):
-        """Return the bytes stored in bucket/key via get_object."""
         try:
             if bucket != self.s3_bucket:
                 raise ValueError(f"bucket '{bucket}' does not match configured bucket '{self.s3_bucket}'")
-            return self._client.get_pub_key(key)
+            resp = self._s3.get_object(Bucket=bucket, Key=key)
+            with closing(resp["Body"]) as body:
+                return body.read()
         except Exception as e:
             self._raise_storage_error(f"download object from s3 bucket '{bucket}' with key '{key}'", e)
 
     def put_secret_string(self, name, secret_string, description=None):
-        """Store a secret string, creating as needed."""
         _ = description
         try:
-            self._client.put_sec_key(name, secret_string.encode("utf-8"))
+            if self._secret_exists(name):
+                self._sm.put_secret_value(SecretId=name, SecretString=secret_string)
+            else:
+                self._sm.create_secret(Name=name, SecretString=secret_string)
         except Exception as e:
             self._raise_storage_error(f"store secret '{name}'", e)
 
     def get_secret_string(self, name, *, allow_missing=False):
-        """Return a secret string value."""
         response = self._get_secret_value(name, allow_missing=allow_missing)
         if response is None:
             return None
-        return response.get("SecretString")
+        secret_string = response.get("SecretString")
+        if secret_string is not None:
+            return secret_string
+        secret_binary = response.get("SecretBinary")
+        if secret_binary is None:
+            return None
+        try:
+            return bytes(secret_binary).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
     def put_secret_binary(self, name, secret_bytes, description=None):
-        """Store a secret binary blob, creating as needed."""
         _ = description
         try:
-            self._client.put_sec_key(name, bytes(secret_bytes))
+            payload = bytes(secret_bytes)
+            if self._secret_exists(name):
+                self._sm.put_secret_value(SecretId=name, SecretBinary=payload)
+            else:
+                self._sm.create_secret(Name=name, SecretBinary=payload)
         except Exception as e:
             self._raise_storage_error(f"store secret binary '{name}'", e)
 
     def get_secret_binary(self, name, *, allow_missing=False):
-        """Return a secret binary value."""
         response = self._get_secret_value(name, allow_missing=allow_missing)
         if response is None:
             return None
-        return response.get("SecretBinary")
+        secret_binary = response.get("SecretBinary")
+        if secret_binary is not None:
+            return secret_binary
+        secret_string = response.get("SecretString")
+        if secret_string is None:
+            return None
+        return secret_string.encode("utf-8")
 
     def _get_secret_value(self, name, *, allow_missing=False):
         try:
-            payload = self._client.get_sec_key(name)
-            return {"SecretString": payload.decode("utf-8"), "SecretBinary": payload}
+            return self._sm.get_secret_value(SecretId=name)
         except Exception as e:
-            if allow_missing:
+            if allow_missing and self._is_not_found(e):
                 return None
             self._raise_storage_error(f"load secret '{name}'", e)
 
-    def _delete_secret(self, name, *, allow_missing=True):
+    def _delete_secret(self, name, *, allow_missing=True, force_delete_without_recovery=False):
         try:
-            self._client.delete_sec_key(name)
+            kwargs = {"SecretId": name}
+            if force_delete_without_recovery:
+                kwargs["ForceDeleteWithoutRecovery"] = True
+            self._sm.delete_secret(**kwargs)
         except Exception as e:
-            if allow_missing:
+            if allow_missing and self._is_not_found(e):
                 return
             self._raise_storage_error(f"delete secret '{name}'", e)
 
     def _delete_s3_object(self, bucket, key, *, allow_missing=True):
+        if bucket != self.s3_bucket:
+            raise ValueError(f"bucket '{bucket}' does not match configured bucket '{self.s3_bucket}'")
         try:
-            if bucket != self.s3_bucket:
-                raise ValueError(f"bucket '{bucket}' does not match configured bucket '{self.s3_bucket}'")
-            self._client.delete_pub_key(key)
+            self._s3.delete_object(Bucket=bucket, Key=key)
         except Exception as e:
-            if allow_missing:
+            if allow_missing and self._is_not_found(e):
                 return
             self._raise_storage_error(f"delete s3 object '{key}' from bucket '{bucket}'", e)
 
     def _secret_exists(self, name: str) -> bool:
-        return self.get_secret_string(name, allow_missing=True) is not None
+        try:
+            self._sm.describe_secret(SecretId=name)
+            return True
+        except Exception as e:
+            if self._is_not_found(e):
+                return False
+            self._raise_storage_error(f"check secret '{name}'", e)
 
     def _s3_object_exists(self, bucket: str, key: str) -> bool:
         if bucket != self.s3_bucket:
             raise ValueError(f"bucket '{bucket}' does not match configured bucket '{self.s3_bucket}'")
         try:
-            return key in set(self._client.list_keys())
-        except Exception:
-            return False
+            self._s3.head_object(Bucket=bucket, Key=key)
+            return True
+        except Exception as e:
+            if self._is_not_found(e):
+                return False
+            self._raise_storage_error(f"check s3 object '{key}' in bucket '{bucket}'", e)
 
     def check_key_id(self, key_id: str, *, bucket: str = None, secret_prefix: str = None) -> dict:
-        """
-        Verify whether all stored blobs for ``key_id`` exist in AWS Secrets Manager and S3.
-
-        Returns a dictionary with the existence of each blob and an ``all_present`` flag
-        that only considers mandatory blobs (sec, enc, eval).
-        """
-
         bucket = bucket or self.s3_bucket
         secret_prefix = secret_prefix or self.secret_prefix
 
@@ -216,22 +270,10 @@ class AWSClient:
         return result
 
     def verify_key_id(self, key_id: str, *, bucket: str = None, secret_prefix: str = None) -> bool:
-        """
-        Return True when all required blobs for ``key_id`` exist, False otherwise.
-
-        This is primarily used by higher-level components to decide whether keys need to be generated.
-        """
-
         status = self.check_key_id(key_id, bucket=bucket, secret_prefix=secret_prefix)
         return bool(status.get("all_present"))
 
     def store_key_dict(self, key_dict: dict, key_id: str, *, bucket: str = None, secret_prefix: str = None):
-        """
-        Persist wrapped key blobs to AWS services.
-
-        ``sec_blob`` and ``metadata_blob`` (if present) go to Secrets Manager,
-        while ``enc_blob`` and ``eval_blob`` are stored in S3.
-        """
         return self._store_key_dict_impl(
             key_dict,
             key_id,
@@ -251,14 +293,6 @@ class AWSClient:
         seal_info=None,
         seal_sec_and_metadata: bool = False,
     ):
-        """
-        Internal implementation for key persistence.
-
-        When ``seal_sec_and_metadata`` is True:
-        - sec_blob is unwrapped to raw bytes and re-wrapped with ``seal_info``
-        - metadata_blob is generated if missing and wrapped with ``seal_info``
-        - enc/eval remain provider-wrapped and are uploaded to S3
-        """
         if seal_sec_and_metadata and seal_info is None:
             raise ValueError("seal_info is required when seal_sec_and_metadata is enabled.")
 
@@ -303,9 +337,6 @@ class AWSClient:
         bucket: str = None,
         secret_prefix: str = None,
     ):
-        """
-        Store keys while sealing sec/metadata with AES KEK (via ``seal_info``).
-        """
         return self._store_key_dict_impl(
             key_dict,
             key_id,
@@ -318,16 +349,6 @@ class AWSClient:
     def load_key_dict(
         self, key_id: str, *, bucket: str = None, secret_prefix: str = None, key_type=None
     ) -> dict:
-        """
-        Load key blobs for ``key_id`` and return a dictionary compatible with
-        ``generate_keys_stream``.
-
-        When ``key_type`` is ``None``, all supported blobs are loaded and returned:
-        ``sec``, ``metadata``, ``enc``, and ``eval``. Otherwise, ``key_type`` acts
-        as a filter and only the requested blob type(s) are fetched and included in
-        the returned dictionary. Allowed values are ``sec``, ``metadata``, ``enc``,
-        and ``eval``.
-        """
         return self._load_key_dict_impl(
             key_id,
             bucket=bucket,
@@ -389,9 +410,6 @@ class AWSClient:
         secret_prefix: str = None,
         key_type=None,
     ) -> dict:
-        """
-        Load keys and unseal sec/metadata with AES KEK (via ``seal_info``).
-        """
         return self._load_key_dict_impl(
             key_id,
             bucket=bucket,
@@ -450,7 +468,6 @@ class AWSClient:
             except Exception:
                 continue
 
-        # If already raw key bytes, pass through.
         if isinstance(payload, (bytes, bytearray)):
             return bytes(payload)
         raise ValueError("Unsupported sec_blob payload; unable to unwrap.")
@@ -496,14 +513,30 @@ class AWSClient:
         storage_key = self._storage_key(key_id, "enc_blob", secret_prefix)
         if bucket != self.s3_bucket:
             raise ValueError(f"bucket '{bucket}' does not match configured bucket '{self.s3_bucket}'")
-        self._client.put_pub_key(storage_key, self._to_json_string(enc_blob).encode("utf-8"))
+        try:
+            self._s3.put_object(
+                Bucket=bucket,
+                Key=storage_key,
+                Body=self._to_json_string(enc_blob).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception as e:
+            self._raise_storage_error(f"store enc key to s3 bucket '{bucket}' with key '{storage_key}'", e)
 
     def store_eval_key(self, eval_blob, key_id: str, *, bucket: str = None, secret_prefix: str = None):
         bucket = bucket or self.s3_bucket
         storage_key = self._storage_key(key_id, "eval_blob", secret_prefix)
         if bucket != self.s3_bucket:
             raise ValueError(f"bucket '{bucket}' does not match configured bucket '{self.s3_bucket}'")
-        self._client.put_pub_key(storage_key, self._to_json_string(eval_blob).encode("utf-8"))
+        try:
+            self._s3.put_object(
+                Bucket=bucket,
+                Key=storage_key,
+                Body=self._to_json_string(eval_blob).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception as e:
+            self._raise_storage_error(f"store eval key to s3 bucket '{bucket}' with key '{storage_key}'", e)
 
     def load_sec_key(self, key_id: str, *, secret_prefix: str = None):
         sec_name = self._secret_name(secret_prefix or self.secret_prefix, key_id, "sec_blob")
@@ -525,7 +558,6 @@ class AWSClient:
             unwrapped = self._codec.unwrap_eval_key_bytes(metadata_payload.encode("utf-8"))
             return json.loads(unwrapped.decode("utf-8"))
         except Exception:
-            # Backward compatibility: preserve previously stored JSON if unwrap fails.
             return parsed_payload
 
     def load_enc_key(self, key_id: str, *, bucket: str = None, secret_prefix: str = None):
@@ -555,7 +587,6 @@ class AWSClient:
         self._delete_s3_object(bucket or self.s3_bucket, storage_key)
 
     def delete_all_keys(self, key_id: str, *, bucket: str = None, secret_prefix: str = None):
-        """Remove all stored blobs for the given key_id from secret store and bucket."""
         bucket = bucket or self.s3_bucket
         secret_prefix = secret_prefix or self.secret_prefix
 

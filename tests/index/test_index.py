@@ -272,6 +272,83 @@ def test_insert_ivf_bulk_accepts_encrypted_cipherblock_with_centroids(monkeypatc
         index._knn.assert_not_called()
 
 
+def test_insert_ivf_row_path_accepts_serialized_ciphertexts_with_centroids(monkeypatch, mock_indexer):
+    ivf_config = IndexConfig(
+        index_name="test_index",
+        dim=32,
+        key_path="./keys",
+        key_id="test_key",
+        preset="ip1",
+        query_encryption="plain",
+        index_encryption="cipher",
+        index_params={"index_type": "ivf_flat", "nlist": 2, "default_nprobe": 1},
+    )
+    mock_indexer.get_index_summary.return_value = {
+        "index_name": "test_index",
+        "dim": 32,
+        "key_id": "test_key",
+        "row_count": 0,
+        "search_type": "ip",
+        "index_encryption": "cipher",
+        "query_encryption": "plain",
+        "is_loaded": True,
+        "is_key_loaded": True,
+        "index_type": "IVF_FLAT",
+        "description": "Test index",
+        "created_time": "2026-01-01T00:00:00Z",
+        "state": "insert/search",
+        "remaining_insertable_shards": 8,
+        "remaining_insertable_vectors_guaranteed": 32768,
+        "remaining_insertable_vectors_best_effort": 32768,
+    }
+    mock_indexer.get_index_info.return_value = {
+        "index_name": "test_index",
+        "dim": 32,
+        "key_id": "test_key",
+        "row_count": 0,
+        "search_type": "ip",
+        "index_encryption": "cipher",
+        "query_encryption": "plain",
+        "is_loaded": True,
+        "index_type": "IVF_FLAT",
+        "description": "Test index",
+        "ivf_detail": MagicMock(
+            nlist=2,
+            default_nprobe=1,
+            centroids=[MagicMock(plain_vector=MagicMock(data=[0.0] * 32)) for _ in range(2)],
+        ),
+        "remaining_insertable_shards": 8,
+        "remaining_insertable_vectors_guaranteed": 32768,
+        "remaining_insertable_vectors_best_effort": 32768,
+    }
+
+    Index._default_indexer = mock_indexer
+    Index._default_key_path = "./keys"
+    cipher_mock = MagicMock()
+    cipher_mock.encrypt_row.return_value = CipherBlock([b"ctxt-1", b"ctxt-2"], centroids_idx=[0, 1])
+    monkeypatch.setattr("pyenvector.index.index.Cipher", MagicMock(return_value=cipher_mock))
+    monkeypatch.setattr("pyenvector.index.index.encrypt_metadata", MagicMock(return_value="encrypted_metadata"))
+    monkeypatch.setattr(ENVECTOR_UTILS_AES, "encrypt_metadata", MagicMock(return_value="encrypted_metadata"))
+
+    index = Index("test_index", ivf_config)
+    index.cipher = cipher_mock
+    index._knn = MagicMock(return_value=[[0], [1]])
+
+    item_ids = index.insert(
+        [[0.01 * i for i in range(32)], [0.02 * i for i in range(32)]],
+        ["meta1", "meta2"],
+        use_row_insert=True,
+        load=False,
+    )
+
+    assert item_ids == [1, 1]
+    cipher_mock.encrypt_row.assert_called_once()
+    mock_indexer.async_persist_data_rows_batch.assert_called_once()
+    args, kwargs = mock_indexer.async_persist_data_rows_batch.call_args
+    assert args[3] == [0, 1]
+    assert kwargs["out_request_id"] == ["split-row-1"]
+
+
 def test_index_init_uses_summary_instead_of_detail(monkeypatch, mock_indexer, index_config):
     Index._default_indexer = mock_indexer
     Index._default_key_path = "./keys"

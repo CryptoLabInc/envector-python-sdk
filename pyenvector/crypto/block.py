@@ -90,6 +90,8 @@ class CipherBlock:
     @property
     def num_vectors(self):
         if not self.is_score:
+            if all(isinstance(vec, bytes) for vec in self.data):
+                return len(self.data)
             total = 0
             for vec in self.data:
                 total += vec.getInnerItemCount()
@@ -100,6 +102,8 @@ class CipherBlock:
     @property
     def num_item_list(self):
         if not self.is_score:
+            if all(isinstance(vec, bytes) for vec in self.data):
+                return [1] * len(self.data)
             if self.enc_type == "multiple":
                 item_list = []
                 for vec in self.data:

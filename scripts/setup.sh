@@ -10,7 +10,7 @@
 # 4. Create a Pipenv virtual environment and install dependencies
 # 5. Generate Protobuf code and run additional scripts
 #
-# Usage: ./setup.sh [--python <version>] [--type <install|wheel>] [--macosx-target <version>] [--evi-commit <sha|branch|tag>] [--skip-build-evi] [--aws] [--gcp] [-j <jobs>|--jobs <jobs>]
+# Usage: ./setup.sh [--python <version>] [--type <install|wheel>] [--macosx-target <version>] [--evi-commit <sha|branch|tag>] [--skip-build-evi] [-j <jobs>|--jobs <jobs>]
 # ==============================================================================
 
 # --- Script Configuration ---
@@ -115,9 +115,7 @@ function build_project() {
     local BUILD_TYPE=${1:-install}
     local MACOSX_TARGET=${2:-11.0}
     local SKIP_BUILD=${3:-false}
-    local PREFER_AWS_SDK=${4:-false}
-    local PREFER_GCP_SDK=${5:-false}
-    local JOBS=${6:-}
+    local JOBS=${4:-}
     msg "Starting project build..."
     if [[ "$SKIP_BUILD" == "true" ]]; then
         msg "--skip-build-evi set: Skipping build_and_install step."
@@ -128,12 +126,6 @@ function build_project() {
     msg "Running the installation script..."
 
     local BUILD_ARGS=(--type "$BUILD_TYPE" --macosx-target "$MACOSX_TARGET")
-    if [[ "$PREFER_AWS_SDK" == "true" ]]; then
-        BUILD_ARGS+=(--aws)
-    fi
-    if [[ "$PREFER_GCP_SDK" == "true" ]]; then
-        BUILD_ARGS+=(--gcp)
-    fi
     if [[ -n "$JOBS" ]]; then
         BUILD_ARGS+=(--jobs "$JOBS")
     fi
@@ -154,8 +146,6 @@ function main() {
     MACOSX_TARGET=11.0   # Default macOS deployment target
     EVI_COMMIT=""
     SKIP_BUILD_EVI=false
-    PREFER_AWS_SDK=false
-    PREFER_GCP_SDK=false
     JOBS=""
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -184,14 +174,6 @@ function main() {
                 SKIP_BUILD_EVI=true
                 shift 1
                 ;;
-            --aws)
-                PREFER_AWS_SDK=true
-                shift 1
-                ;;
-            --gcp)
-                PREFER_GCP_SDK=true
-                shift 1
-                ;;
             -j|--jobs)
                 if [[ $# -lt 2 ]]; then
                     echo "Option $1 requires a positive integer value."
@@ -215,7 +197,7 @@ function main() {
     cleanup
     init_submodule "$EVI_COMMIT"
     setup_pipenv $PYTHON_VERSION
-    build_project $BUILD_TYPE $MACOSX_TARGET $SKIP_BUILD_EVI $PREFER_AWS_SDK $PREFER_GCP_SDK $JOBS
+    build_project $BUILD_TYPE $MACOSX_TARGET $SKIP_BUILD_EVI $JOBS
 
     echo # Newline for spacing
     success "All setup steps completed successfully!"
