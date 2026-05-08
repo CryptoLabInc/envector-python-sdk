@@ -50,4 +50,4 @@ except ImportError:
     KMSClient = None
 from pyenvector.utils import AWSClient, GCPClient, VaultClient
 
-__version__ = "1.4.0a5"
+__version__ = "1.4.2"

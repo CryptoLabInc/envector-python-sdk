@@ -14,7 +14,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "pyenvector"
-version = "1.4.0a5"
+version = "1.4.2"
 description = "Python SDK for enVector: encrypted vector search powered by homomorphic encryption"
 authors = [
     {name = "CryptoLab Inc.", email = "pypi@cryptolab.co.kr"}
