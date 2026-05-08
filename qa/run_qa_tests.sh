@@ -2,7 +2,7 @@
 
 # Default environment variables
 export TOPK=${TOPK:-2}
-export ES2E_HOST_PORT=${ES2E_HOST_PORT:-50050}
+export ENVECTOR_ENDPOINT_HOST_PORT=${ENVECTOR_ENDPOINT_HOST_PORT:-50050}
 
 # Get test_type from arguments or set default
 test_type=${1:-"nightly"}
@@ -16,7 +16,7 @@ run_test() {
   python qa-test.py \
     --test_name $test_name \
     --top_k $TOPK \
-    --port $ES2E_HOST_PORT \
+    --port $ENVECTOR_ENDPOINT_HOST_PORT \
     --test_type $test_type || echo "fail" > $fail_file
 }
 

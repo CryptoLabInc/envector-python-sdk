@@ -7,10 +7,10 @@ from pyenvector.crypto.parameter import ContextParameter
 @pytest.mark.parametrize(
     "preset, dim, eval_mode, expected_preset, expected_search_type",
     [
-        ("IP", 32, "RMP", "IP0", "IP"),
-        ("IP0", 64, "RMP", "IP0", "IP"),
-        ("IP", 128, "RMP", "IP0", "IP"),
-        ("IP", 256, "RMP", "IP0", "IP"),
+        ("IP1", 32, "MM", "IP1", "IP"),
+        ("IP1", 64, "MM", "IP1", "IP"),
+        ("IP1", 128, "MM", "IP1", "IP"),
+        ("IP1", 256, "MM", "IP1", "IP"),
     ],
 )
 def test_context_initialization(preset, dim, eval_mode, expected_preset, expected_search_type):
@@ -22,7 +22,7 @@ def test_context_initialization(preset, dim, eval_mode, expected_preset, expecte
 
 
 def test_context_from_parameter():
-    parameter = ContextParameter(preset="IP", dim=128, eval_mode="RMP")
+    parameter = ContextParameter(preset="IP1", dim=128, eval_mode="MM")
     context = Context._create_from_parameter(parameter)
     assert context.preset == parameter.preset
     assert context.dim == parameter.dim
@@ -37,4 +37,4 @@ def test_context_invalid_preset():
 
 def test_context_invalid_eval_mode():
     with pytest.raises(ValueError):
-        Context(preset="IP", dim=123, eval_mode="NONE")
+        Context(preset="IP1", dim=123, eval_mode="NONE")

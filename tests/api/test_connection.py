@@ -2,9 +2,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import grpc
 
-from pyenvector.api.connection import Connection
-
-MAX_MESSAGE_LENGTH = 1024 * 1024 * 100  # Update to match actual gRPC options
+from pyenvector.api.connection import MAX_MESSAGE_LENGTH, Connection
 
 GRPC_OPTIONS = [
     ("grpc.max_receive_message_length", MAX_MESSAGE_LENGTH),

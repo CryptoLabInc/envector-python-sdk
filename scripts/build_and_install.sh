@@ -4,6 +4,13 @@ set -e
 # Parse input arguments first
 TYPE="install"  # Default to install
 MACOSX_TARGET="11.0"  # Default macOS deployment target
+PREFER_AWS_SDK=false
+PREFER_GCP_SDK=false
+JOBS=""
+
+is_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -15,6 +22,26 @@ while [[ $# -gt 0 ]]; do
       MACOSX_TARGET="$2"
       shift 2
       ;;
+    --aws)
+      PREFER_AWS_SDK=true
+      shift 1
+      ;;
+    --gcp)
+      PREFER_GCP_SDK=true
+      shift 1
+      ;;
+    -j|--jobs)
+      if [[ $# -lt 2 ]]; then
+        echo "Option $1 requires a positive integer value."
+        exit 1
+      fi
+      if ! is_positive_integer "$2"; then
+        echo "Invalid jobs value: $2. Expected a positive integer."
+        exit 1
+      fi
+      JOBS="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
       exit 1
@@ -24,6 +51,7 @@ done
 
 # Detect platform
 platform="$(uname)"
+base_cmake_args="${CMAKE_ARGS:-}"
 cmake_args="-DBUILD_PYTHON=ON"
 
 # Platform-specific tweaks
@@ -45,8 +73,34 @@ else
   echo "Detected Linux or other Unix"
 fi
 
+# Preserve externally provided CMake args (e.g., CI overrides) and append
+# package defaults.
+if [[ -n "$base_cmake_args" ]]; then
+  cmake_args="$base_cmake_args $cmake_args"
+fi
+
+AWS_SDK_CMAKE_VALUE=OFF
+GCP_SDK_CMAKE_VALUE=OFF
+if [[ "$PREFER_AWS_SDK" == "true" ]]; then
+  AWS_SDK_CMAKE_VALUE=ON
+fi
+if [[ "$PREFER_GCP_SDK" == "true" ]]; then
+  GCP_SDK_CMAKE_VALUE=ON
+fi
+cmake_args+=" -DEVI_KM_PREFER_AWS_SDK=$AWS_SDK_CMAKE_VALUE -DEVI_KM_PREFER_GCP_SDK=$GCP_SDK_CMAKE_VALUE"
+
+# Pin CMake to the active Python so it does not pick up a stale toolcache binary
+PYTHON_EXE="$(command -v python3 || command -v python)"
+if [[ -n "$PYTHON_EXE" ]]; then
+  cmake_args+=" -DPython3_EXECUTABLE=$PYTHON_EXE -DPython_EXECUTABLE=$PYTHON_EXE"
+fi
+
 # Export for pip/scikit-build-core
-export CMAKE_ARGS="$cmake_args"
+export CMAKE_ARGS="${CMAKE_ARGS:-} $cmake_args"
+if [[ -n "$JOBS" ]]; then
+  export CMAKE_BUILD_PARALLEL_LEVEL="$JOBS"
+  echo "Using parallel build jobs: $CMAKE_BUILD_PARALLEL_LEVEL"
+fi
 
 if [[ "$TYPE" == "wheel" ]]; then
   echo "Building wheel with CMAKE_ARGS:"

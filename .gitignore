@@ -81,9 +81,17 @@ site/
 Thumbs.db
 
 # ==========================
+# Environment files
+# ==========================
+.env
+.env.*
+!.env.example
+
+# ==========================
 # Project-specific
 # ==========================
 # Generated keys and KEK
 keys/
 aes.kek
 envector.egg-info/
+pyenvector/proto_gen/v2/v2/

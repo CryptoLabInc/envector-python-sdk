@@ -15,7 +15,7 @@ def temp_enc_key(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def context_param():
-    return ContextParameter(preset="IP", dim=32)
+    return ContextParameter(preset="IP1", dim=32, eval_mode="MM")
 
 
 def test_encryptor_context_required(temp_enc_key):

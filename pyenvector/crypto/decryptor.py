@@ -143,9 +143,12 @@ class Decryptor:
         sec_key = evi.SecretKey(sec_key, self.seal_info)
         if is_score:
             result = self.decryptor.decrypt(enc_msg, sec_key, is_score)
+            del sec_key
             return result
         result = self.decryptor.decrypt(enc_msg, sec_key)
         sliced_result = result[: self.context_param.dim]
+        del result
+        del sec_key
         return sliced_result
 
     def decrypt_with_idx(self, enc_msg, dec_idx, sec_key: str):
@@ -169,6 +172,7 @@ class Decryptor:
         sec_key = evi.SecretKey(sec_key, self.seal_info)
         res = self.decryptor.decrypt(dec_idx, enc_msg, sec_key)
         sliced = res[: self.context_param.dim]
+        del res
         del sec_key
         return sliced
 
@@ -193,8 +197,12 @@ class Decryptor:
         >>> decrypted_score = dec.decrypt_score(encrypted_score, sec_key_path="/path/to/SecKey.bin")
         """
         dec_target = evi.SearchResult.deserializeFrom(enc_msg.data)
-
-        return self.decrypt(dec_target, sec_key=sec_key, is_score=True)[: dec_target.get_item_count()]
+        item_count = dec_target.get_item_count()
+        result = self.decrypt(dec_target, sec_key=sec_key, is_score=True)
+        sliced = result[:item_count]
+        del result
+        del dec_target
+        return sliced
 
     # def get_cleaner(self):
     #     return self.decryptor.get_cleaner()

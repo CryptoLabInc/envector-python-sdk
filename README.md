@@ -1,19 +1,13 @@
-## enVector Python SDK: Development Environment Setup
+# pyenvector — enVector Python SDK
 
-### Requirements
+[![PyPI version](https://img.shields.io/pypi/v/pyenvector)](https://pypi.org/project/pyenvector/)
+[![Python](https://img.shields.io/pypi/pyversions/pyenvector)](https://pypi.org/project/pyenvector/)
+[![License](https://img.shields.io/badge/license-proprietary-blue)](./LICENSE)
 
-**Ubuntu**
-- OS: Ubuntu 22.04+
-- Shell: bash
-- Python: 3.12 (recommended)
-- Virtual Environment: pipenv
+Python SDK for **enVector** — encrypted vector search powered by fully homomorphic encryption (FHE).
 
-**Mac**
-- OS: macOS Sequoia 15.5+
-- Shell: zsh
-- Package Manager: Homebrew
-- Python: 3.12 (recommended)
-- Virtual Environment: pipenv
+Your vectors and similarity scores stay encrypted during the entire computation.
+The server never sees plaintext data.
 
 ---
 ### 0. Install Dependencies (Linux)
@@ -22,6 +16,7 @@ sudo apt-get update
 sudo apt-get install -y make build-essential \
   libssl-dev zlib1g-dev libbz2-dev \
   libreadline-dev libsqlite3-dev wget curl llvm \
+  libcurl4-openssl-dev \
   libncursesw5-dev xz-utils tk-dev \
   libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev git
 ```
@@ -31,235 +26,161 @@ sudo apt-get install -y make build-essential \
 > **Tip:** Make sure your SSH key is registered with GitHub for private repo access.
 
 ```bash
-git config url."git@github.com:".insteadOf https://github.com/
-git clone git@github.com:CryptoLabInc/envector-python-sdk.git
+pip install pyenvector
+
+# or, for pre-release versions:
+pip install pyenvector --pre
 ```
 
----
+Requires Python 3.9 -- 3.13. Wheels are available for Linux (x86_64) and macOS (arm64).
 
-### 2. Quick Setup (Recommended)
+## Quick Start
 
-**For SDK developers:**
-> Use this quick setup to prepare a full development environment.
->
-**For SDK User:**
-> See section 4 (B) below if you only want to build the wheel file for distribution or installation.
+```python
+import numpy as np
+import pyenvector as ev
 
-```bash
-./scripts/setup.sh --python 3.12
-# Check importing pyenvector and its version
-pipenv run python -c "import pyenvector as ev; print(ev.__version__)"
-# Activate Pipenv
-pipenv shell
-```
-- Default Python version is 3.12.
-- All dependencies, submodules, and build steps are automated.
+# 1. Connect and load keys
+ev.init(host="localhost", port=50050, key_path="./keys", key_id="my_key")
 
----
+# 2. Create an index
+index = ev.create_index("my_index", dim=512)
 
-### 3. Manual Step-by-Step Setup
+# 3. Insert vectors
+vectors = np.random.randn(100, 512).astype(np.float32)
+vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+metadata = [f"item_{i}" for i in range(100)]
 
-```bash
-# 1. Initialize submodules
-./scripts/init_evi_crypto.sh
+index.insert(vectors, metadata=metadata)
 
-# 3. Install Python & pipenv
-#
-# If the above scripts do not work for your system, please ensure that Python 3.12 and pipenv are installed manually.
-# You can use your OS package manager, pyenv, conda, or any other method to install Python 3.12 and pipenv.
-# After installation, continue with the next steps.
-./scripts/install_deps_linux.sh   # For Linux
-./scripts/install_deps_mac.sh     # For Mac
+# 4. Search (encrypted end-to-end)
+result = index.search(vectors[0], top_k=5, output_fields=["metadata"])
+print(result)
 
-# 4. Set up pipenv environment
-./scripts/setup_pipenv.sh
-
-# 5. Build and install the SDK
-pipenv run ./scripts/build_and_install.sh
-
-# 6. Check importing pyenvector and its version
-pipenv run python -c "import pyenvector as ev; print(ev.__version__)"
-
-# 7. Activate Pipenv
-pipenv shell
+# 5. Clean up
+ev.drop_index("my_index")
+# ev.delete_key("my_key")  # optional: remove keys from server
 ```
 
----
+## Key Features
 
-### 4. Build a Wheel File
+- **End-to-end encryption** — vectors are encrypted on the client before leaving your machine. Search computation happens on ciphertext via FHE. Scores are decrypted only on the client.
+- **Drop-in vector DB API** — `create_index`, `insert`, `search`, `drop_index`. Familiar interface if you have used Milvus, Pinecone, or similar.
+- **Admin management APIs** — inspect index summaries with `get_index_summary` and duplicate existing indexes with `clone_index`.
+- **Key management** — generate, seal (AES KEK), and upload keys to AWS S3 / GCP Cloud Storage via the `pyenvector-keygen` CLI.
+- **Cloud-ready** — deploy the enVector server on GKE, EKS, or on-prem. The SDK talks gRPC.
 
-> **Note:**
-> The wheel file (`.whl`) is intended for deployment and distribution, **not for development**.
-> **SDK developers should NOT use the wheel build for development.**
-> If you are developing the SDK, skip this section and use the Quick Setup above.
-> Only follow these instructions if you need to generate a wheel for deployment or installation elsewhere.
-
-
-#### (A) If you have already run `./scripts/setup.sh` and have a working pipenv environment:
+## CLI: Key Generation
 
 ```bash
-# Activate Pipenv
-pipenv shell
+# Generate keys locally
+pyenvector-keygen --key-path ./keys --key-id my_key
 
-pipenv run export-wheel
+# Generate with AES sealing
+pyenvector-keygen --key-path ./keys --key-id my_key \
+  --seal-mode aes --seal-key-path aes.kek
 
-pip install dist/pyenvector-XXX.whl
-```
-
-#### (B) If you have NOT run `./scripts/setup.sh` (or want to only build the wheel):
-
-```bash
-./scripts/setup.sh --type wheel
-# The wheel file will be generated in the dist/ directory
-pipenv shell
-
-pip install dist/pyenvector-XXX.whl
-```
-
----
-
-### 5. Run Tests
-
-```bash
-pipenv run pytest
-```
-
----
-
-### 6. Build Documentation
-
-> **Note:** Make sure the SDK is installed before building docs.
-
-```bash
-pipenv run docs
-```
-
----
-
-### 7. CLI Key Generation Example
-
-You can generate keys using the CLI after installing the SDK wheel.
-Keys will be stored in `{key_path}/{key_id}`.
-
-#### Basic Usage
-
-```bash
-source .venv/bin/activate
-# Generate keys without KEK (Key Encryption Key)
-pyenvector-keygen --key-path keys --key-id id --seal-mode none --metadata-encryption true
-```
-
-#### Generate keys with AES KEK
-
-```bash
-pyenvector-keygen --key-path keys --key-id seal --seal-mode aes --seal-key-path aes.kek --eval-mode rmp --preset ip
-```
-
-#### Upload keys directly to AWS
-
-```bash
-pyenvector-keygen \
-  --key-store aws \
-  --key-id test-envector \
+# Upload directly to AWS
+pyenvector-keygen --key-store aws --key-id my_key \
   --region-name ap-northeast-2 \
-  --bucket-name envector-cli \
+  --bucket-name my-bucket \
+  --secret-prefix envector/keys
+
+# Upload directly to GCP
+pyenvector-keygen --key-store gcp --key-id my_key \
+  --bucket-name my-bucket \
   --secret-prefix envector/keys
 ```
 
-**Arguments (with defaults):**
-- `--dim` / `--dim_list`: Dimensions to generate (default: `32 64 128 256 512 1024 2048 4096`)
-- `--key-path` / `--key_path`: Directory to store keys (default: `./keys`; ignored when using `--key-store aws`)
-- `--key-id` / `--key_id`: Key identifier (required for AWS mode)
-- `--preset`: Parameter preset (e.g. `ip`, default: `ip`)
-- `--eval-mode` / `--eval_mode`: Evaluation mode (e.g. `rmp`, default: `rmp`)
-- `--seal-mode` / `--seal_mode`: Seal mode (`none` or `aes`, default: `none`; must stay `none` when using AWS)
-- `--seal-key-path` / `--seal_key_path`: Path to AES KEK file (required when `--seal-mode aes`)
-- `--seal-key-stdin` / `--seal_key_stdin`: Read AES KEK from stdin (overrides `--seal-key-path`)
-- `--metadata-encryption` / `--metadata_encryption`: Metadata encryption (`true` by default)
-- `--key-store` / `--key_store`: `local` (default) writes JSON files, `aws` uploads key streams to AWS
-- `--region-name` / `--region_name`: AWS region (required when `--key-store aws`)
-- `--bucket-name` / `--bucket_name`: AWS S3 bucket for encrypted/eval keys (required for AWS)
-- `--secret-prefix` / `--secret_prefix`: AWS Secrets Manager prefix for Sec/Metadata keys (required for AWS)
+Run `pyenvector-keygen --help` for all options.
 
-When using `--key-store aws`, keys are generated in-memory using `generate_keys_stream` and uploaded directly to AWS (no local files are written, and sealing options are disabled).
+## Examples
 
-If you use `--seal_kek_stdin`, you can provide the KEK via standard input:
-```bash
-echo "your-32-byte-kek" | pyenvector-keygen \
---key-path keys \
---key-id seal \
---seal-mode aes \
---seal-key-stdin \
---eval-mode rmp \
---preset ip \
---metadata-encryption true
-```
-Or, you can use file redirection:
-```bash
-pyenvector-keygen --key-path keys --key-id seal --seal-mode aes --seal-key-stdin --eval-mode rmp --preset ip < aes.kek
-```
----
+See the [`example/`](./example) directory:
 
-**For troubleshooting or custom setups, refer to each script's comments and logs.**
-If you encounter issues with Python or pipenv installation, please install them manually and retry the setup steps.
+| Directory | Description |
+|-----------|-------------|
+| `client_only/` | Client-side encryption, key generation, and cipher operations without a server |
+| `client_and_server/` | End-to-end workflows: index creation, insert, search, and index operations |
 
+## Documentation
 
-### Whl User (MacOS)
-```
-brew install virtualenv python@3.12 libomp
-virtualenv -p python3.12 pyenvector_venv
-source pyenvector_venv/bin/activate
-pip install dist/pyenvector-1.0.0-cp312-cp312-macosx_15_0_arm64.whl
-```
+- [enVector Documentation](https://docs.envector.io) — full product docs (deployment, architecture, API reference)
+- [PyPI page](https://pypi.org/project/pyenvector/) — package info and install instructions
 
-### Whl User (Linux)
-```
-# Make sure Python 3.12 is available in your virtual environment, or use pyenv to install python3.12
+## Requirements
 
-# Install Pyenv (if you do not have python3.12 and virtualenv)
-rm -rf "$HOME/.pyenv"  # Remove existing pyenv directory if it exists
-curl https://pyenv.run | bash
-export PYENV_ROOT="$HOME/.pyenv"
-export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init - bash)"
-pyenv install 3.12
-pyenv global 3.12
+- Python 3.9 -- 3.13
+- A running enVector server (for search operations; client-only crypto works offline)
+- HE keys generated via `pyenvector-keygen`
 
-# Activate virtualenv and install whl file
-pip install virtualenv
-virtualenv -p python3.12 pyenvector_venv
-source pyenvector_venv/bin/activate
-pip install dist/pyenvector-1.0.0-cp312-cp312-linux_x86_64.whl
-```
+## Docker
 
-**Log Level Troubleshooting:**
-- By default, SDK logs are hidden. To enable detailed loguru logs (for debugging), set the environment variable before running any Python commands:
+Docker packaging is split into two phases under `sdk/python/docker/`:
+
+- **wheel build**: [`docker/buildpack/Dockerfile`](./docker/buildpack/Dockerfile)
+  builds manylinux wheels from source using the private
+  `external/evi-crypto` submodule (cmake source-dir: `external/evi-crypto`).
+- **runtime packaging**:
+  [`docker/dockerize/Dockerfile`](./docker/dockerize/Dockerfile)
+  installs only prebuilt wheels into a minimal runtime image. Its build context
+  is the wheelhouse only, so the private source tree is not available to the
+  runtime image build.
+
+The helper [`./scripts/build_docker.sh`](./scripts/build_docker.sh) orchestrates
+both phases by default. The private submodule must be populated only for the
+wheel-build phase (`git submodule update --init --recursive`).
 
 ```bash
-export PYENVECTOR_LOG_LEVEL=DEBUG  # PYENVECTOR_LOG_LEVEL is still accepted for compatibility
-```
-- This will show debug-level logs for SDK operations.
+# Single arch (host), loads into local daemon -- defaults to amd64
+./scripts/build_docker.sh
 
-## How to Deploy a Wheel to PyPI
-```
-export GITHUB_TOKEN="{your_github_token}"
-export WHEEL_VERSION="x.x.x"
-# build wheel by os
-./scripts/build_wheel_by_os.sh
+# arm64 build (qemu emulation is auto-registered on first run)
+./scripts/build_docker.sh --target-arch arm64
+
+# Build wheel artifacts only (no runtime image)
+./scripts/build_docker.sh --wheel-only
+
+# Package from an existing wheelhouse without reading the private source tree
+./scripts/build_docker.sh \
+  --wheelhouse ./dist/sdk-wheel-house/1.4.0a5-py312
+
+# Multi-arch manifest -- must push to a registry (docker cannot --load
+# a multi-platform manifest into the local daemon)
+./scripts/build_docker.sh --target-arch multiarch --action push \
+  --image <registry>/pyenvector --tag v1.4.0a5
+
+# Different CPython ABI
+./scripts/build_docker.sh --python 3.11 --tag dev
+
+# Raw buildx equivalent: build a wheel artifact for amd64
+docker buildx build --platform linux/amd64 \
+  --target wheelhouse \
+  --output type=local,dest=./dist/sdk-wheel-house/dev-py312/amd64 \
+  --build-arg PYTHON_VERSION=3.12 \
+  --build-arg PYTHON_TAG=cp312 \
+  -f ./docker/buildpack/Dockerfile .
+
+# Raw buildx equivalent: package a runtime image from the wheelhouse only
+docker buildx build --platform linux/amd64 --load \
+  --build-arg PYTHON_VERSION=3.12 \
+  -t pyenvector:dev-amd64 \
+  -f ./docker/dockerize/Dockerfile \
+  ./dist/sdk-wheel-house/dev-py312
 ```
 
-```
-export TWINE_USERNAME="__token__"
-export TWINE_PASSWORD="{your_pypi_api_token}"
-# uplooad test pypi
-./scripts/upload_wheel_to_pypi.sh
-# upload to pypi
-UPLOAD_TARGET="release-pypi" ./scripts/upload_wheel_to_pypi.sh
-```
+The helper auto-creates a `docker-container` buildx builder
+(`pyenvector-builder`) and bootstraps qemu for cross-arch emulation when
+needed. Cross-arch builds under emulation are substantially slower than
+native — prefer native CI runners (or `--target-arch multiarch` on a runner
+that has both architectures available) for routine release builds. See
+`./scripts/build_docker.sh --help` for all flags.
 
-```
-# download stable version
-pip install pyenvector
-# download pre-release version
-pip install pyenvector --pre
-```
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for development environment setup, build instructions, and how to run tests.
+
+## License
+
+Proprietary. See [LICENSE](./LICENSE) for details.
+Contact: pypi@cryptolab.co.kr

@@ -20,7 +20,10 @@ Classes:
 
 """
 
-from typing import Any, List, Optional, Union
+import base64
+import json
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Union
 
 import numpy as np
 from tqdm import tqdm
@@ -29,12 +32,26 @@ from pyenvector.api import Indexer
 from pyenvector.crypto.block import CipherBlock
 from pyenvector.crypto.cipher import Cipher
 from pyenvector.crypto.parameter import ContextParameter, IndexParameter, KeyParameter, SealInfo
+from pyenvector.errors import EnvectorApplicationError
+from pyenvector.proto_gen.v2.common import index_operation_message_pb2 as envector_op_pb2
+from pyenvector.proto_gen.v2.common import type_pb2 as common_type_pb2
 from pyenvector.utils.aes import decrypt_metadata, encrypt_metadata
 from pyenvector.utils.logging_config import logger
 from pyenvector.utils.utils import topk
 
 ENCRYPTION_BATCH_SIZE = 4096
 KNN_BATCH_SIZE = 4096
+MAX_REQUEST_ID_LENGTH = 30
+_IVF_INDEX_TYPES: frozenset = frozenset({"IVF_FLAT", "IVF_VCT"})
+AccessTokenInput = Optional[Union[str, Callable[[], Optional[str]]]]
+
+
+@dataclass
+class _NormalizedInsertData:
+    """Internal normalized representation for insert input."""
+
+    kind: str  # "plain" or "cipher"
+    data: Union[List[Any], np.ndarray]
 
 
 class IndexConfig:
@@ -70,13 +87,13 @@ class IndexConfig:
     description : str, optional
         Human-readable text describing the index.
     key_store : str, optional
-        External key storage provider (currently only ``"aws"``).
+        External key storage provider (e.g., ``"aws"``, ``"gcp"``).
     region_name : str, optional
-        Region used by the external key store.
+        Region used by the external key store (AWS).
     bucket_name : str, optional
-        S3 bucket for AWS key storage.
+        Bucket name for external key storage.
     secret_prefix : str, optional
-        Secret prefix for AWS Secrets Manager.
+        Secret prefix for external key storage.
 
     Examples
     --------
@@ -84,7 +101,7 @@ class IndexConfig:
     >>> index_config = IndexConfig(
     ...   key_path="./keys",
     ...   key_id="example_key",
-    ...   preset="ip",
+    ...   preset="ip1",
     ...   query_encryption="plain",
     ...   index_encryption="cipher",
     ...   index_params={"index_type": "flat"},
@@ -122,13 +139,15 @@ class IndexConfig:
         region_name: Optional[str] = None,
         bucket_name: Optional[str] = None,
         secret_prefix: Optional[str] = None,
+        vault_addr: Optional[str] = None,
+        vault_mount: Optional[str] = None,
     ):
         """
         Initializes the IndexConfig class.
         """
+        self.context_param = ContextParameter(preset=preset, dim=dim, eval_mode=eval_mode)
         self.index_name = index_name
         self.description = description
-        self.context_param = ContextParameter(preset=preset, dim=dim, eval_mode=eval_mode)
         self.key_param = KeyParameter(
             key_path=key_path,
             key_id=key_id,
@@ -145,6 +164,8 @@ class IndexConfig:
             region_name=region_name,
             bucket_name=bucket_name,
             secret_prefix=secret_prefix,
+            vault_addr=vault_addr,
+            vault_mount=vault_mount,
         )
         if index_params is None and index_type is not None:
             index_params = {"index_type": index_type}
@@ -275,7 +296,8 @@ class IndexConfig:
         Args:
             preset (str): Preset for the index.
         """
-        self.context_param = ContextParameter(preset=preset, dim=self.dim, eval_mode=self.eval_mode)
+        level = self.context_param.level if self.context_param.level_is_explicit else None
+        self.context_param = ContextParameter(preset=preset, dim=self.dim, eval_mode=self.eval_mode, level=level)
         return self
 
     @property
@@ -296,7 +318,10 @@ class IndexConfig:
         Args:
             dim (int): Dimensionality of the index.
         """
-        self.context_param = ContextParameter(preset=self.preset, dim=dim, eval_mode=self.context_param.eval_mode)
+        level = self.context_param.level if self.context_param.level_is_explicit else None
+        self.context_param = ContextParameter(
+            preset=self.preset, dim=dim, eval_mode=self.context_param.eval_mode, level=level
+        )
         return self
 
     @property
@@ -317,7 +342,29 @@ class IndexConfig:
         Args:
             eval_mode (str): Evaluation mode for the context.
         """
-        self.context_param = ContextParameter(preset=self.preset, dim=self.dim, eval_mode=eval_mode)
+        level = self.context_param.level if self.context_param.level_is_explicit else None
+        self.context_param = ContextParameter(preset=self.preset, dim=self.dim, eval_mode=eval_mode, level=level)
+        return self
+
+    @property
+    def level(self) -> int:
+        """
+        Returns the level.
+
+        Returns:
+            ``int``: Level for the context.
+        """
+        return self.context_param.level
+
+    @level.setter
+    def level(self, level: int):
+        """
+        Sets the level.
+
+        Args:
+            level (int): Level for the context.
+        """
+        self.context_param = ContextParameter(preset=self.preset, dim=self.dim, eval_mode=self.eval_mode, level=level)
         return self
 
     @property
@@ -507,6 +554,14 @@ class IndexConfig:
         return self.key_param.secret_prefix
 
     @property
+    def vault_addr(self) -> Optional[str]:
+        return self.key_param.vault_addr
+
+    @property
+    def vault_mount(self) -> Optional[str]:
+        return self.key_param.vault_mount
+
+    @property
     def seal_info(self) -> SealInfo:
         """
         Returns the seal mode.
@@ -685,6 +740,8 @@ class IndexConfig:
         region_name: Optional[str] = None,
         bucket_name: Optional[str] = None,
         secret_prefix: Optional[str] = None,
+        vault_addr: Optional[str] = None,
+        vault_mount: Optional[str] = None,
     ) -> "IndexConfig":
         """
         Creates a deep copy of the index configuration.
@@ -718,6 +775,8 @@ class IndexConfig:
             region_name=self.key_param.region_name if region_name is None else region_name,
             bucket_name=self.key_param.bucket_name if bucket_name is None else bucket_name,
             secret_prefix=self.key_param.secret_prefix if secret_prefix is None else secret_prefix,
+            vault_addr=self.key_param.vault_addr if vault_addr is None else vault_addr,
+            vault_mount=self.key_param.vault_mount if vault_mount is None else vault_mount,
         )
         return new_config
 
@@ -756,7 +815,7 @@ class Index:
     >>> index_config = IndexConfig(
     ...   key_path="./keys",
     ...   key_id="example_key",
-    ...   preset="ip",
+    ...   preset="ip1",
     ...   query_encryption="plain",
     ...   index_encryption="cipher",
     ...   index_type="flat",
@@ -779,6 +838,7 @@ class Index:
     _default_key_path: Optional[str] = None
     _default_indexer: Optional[Indexer] = None
     _default_index_config: Optional[IndexConfig] = None
+    _default_kms_client = None
 
     def __init__(self, index_name: str, index_config: Optional[IndexConfig] = None):
         """
@@ -798,7 +858,7 @@ class Index:
         indexer = Index._default_indexer
         if index_name not in indexer.get_index_list():
             raise ValueError(f"Index '{index_name}' does not exist. Please run create_index first.")
-        metadata = indexer.get_index_info(index_name)
+        metadata = indexer.get_index_summary(index_name)
         self.indexer = indexer
         index_config.index_name = index_name
         index_config.dim = metadata["dim"]
@@ -807,34 +867,75 @@ class Index:
         index_config.query_encryption = metadata["query_encryption"]
         index_config.index_type = metadata["index_type"]
         index_config.description = metadata.get("description")
-        if index_config.index_type == "IVF_FLAT":
-            index_config.index_param.nlist = metadata["ivf_detail"].nlist
-            index_config.index_param.default_nprobe = metadata["ivf_detail"].default_nprobe
-            index_config.index_param.centroids = np.array(
-                list(map(lambda x: np.array(x.plain_vector.data), metadata["ivf_detail"].centroids))
-            )
         self.index_config = index_config
+        self._ivf_runtime_metadata_loaded = index_config.index_type not in ("IVF_FLAT", "IVF_VCT")
+        self._ivf_centroids_loaded = False
         self.num_entities = metadata["row_count"]
+        self.kms_client = Index._default_kms_client
         self.cipher = Cipher._create_from_index_config(self.index_config) if self.index_config.need_cipher else None
         self._is_loaded = metadata["is_loaded"]
-        if not self.is_loaded:
-            self.load()
+
+    def _ensure_ivf_runtime_metadata_loaded(self, require_centroids: bool = False) -> None:
+        """Populate IVF runtime metadata lazily when an operation actually needs it."""
+        index_type = self.index_config.index_type
+        if index_type not in ("IVF_FLAT", "IVF_VCT"):
+            return
+
+        needs_runtime = not self._ivf_runtime_metadata_loaded
+        needs_centroids = require_centroids and index_type == "IVF_FLAT" and not self._ivf_centroids_loaded
+        if not needs_runtime and not needs_centroids:
+            return
+
+        metadata = self.indexer.get_index_info(self.index_config.index_name)
+        ivf_detail = metadata.get("ivf_detail")
+        if ivf_detail is None:
+            raise ValueError(
+                f"IVF metadata for index '{self.index_config.index_name}' is unavailable from get_index_info()."
+            )
+
+        self.index_config.index_param.nlist = ivf_detail.nlist
+        self.index_config.index_param.default_nprobe = ivf_detail.default_nprobe
+        self._ivf_runtime_metadata_loaded = True
+
+        if index_type == "IVF_FLAT" or require_centroids:
+            if not getattr(ivf_detail, "centroids", None):
+                raise ValueError(
+                    f"Centroids for IVF_FLAT index '{self.index_config.index_name}' are missing from index detail."
+                )
+            self.index_config.index_param.centroids = np.array(
+                [np.array(centroid.plain_vector.data) for centroid in ivf_detail.centroids],
+                dtype=np.float32,
+            )
+            self._ivf_centroids_loaded = True
 
     @classmethod
     def init_connect(
         cls,
         address: str,
-        access_token: Optional[str] = None,
+        access_token: AccessTokenInput = None,
         secure: Optional[bool] = None,
+        refresh_token: Optional[str] = None,
+        oidc_issuer: Optional[str] = None,
+        token_endpoint: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> "Indexer":
         """
         Connects to the indexer.
 
         Args:
             address (``str``): Address of the indexer.
-            access_token (``str``, optional): Access token for authentication.
+            access_token (``str`` or callable, optional): Access token for authentication, or a
+                callable returning the current token for refreshable auth flows.
             secure (``bool``, optional): Whether to use a secure connection. If None,
-                (defaults to True when access_token is provided, otherwise False.)
+                (defaults to True when access_token or refresh_token is provided, otherwise False.)
+            refresh_token (``str``, optional): OIDC refresh token used by the SDK to renew bearer tokens.
+            oidc_issuer (``str``, optional): OIDC issuer URL used to discover the token endpoint.
+            token_endpoint (``str``, optional): Explicit token endpoint used for refresh token exchange.
+            client_id (``str``, optional): OIDC client ID for refresh token exchange.
+            client_secret (``str``, optional): OIDC client secret for refresh token exchange.
+            scope (``str``, optional): Optional scope value included in refresh requests.
 
         Returns:
             Indexer: Connected indexer object.
@@ -853,6 +954,12 @@ class Index:
             address=address,
             access_token=access_token,
             secure=secure,
+            refresh_token=refresh_token,
+            oidc_issuer=oidc_issuer,
+            token_endpoint=token_endpoint,
+            client_id=client_id,
+            client_secret=client_secret,
+            scope=scope,
         )
         cls._default_indexer = indexer
         logger.info(f"Connection created at {address}")
@@ -893,7 +1000,7 @@ class Index:
         >>> index_config = IndexConfig(
         ...   key_path="./keys",
         ...   key_id="example_key",
-        ...   preset="ip",
+        ...   preset="ip1",
         ...   query_encryption="plain",
         ...   index_encryption="cipher",
         ...   index_type="flat",
@@ -933,22 +1040,80 @@ class Index:
         )
         return cls(index_config.index_name, index_config)
 
+    def indexing(
+        self,
+        request_ids: Optional[List[str]] = None,
+    ):
+        self.indexer.async_merge_by_request_ids(
+            self.index_config.index_name,
+            request_ids,
+        )
+
     def insert(
         self,
-        data: Union[List[List[float]], List[np.ndarray], np.ndarray, List[CipherBlock]],
+        data: Union[CipherBlock, List[List[float]], List[np.ndarray], np.ndarray, List[CipherBlock]],
         metadata: List[Any] = None,
+        request_ids: Optional[List[str]] = None,
+        await_completion: bool = False,
+        execute_until: str = "segmentation",
+        load: bool = True,
+        use_row_insert: bool = False,
+        encryptor=None,
+        **kwargs,
     ):
         """
         Inserts data into the index.
 
+        enVector INSERT requests are asynchronous. ``Index.insert()`` always submits the split/persist
+        RPCs first. ``execute_until="flush"`` stops there, while ``execute_until="segmentation"``
+        additionally submits ``merge_by_request_ids`` for the captured split request IDs. For
+        request-scoped completion tracking, pass an empty list as ``request_ids``. The server-generated
+        split request IDs will be appended to it after each underlying async split RPC completes.
+
         Parameters
         ----------
-        data : list of floats, list of np.ndarray, 2D np.ndarray, or list of CipherBlock
+        data : CipherBlock, list of floats, list of np.ndarray, 2D np.ndarray, or list of CipherBlock
             Data to be inserted. It can be plaintext (list of lists, list of numpy arrays, or 2D numpy array) or
-            ciphertext (CipherBlock).
-            Currently, only a list of ``CipherBlock`` is supported for encrypted data.
+            ciphertext (``CipherBlock`` or list of ``CipherBlock``).
         metadata : str
             Metadata for the data.
+        request_ids : Optional[List[str]], optional
+            Out list for server-generated request identifiers (from response ``header.id``).
+
+            - If ``None`` (default), the client does not capture request identifiers and you cannot
+              poll completion for this insert.
+            - If provided, the list is cleared and filled with the server-generated request IDs
+              (one per underlying async split request). These are the split request IDs; use
+              them with :meth:`get_index_operation_status`, :meth:`wait_for_inserts_searchable`,
+              or :meth:`async_merge_by_request_ids`.
+        await_completion : bool, optional
+            If ``True``, block until the selected server-side stage is reached. ``"flush"``
+            waits for ``SPLIT_COMPLETED``; ``"segmentation"`` waits for ``MERGED_SAVED``.
+            When ``load=True`` is also set, the SDK then calls :meth:`load` after that stage
+            wait completes. The SDK does not perform an additional searchable wait
+            automatically; use :meth:`wait_for_inserts_searchable` when callers need a
+            ``done=true`` searchable guarantee.
+        execute_until : str, optional
+            Server-side completion stage for this insert. Supported values are:
+
+            - ``"flush"``: stop after split/persist submission
+            - ``"segmentation"``: submit ``merge_by_request_ids`` after split request IDs are captured
+        load : bool, optional
+            If ``True``, call :meth:`load` after submission, or after the selected stage wait
+            when ``await_completion=True``. This triggers backend publication work but does not
+            add an SDK-side searchable wait on its own. When invoked before merge completion,
+            backend ``LoadIndex`` may expose raw fallback shards while request-scoped merge
+            work is still unfinished.
+        use_row_insert : bool, optional
+            If ``True``, small plaintext chunks (fewer vectors than ``dim``) use the
+            row-insert path instead of bulk insertion. Default: ``False``.
+        encryptor : Encryptor or Cipher, optional
+            Custom encryptor for this insert call. When provided, this encryptor
+            is used instead of ``self.cipher`` for FHE encryption. This enables
+            thread-safe parallel inserts by giving each thread its own encryptor
+            with an independent PRNG state. Accepts either an ``Encryptor``
+            instance or a ``Cipher`` instance (its internal encryptor is used).
+            If ``None`` (default), ``self.cipher`` is used.
 
         Returns
         -------
@@ -961,42 +1126,305 @@ class Index:
         >>> metadata = ["example_metadata"]
         >>> index.insert(data=data, metadata=metadata)
 
-        >>> import numpy as np
-        >>> data = np.random.rand(100, 512)  # 2D numpy array
-        >>> metadata = [f"item_{i}" for i in range(100)]
-        >>> index.insert(data=data, metadata=metadata)
+        >>> # Parallel insert with independent encryptors
+        >>> from pyenvector.crypto.cipher import Cipher
+        >>> cipher = Cipher(dim=512, enc_key_path="keys/EncKey.json", preset="ip1", eval_mode="mm")
+        >>> index.insert(data=data, metadata=metadata, encryptor=cipher)
+        """
+        normalized_data = self._normalize_insert_data(data)
+
+        if normalized_data.kind == "cipher":
+            available_shards = self.remaining_insertable_shards
+            if len(normalized_data.data) > available_shards:
+                raise ValueError(f"index is not insertable for {len(normalized_data.data)} ciphertexts, {available_shards} available")
+            else:
+                logger.info(f"Index is insertable for {len(normalized_data.data)} ciphertexts, {available_shards} available")
+        else:
+            available_vectors = self.remaining_insertable_vectors
+            if len(normalized_data.data) > available_vectors:
+                raise ValueError(f"Index is not insertable for {len(normalized_data.data)} vectors, {available_vectors} available")
+            else:
+                logger.info(f"Index is insertable for {len(normalized_data.data)} vectors, {available_vectors} available")
+
+        # Resolve encryptor: Cipher → extract _encryptor, Encryptor → use directly
+        resolved_encryptor = None
+        if encryptor is not None:
+            if isinstance(encryptor, Cipher):
+                resolved_encryptor = encryptor._encryptor
+            else:
+                resolved_encryptor = encryptor
+
+        stage_order = {"flush": 1, "segmentation": 2}
+        if execute_until not in stage_order:
+            raise ValueError("execute_until must be one of: 'flush', 'segmentation'")
+        if await_completion is not None and not isinstance(await_completion, bool):
+            raise TypeError("await_completion must be a bool when provided")
+        if load is not None and not isinstance(load, bool):
+            raise TypeError("load must be a bool")
+        if not isinstance(use_row_insert, bool):
+            raise TypeError("use_row_insert must be a bool")
+
+        # Prepare out_request_ids list to capture server-generated request IDs
+        out_request_ids = request_ids
+        if out_request_ids is None and execute_until in ("flush", "segmentation"):
+            out_request_ids = []
+
+        if out_request_ids is not None:
+            if not isinstance(out_request_ids, list):
+                raise TypeError("request_ids must be a list[str]")
+            out_request_ids.clear()
+
+        item_ids = self._insert_bulk(
+            normalized_data,
+            metadata=metadata,
+            use_row_insert=use_row_insert,
+            out_request_ids=out_request_ids,
+            encryptor=resolved_encryptor,
+        )
+
+        if execute_until in ("segmentation") and out_request_ids:
+            self.indexer.async_merge_by_request_ids(
+                self.index_config.index_name,
+                out_request_ids,
+            )
+
+        if await_completion:
+            timeout_s = kwargs.get("timeout_s", 86400.0)
+            poll_interval_s = kwargs.get("poll_interval_s", 1.0)
+            logger.debug(f"Async data insertion submitted. Waiting until '{execute_until}'.")
+            if out_request_ids:
+                self._wait_for_insert_stage(
+                    request_ids=out_request_ids,
+                    target_stage=execute_until,
+                    timeout_s=timeout_s,
+                    poll_interval_s=poll_interval_s,
+                )
+            else:
+                logger.warning("await_completion requested but no request_ids were captured; skipping wait.")
+
+        if load:
+            self.load()
+        self._refresh_loaded_state()
+        logger.debug("Data insertion completed successfully.")
+        return item_ids
+
+    def delete(
+        self,
+        item_ids: List[int],
+        await_completion: bool = True,
+        timeout_s: float = 600.0,
+        poll_interval_s: float = 1.0,
+    ) -> str:
+        """
+        Deletes items from the index by item ID.
+
+        The server rebuilds affected shards excluding the deleted items. This operation
+        is asynchronous — by default the SDK polls until the shard rebuild is complete
+        and the remaining data becomes searchable.
+
+        Parameters
+        ----------
+        item_ids : List[int]
+            List of item IDs to delete. These must be ``item_id`` values originally
+            returned by ``Index.insert()`` or the low-level insert APIs
+            (``Indexer.insert_data_bulk()``, ``Indexer.insert_data_rows_batch()``).
+            Must be non-empty, contain only positive integers, and have no duplicates.
+        await_completion : bool, optional
+            If ``True`` (default), poll ``get_index_operation_status`` with
+            ``operation_type=DELETE`` until the operation reaches SEARCHABLE state.
+            If ``False``, return immediately after submitting the request.
+        timeout_s : float, optional
+            Maximum time to wait for completion (seconds). Only used when
+            ``await_completion=True``. Default: 600s.
+        poll_interval_s : float, optional
+            Poll interval (seconds). Only used when ``await_completion=True``. Default: 1s.
+
+        Returns
+        -------
+        str
+            Server-generated ``request_id`` for tracking operation completion.
+
+        Raises
+        ------
+        ValueError
+            If the index is not loaded.
+        EnvectorValidationError
+            If ``item_ids`` is empty, contains duplicates, or contains non-positive values.
+        EnvectorTimeoutError
+            If ``await_completion=True`` and the operation does not complete within ``timeout_s``.
+
+        Examples
+        --------
+        >>> # Insert data and capture item IDs
+        >>> item_ids = index.insert(data=vectors, metadata=metadata)
+        >>> # Delete specific items (waits for completion by default)
+        >>> request_id = index.delete(item_ids=[item_ids[0], item_ids[2]])
+        >>> # Delete without waiting
+        >>> request_id = index.delete(item_ids=[item_ids[1]], await_completion=False)
         """
         if not self.is_loaded:
             raise ValueError("Index not loaded. Please call Index.load() first.")
+        if not isinstance(await_completion, bool):
+            raise TypeError("await_completion must be a bool")
+
+        # item_ids: values returned by InsertData response (Index.insert() or Indexer.insert_data_bulk(), etc.)
+        # Validation is performed inside indexer.delete_data()
+        request_id = self.indexer.delete_data(
+            index_name=self.index_config.index_name,
+            item_ids=item_ids,
+        )
+
+        if await_completion:
+            logger.debug(f"DeleteData submitted. Waiting for completion (timeout={timeout_s}s).")
+            self.indexer.wait_for_delete_completion(
+                index_name=self.index_config.index_name,
+                request_id=request_id,
+                timeout_s=timeout_s,
+                poll_interval_s=poll_interval_s,
+            )
+            logger.debug("DeleteData completed successfully.")
+
+        return request_id
+
+    def _wait_for_insert_stage(
+        self,
+        request_ids: List[str],
+        target_stage: str,
+        timeout_s: float,
+        poll_interval_s: float,
+    ) -> None:
+        target_state_map = {
+            "flush": envector_op_pb2.SPLIT_COMPLETED,
+            "segmentation": envector_op_pb2.MERGED_SAVED,
+        }
+        target_state = target_state_map[target_stage]
+
+        _ = self.indexer.wait_for_index_operations_state(
+            self.index_config.index_name,
+            request_ids,
+            target_state=target_state,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+
+    def _normalize_insert_data(
+        self,
+        data: Union[CipherBlock, List[float], List[List[float]], List[np.ndarray], np.ndarray, List[CipherBlock]],
+    ) -> _NormalizedInsertData:
+        """Normalizes insert input into a single internal structure."""
+        normalized = self._validate_insert_data(data)
+        is_cipher_data = isinstance(normalized, list) and normalized and isinstance(normalized[0], CipherBlock)
+        return _NormalizedInsertData(kind="cipher" if is_cipher_data else "plain", data=normalized)
+
+    def _validate_insert_data(
+        self,
+        data: Union[CipherBlock, List[float], List[List[float]], List[np.ndarray], np.ndarray, List[CipherBlock]],
+    ) -> Union[np.ndarray, List[CipherBlock]]:
+        """
+        Validates and normalizes insert data format and dimension.
+
+        Parameters
+        ----------
+        data : CipherBlock, list of floats, list of lists, list of np.ndarray, 2D np.ndarray, or list of CipherBlock
+            Data to be validated. Single vectors (list of floats or 1D numpy array) are
+            automatically wrapped into batch format.
+
+        Returns
+        -------
+        Union[np.ndarray, List[CipherBlock]]
+            Normalized data in batch format.
+            Plain vectors are always returned as a 2D numpy array.
+            Cipher vectors are always returned as list[CipherBlock].
+
+        Raises
+        ------
+        ValueError
+            If data is empty, has wrong dimension, mixes plain/cipher input, or is in an unsupported format.
+        """
+        # Handle single CipherBlock - wrap to list for unified downstream processing.
+        if isinstance(data, CipherBlock):
+            if self.index_config.index_encryption not in ["cipher", "hybrid"]:
+                raise ValueError("Index encryption must be enabled to insert CipherBlock data.")
+            return [data]
+
+        # Check for empty data
+        if isinstance(data, np.ndarray):
+            if data.size == 0:
+                raise ValueError("Data cannot be empty.")
+        elif not data:
+            raise ValueError("Data cannot be empty.")
+
+        # Handle 1D numpy array (single vector) - wrap it
+        if isinstance(data, np.ndarray) and data.ndim == 1:
+            if data.shape[0] != self.index_config.dim:
+                raise ValueError(
+                    f"Data dimension {data.shape[0]} does not match index dimension {self.index_config.dim}."
+                )
+            return data.reshape(1, -1)
+
         # Handle 2D numpy array
         if isinstance(data, np.ndarray) and data.ndim == 2:
             if data.shape[1] != self.index_config.dim:
                 raise ValueError(
                     f"Data dimension {data.shape[1]} does not match index dimension {self.index_config.dim}."
                 )
-        elif isinstance(data[0], CipherBlock):
+            return data
+
+        if not isinstance(data, list):
+            raise ValueError(
+                "Data must be a CipherBlock, list of floats, list of lists, numpy arrays, 2D numpy array, or list of CipherBlock."
+            )
+
+        # Handle single vector as list of floats - wrap it
+        if data and isinstance(data[0], (int, float, np.floating, np.integer)):
+            if len(data) != self.index_config.dim:
+                raise ValueError(f"Data dimension {len(data)} does not match index dimension {self.index_config.dim}.")
+            return np.asarray(data).reshape(1, -1)
+
+        has_cipherblock = any(isinstance(item, CipherBlock) for item in data)
+        if has_cipherblock:
+            if not all(isinstance(item, CipherBlock) for item in data):
+                raise ValueError("Data cannot mix CipherBlock and plaintext vectors in a single insert call.")
             if self.index_config.index_encryption not in ["cipher", "hybrid"]:
                 raise ValueError("Index encryption must be enabled to insert CipherBlock data.")
-        elif isinstance(data[0], list):
-            if len(data[0]) != self.index_config.dim:
-                raise ValueError(
-                    f"Data dimension {len(data[0])} does not match index dimension {self.index_config.dim}."
-                )
-        elif isinstance(data[0], np.ndarray):
-            if data[0].shape[0] != self.index_config.dim:
-                raise ValueError(
-                    f"Data dimension {data[0].shape[0]} does not match index dimension {self.index_config.dim}."
-                )
-        else:
-            raise ValueError("Data must be a list of lists, numpy arrays, 2D numpy array, or CipherBlock.")
+            has_centroids_idx = [block.centroids_idx is not None for block in data]
+            if any(has_centroids_idx) and not all(has_centroids_idx):
+                raise ValueError("centroids_idx must be present on all CipherBlocks or none.")
+            if all(has_centroids_idx):
+                for block in data:
+                    if block.num_vectors != len(block.centroids_idx):
+                        raise ValueError("The length of centroids_idx must equal num_vectors.")
+            return data
 
-        item_ids = self._insert_bulk(data, metadata=metadata)
-        logger.debug("Data insertion completed successfully.")
-        return item_ids
+        # Handle list of list vectors
+        if isinstance(data[0], list):
+            arr = np.asarray(data)
+            if arr.ndim != 2 or arr.shape[1] != self.index_config.dim:
+                raise ValueError(
+                    f"Data dimension {arr.shape[1] if arr.ndim == 2 else 'invalid'} does not match index dimension {self.index_config.dim}."
+                )
+            return arr
+
+        # Handle list of numpy arrays
+        if isinstance(data[0], np.ndarray):
+            arr = np.asarray(data)
+            if arr.ndim != 2 or arr.shape[1] != self.index_config.dim:
+                raise ValueError(
+                    f"Data dimension {arr.shape[1] if arr.ndim == 2 else 'invalid'} does not match index dimension {self.index_config.dim}."
+                )
+            return arr
+
+        raise ValueError(
+            "Data must be a CipherBlock, list of floats, list of lists, numpy arrays, 2D numpy array, or list of CipherBlock."
+        )
 
     def _encrypt_metadata_list(self, metadata: List[Any]) -> List[Any]:
         """Encrypts metadata if metadata encryption is enabled."""
         if self.index_config.metadata_encryption:
+            if self._is_kms_managed_mode():
+                plaintext_metadata = [self._stringify_metadata_value(m) for m in metadata]
+                encrypted_metadata = self.kms_client.encrypt_metadata(self.index_config.key_id, plaintext_metadata)
+                return [base64.b64encode(item).decode("ascii") for item in encrypted_metadata]
             key_source = self.index_config.metadata_key_path or self.index_config.metadata_key
             encrypted_metadata = [
                 encrypt_metadata(m, key_source, kek=self.index_config.seal_kek_path) for m in metadata
@@ -1010,6 +1438,119 @@ class Index:
             return decrypt_metadata(metadata, key_source, kek=self.index_config.seal_kek_path)
         else:
             return metadata
+
+    def _is_kms_managed_mode(self) -> bool:
+        return self.kms_client is not None
+
+    @staticmethod
+    def _stringify_metadata_value(metadata: Any) -> str:
+        if metadata is None:
+            return ""
+        if isinstance(metadata, bytes):
+            return metadata.decode("utf-8", errors="ignore")
+        if isinstance(metadata, (dict, list)):
+            return json.dumps(metadata, ensure_ascii=False)
+        return str(metadata)
+
+    @staticmethod
+    def _parse_kms_plaintext_metadata(metadata: str) -> Any:
+        if metadata is None:
+            return None
+        try:
+            return json.loads(metadata)
+        except Exception:
+            return metadata
+
+    @staticmethod
+    def _metadata_payload(entry: Any) -> Any:
+        if hasattr(entry, "data"):
+            return entry.data
+        return getattr(entry, "infos", None)
+
+    def _kms_topk(self, result_ctxt: CipherBlock, top_k: int):
+        encrypted_scores = [
+            common_type_pb2.EVCiphertext(degree=score.degree, data=score.data) for score in result_ctxt.data.ctxt_score
+        ]
+        shard_indices = list(getattr(result_ctxt.data, "shard_idx", []))
+        return self.kms_client.topk(
+            key_id=self.index_config.key_id,
+            encrypted_scores=encrypted_scores,
+            k=top_k,
+            shard_indices=shard_indices or None,
+        )
+
+    def _multiquery_get_topk_metadata_results_via_kms(
+        self, results: List[CipherBlock], top_k: int, output_fields: List[str] = None
+    ):
+        ranked_results_list = []
+        topk_indices_list = []
+
+        for result in results:
+            ranked_results = self._kms_topk(result, top_k)
+            ranked_results_list.append(ranked_results)
+            for ranked in ranked_results:
+                metadata_idx = ranked.metadata_idx
+                topk_indices_list.append(
+                    {
+                        "shard_idx": metadata_idx.shard_idx,
+                        "row_idx": metadata_idx.row_idx,
+                    }
+                )
+
+        metadata_result = self.indexer.get_metadata(
+            self.index_config.index_name, topk_indices_list, fields=output_fields
+        )
+
+        if len(metadata_result) != len(topk_indices_list):
+            raise ValueError(
+                f"Metadata count mismatch: requested {len(topk_indices_list)}, received {len(metadata_result)}"
+            )
+
+        decrypted_metadata = None
+        if self.index_config.metadata_encryption:
+            encrypted_metadata = []
+            encrypted_positions = []
+            for i, item in enumerate(metadata_result):
+                payload = self._metadata_payload(item)
+                if not payload:
+                    continue
+                encrypted_metadata.append(base64.b64decode(payload))
+                encrypted_positions.append(i)
+
+            decrypted_metadata = [None] * len(metadata_result)
+            if encrypted_metadata:
+                plaintext_metadata = self.kms_client.decrypt_metadata(self.index_config.key_id, encrypted_metadata)
+                for i, plaintext in zip(encrypted_positions, plaintext_metadata):
+                    decrypted_metadata[i] = self._parse_kms_plaintext_metadata(plaintext)
+
+        output_result_list = []
+        offset = 0
+        for ranked_results in ranked_results_list:
+            n = len(ranked_results)
+            output_result = []
+            for i in range(n):
+                metadata_entry = metadata_result[i + offset]
+                payload = self._metadata_payload(metadata_entry)
+                metadata_value = payload
+                if self.index_config.metadata_encryption:
+                    metadata_value = decrypted_metadata[i + offset]
+                output_result.append(
+                    {
+                        "id": metadata_entry.id,
+                        "score": ranked_results[i].score,
+                        "metadata": metadata_value,
+                    }
+                )
+            output_result_list.append(output_result)
+            offset += n
+
+        ranked_results_list.clear()
+        topk_indices_list.clear()
+        if hasattr(metadata_result, "clear"):
+            metadata_result.clear()
+        del metadata_result
+
+        return output_result_list
 
     def _prepare_metadata_for_chunk(self, metadata_chunk: List[Any], num_item_list: List[int]) -> List[List[str]]:
         """Ensures each ciphertext chunk sends ``count`` metadata strings."""
@@ -1045,27 +1586,98 @@ class Index:
 
         return prepared
 
-    def _insert_chunk(self, data_chunk: CipherBlock, metadata: List[any] = None, centroid_idx: int = 0):
+    @staticmethod
+    def _extend_item_ids(item_ids: List[Any], item_id_chunk: Optional[List[Any]]) -> None:
+        """Append chunk item IDs while preserving existing duplicate-guard behavior."""
+        if item_id_chunk and (not item_ids or item_ids[-len(item_id_chunk) :] != item_id_chunk):
+            item_ids.extend(item_id_chunk)
+
+    def _insert_chunk(
+        self,
+        data_chunk: CipherBlock,
+        metadata: List[any] = None,
+        out_request_ids: Optional[List[str]] = None,
+    ):
         """Inserts a single data chunk (CipherBlock) and its metadata into the indexer."""
         input_metadata = self._prepare_metadata_for_chunk(metadata, data_chunk.num_item_list)
+        centroid_idx = data_chunk.centroids_idx
+        if self.index_config.index_type.upper() in _IVF_INDEX_TYPES and centroid_idx is None:
+            raise ValueError("IVF insert requires centroids_idx in CipherBlock.")
 
-        item_ids = self.indexer.insert_data_bulk(
-            self.index_config.index_name, data_chunk.data, data_chunk.num_item_list, input_metadata, centroid_idx
+        item_ids = self.indexer.async_persist_data_bulk(
+            self.index_config.index_name,
+            data_chunk.data,
+            data_chunk.num_item_list,
+            input_metadata,
+            centroid_idx,
+            out_request_id=out_request_ids,
         )
         self.num_entities += data_chunk.num_vectors
-
         return item_ids
 
-    def _insert_ivf_bulk(self, data: Union[List[any], np.ndarray], metadata: List[any] = None):
+    def _insert_row(
+        self,
+        data_chunk: CipherBlock,
+        metadata: List[any] = None,
+        out_request_ids: Optional[List[str]] = None,
+    ):
+        """Inserts a single data chunk (CipherBlock) and its metadata into the indexer."""
+        enc_vecs = data_chunk.data
+        metadata_list = [metadata[i] if metadata and i < len(metadata) else "" for i in range(len(enc_vecs))]
+        cluster_ids = data_chunk.centroids_idx
+        if self.index_config.index_type.upper() in _IVF_INDEX_TYPES and cluster_ids is None:
+            raise ValueError("IVF insert requires centroids_idx in CipherBlock.")
+        result = self.indexer.async_persist_data_rows_batch(
+            self.index_config.index_name,
+            enc_vecs,
+            metadata_list,
+            cluster_ids,
+            out_request_id=out_request_ids,
+        )
+
+        self.num_entities += len(enc_vecs)
+        return result
+
+    def _insert_ivf_bulk(
+        self,
+        normalized_data: _NormalizedInsertData,
+        metadata: List[any] = None,
+        use_row_insert: bool = False,
+        out_request_ids: Optional[List[str]] = None,
+        encryptor=None,
+    ):
         """
         Bulk inserts data into the index for IVF-FLAT.
         If the data is not encrypted, it will be encrypted before insertion.
         """
+        data = normalized_data.data
+
         # Insert Bulk
         item_ids = []  # placeholder for return value
 
-        if isinstance(data[0], CipherBlock):
-            raise Exception("Encrypted data can not be insert with IVF Index")
+        if normalized_data.kind == "cipher":
+            num_total_vectors = sum(chunk.num_vectors for chunk in data)
+            if metadata and num_total_vectors != len(metadata):
+                raise ValueError("Metadata length does not match the total number of entities.")
+
+            metadata_offset = 0
+            for data_chunk in tqdm(data, desc="Insert CipherBlock IVF Bulk"):
+                if metadata:
+                    num_chunk_entities = data_chunk.num_vectors
+                    metadata_chunk = metadata[metadata_offset : metadata_offset + num_chunk_entities]
+                    metadata_offset += num_chunk_entities
+                else:
+                    metadata_chunk = None
+
+                item_id_chunk = self._insert_chunk(
+                    data_chunk,
+                    metadata_chunk,
+                    out_request_ids=out_request_ids,
+                )
+                self._extend_item_ids(item_ids, item_id_chunk)
+
+            logger.debug("IVF pre-encrypted data insertion completed successfully.")
+            return item_ids
         if self.index_config.index_encryption not in ["cipher", "hybrid"]:
             raise ValueError("Received unencrypted data, but index encryption is disabled.")
 
@@ -1075,92 +1687,125 @@ class Index:
             for idx in close_idxs
         ]
 
-        close_vector_idx = dict()
-        for i, idx in enumerate(close_idxs):
-            if idx not in close_vector_idx:
-                close_vector_idx[idx] = []
-            close_vector_idx[idx].append(i)
+        num_items = len(data)
+        for i in range(0, num_items, ENCRYPTION_BATCH_SIZE):
+            batch_num = i // ENCRYPTION_BATCH_SIZE
+            end_idx = min(i + ENCRYPTION_BATCH_SIZE, num_items)
+            raw_data_chunk = list(data[i:end_idx])
+            metadata_chunk = metadata[i:end_idx] if metadata else None
+            centroid_idx_chunk = close_idxs[i:end_idx]
+            try:
+                item_id_chunk = self._encrypt_and_insert(
+                    raw_data_chunk,
+                    metadata_chunk,
+                    centroid_idx=centroid_idx_chunk,
+                    use_row_insert=use_row_insert,
+                    out_request_ids=out_request_ids,
+                    encryptor=encryptor,
+                )
+                self._extend_item_ids(item_ids, item_id_chunk)
+            except Exception as e:
+                raise RuntimeError(f"Batch {batch_num} insert failed: {e}") from e
 
-        for idx, vec_indices in tqdm(close_vector_idx.items(), desc="Insert IVF_FLAT", total=len(close_vector_idx)):
-            logger.debug(f"Cluster {idx}: {len(vec_indices)} vectors")
-            num_items = len(vec_indices)
-            logger.debug(
-                f"Bulk encrypting {num_items} entities for index '{self.index_config.index_name}'"
-                f" to centroid {idx}."
-            )
-            for i in range(0, num_items, ENCRYPTION_BATCH_SIZE):
-                raw_data_chunk = []
-                metadata_chunk = [] if metadata else None
-                for j in range(i, min(i + ENCRYPTION_BATCH_SIZE, num_items)):
-                    raw_data_chunk.append(data[vec_indices[j]])
-                    if metadata_chunk is not None:
-                        metadata_chunk.append(metadata[vec_indices[j]])
-
-                encrypted_chunk = self.cipher.encrypt_multiple(raw_data_chunk, encode_type="item")
-                item_id_chunk = self._insert_chunk(encrypted_chunk, metadata_chunk, idx)
-                if item_id_chunk:
-                    if not item_ids or item_ids[-len(item_id_chunk) :] != item_id_chunk:
-                        item_ids.extend(item_id_chunk)
-
-        logger.debug("IVF_FLAT Data insertion completed successfully.")
+        logger.debug("IVF Data insertion completed successfully.")
         return item_ids
 
-    def _insert_flat_bulk(self, data: Union[List[any], np.ndarray], metadata: List[any] = None):
+    def _encrypt_and_insert(
+        self,
+        data_chunk: Union[List[any], np.ndarray],
+        metadata_chunk: List[any] = None,
+        centroid_idx: Optional[List[int]] = None,
+        use_row_insert: bool = False,
+        out_request_ids: Optional[List[str]] = None,
+        encryptor=None,
+    ):
+        """Encrypts and inserts a data chunk into the indexer."""
+        cipher = self.cipher if encryptor is None else None
+        enc = encryptor or self.cipher._encryptor
+
+        # check data chunk size
+        if (isinstance(data_chunk, np.ndarray) and data_chunk.ndim == 1) or (
+            isinstance(data_chunk, list) and isinstance(data_chunk[0], (int, float, np.floating, np.integer))
+        ):
+            num_data = 1
+        else:
+            num_data = len(data_chunk)
+        # Encrypt data chunk in row
+        if use_row_insert and num_data < self.index_config.dim:
+            if cipher is not None:
+                encrypted_chunk = cipher.encrypt_row(data_chunk, encode_type="item", centroids_idx=centroid_idx)
+            else:
+                encrypted_chunk = CipherBlock(
+                    data=enc.encrypt_row(data_chunk, "item"),
+                    enc_type="single",
+                    centroids_idx=centroid_idx,
+                )
+            return self._insert_row(
+                encrypted_chunk,
+                metadata_chunk,
+                out_request_ids=out_request_ids,
+            )
+        # Encrypt data chunk in bulk
+        if cipher is not None:
+            encrypted_chunk = cipher.encrypt_multiple(data_chunk, encode_type="item", centroids_idx=centroid_idx)
+        else:
+            encrypted_chunk = CipherBlock(
+                data=enc.encrypt_multiple(data_chunk, "item"),
+                enc_type="multiple",
+                centroids_idx=centroid_idx,
+            )
+        return self._insert_chunk(
+            encrypted_chunk,
+            metadata_chunk,
+            out_request_ids=out_request_ids,
+        )
+
+    def _insert_flat_bulk(
+        self,
+        normalized_data: _NormalizedInsertData,
+        metadata: List[any] = None,
+        use_row_insert: bool = False,
+        out_request_ids: Optional[List[str]] = None,
+        encryptor=None,
+    ):
         """
         Bulk inserts data into the index.
         If the data is not encrypted, it will be encrypted before insertion.
         """
+        data = normalized_data.data
+
         # Insert Bulk
         item_ids = []  # placeholder for return value
 
         # Case 1: Data is not encrypted (raw data)
-        # Handle 2D numpy array
-        if isinstance(data, np.ndarray) and data.ndim == 2:
+        if normalized_data.kind == "plain":
             if self.index_config.index_encryption not in ["cipher", "hybrid"]:
                 raise ValueError("Received unencrypted data, but index encryption is disabled.")
 
-            num_items = data.shape[0]
+            num_items = data.shape[0] if isinstance(data, np.ndarray) else len(data)
             logger.debug(f"Bulk encrypting {num_items} entities for index '{self.index_config.index_name}'.")
             for i in tqdm(range(0, num_items, ENCRYPTION_BATCH_SIZE), desc="Encrypt and Insert"):
-                raw_data_chunk = data[i : i + ENCRYPTION_BATCH_SIZE]
-                # Convert numpy array chunk to list of 1D arrays for encryption
-                raw_data_chunk_list = [raw_data_chunk[j] for j in range(raw_data_chunk.shape[0])]
-
-                # Encrypt the data and convert it into a CipherBlock object
-                encrypted_chunk = self.cipher.encrypt_multiple(raw_data_chunk_list, encode_type="item")
-
-                metadata_chunk = metadata[i : i + ENCRYPTION_BATCH_SIZE] if metadata else None
-                item_id_chunk = self._insert_chunk(encrypted_chunk, metadata_chunk)
-                if item_id_chunk:
-                    if not item_ids or item_ids[-len(item_id_chunk) :] != item_id_chunk:
-                        item_ids.extend(item_id_chunk)
-
-        elif not isinstance(data[0], CipherBlock):
-            if self.index_config.index_encryption not in ["cipher", "hybrid"]:
-                raise ValueError("Received unencrypted data, but index encryption is disabled.")
-
-            num_items = len(data)
-            logger.debug(f"Bulk encrypting {num_items} entities for index '{self.index_config.index_name}'.")
-            for i in tqdm(range(0, num_items, ENCRYPTION_BATCH_SIZE), desc="Encrypt and Insert"):
-                raw_data_chunk = data[i : i + ENCRYPTION_BATCH_SIZE]
-
-                # Encrypt the data and convert it into a CipherBlock object
-                encrypted_chunk = self.cipher.encrypt_multiple(raw_data_chunk, encode_type="item")
-
-                metadata_chunk = metadata[i : i + ENCRYPTION_BATCH_SIZE] if metadata else None
-                item_id_chunk = self._insert_chunk(encrypted_chunk, metadata_chunk)
-                if item_id_chunk:
-                    if not item_ids or item_ids[-len(item_id_chunk) :] != item_id_chunk:
-                        item_ids.extend(item_id_chunk)
+                end_idx = min(i + ENCRYPTION_BATCH_SIZE, num_items)
+                raw_data_chunk = list(data[i:end_idx]) if isinstance(data, np.ndarray) else data[i:end_idx]
+                metadata_chunk = metadata[i:end_idx] if metadata else None
+                item_id_chunk = self._encrypt_and_insert(
+                    raw_data_chunk,
+                    metadata_chunk,
+                    use_row_insert=use_row_insert,
+                    out_request_ids=out_request_ids,
+                    encryptor=encryptor,
+                )
+                self._extend_item_ids(item_ids, item_id_chunk)
 
         # Case 2: Data is already a list of CipherBlock objects
         else:
-            num_total_vectors = sum(chunk.num_vectors for chunk in data)
+            cipher_data = data if isinstance(data, list) else [data]
+            num_total_vectors = sum(chunk.num_vectors for chunk in cipher_data)
             if metadata and num_total_vectors != len(metadata):
                 raise ValueError("Metadata length does not match the total number of entities.")
 
             metadata_offset = 0
-            for data_chunk in tqdm(data, desc="Insert CipherBlock Bulk"):
+            for data_chunk in tqdm(cipher_data, desc="Insert CipherBlock Bulk"):
                 if metadata:
                     num_chunk_entities = data_chunk.num_vectors
                     metadata_chunk = metadata[metadata_offset : metadata_offset + num_chunk_entities]
@@ -1168,13 +1813,24 @@ class Index:
                 else:
                     metadata_chunk = None
 
-                item_id_chunk = self._insert_chunk(data_chunk, metadata_chunk)
+                item_id_chunk = self._insert_chunk(
+                    data_chunk,
+                    metadata_chunk,
+                    out_request_ids=out_request_ids,
+                )
                 item_ids.extend(item_id_chunk)
 
         logger.debug("FLAT Data insertion completed successfully.")
         return item_ids
 
-    def _insert_bulk(self, data: Union[List[any], np.ndarray], metadata: List[any] = None):
+    def _insert_bulk(
+        self,
+        normalized_data: _NormalizedInsertData,
+        metadata: List[any] = None,
+        use_row_insert: bool = False,
+        out_request_ids: Optional[List[str]] = None,
+        encryptor=None,
+    ):
         """
         Bulk inserts data into the index.
         If the data is not encrypted, it will be encrypted before insertion.
@@ -1184,10 +1840,22 @@ class Index:
             metadata = self._encrypt_metadata_list(metadata)
 
         # Before insert get index info
-        if self.index_config.index_type.upper() == "IVF_FLAT":
-            return self._insert_ivf_bulk(data, metadata)
+        if self.index_config.index_type.upper() == "IVF_FLAT" or self.index_config.index_type.upper() == "IVF_VCT":
+            return self._insert_ivf_bulk(
+                normalized_data,
+                metadata=metadata,
+                use_row_insert=use_row_insert,
+                out_request_ids=out_request_ids,
+                encryptor=encryptor,
+            )
         elif self.index_config.index_type.upper() == "FLAT":
-            return self._insert_flat_bulk(data, metadata)
+            return self._insert_flat_bulk(
+                normalized_data,
+                metadata=metadata,
+                use_row_insert=use_row_insert,
+                out_request_ids=out_request_ids,
+                encryptor=encryptor,
+            )
         else:
             raise ValueError(f"Index type '{self.index_config.index_type}' not supported for insertion.")
 
@@ -1222,8 +1890,22 @@ class Index:
         >>> print(results)
         """
         result_ctxt_list = self.scoring(query, search_params=search_params)
+        if len(result_ctxt_list) == 0:
+            return []
+        if self._is_kms_managed_mode():
+            output_result_list = self._multiquery_get_topk_metadata_results_via_kms(
+                result_ctxt_list, top_k, output_fields
+            )
+            result_ctxt_list.clear()
+            del result_ctxt_list
+            return output_result_list
         result_list = [self.decrypt_score(result_ctxt) for result_ctxt in result_ctxt_list]
+        result_ctxt_list.clear()
+        del result_ctxt_list
+
         output_result_list = self._multiquery_get_topk_metadata_results(result_list, top_k, output_fields)
+        result_list.clear()
+        del result_list
         return output_result_list
 
     def scoring(
@@ -1270,7 +1952,13 @@ class Index:
                         f"Query dimension {len(i)} does not match index dimension {self.index_config.dim}."
                     )
         # Now, all query is form of multi query
+        plain_query_level = (
+            0
+            if str(self.index_config.eval_mode).upper() in ("MM", "MMS", "MM32", "MMS32")
+            else self.index_config.level
+        )
         if self.index_config.index_type == "IVF_FLAT":
+            self._ensure_ivf_runtime_metadata_loaded(require_centroids=True)
             if self.index_config.query_encryption in ["cipher"]:  # CC
                 # Encrypt multiple queries for each, if query was plaintext
                 if (
@@ -1281,14 +1969,16 @@ class Index:
                         if search_params
                         else self.index_config.index_param.default_nprobe
                     )
-                    encrypted_query = [self.cipher.encrypt(i, encode_type="query") for i in query]
+                    encrypted_query = [self.cipher.encrypt_query(i) for i in query]
 
                     search_topk = self._knn(query, k=nprobe)
 
                 else:
                     raise Exception("IVF_FLAT need to closet centriod info before encryption")
 
-                assert nprobe == len(search_topk[0])
+                # FIX: Replace assert with explicit validation (asserts can be disabled with -O flag)
+                if nprobe != len(search_topk[0]):
+                    raise ValueError(f"nprobe mismatch: expected {nprobe}, got {len(search_topk[0])}")
                 logger.debug(f"Search on {nprobe} clusters by IVF-FLAT: {search_topk}")
 
                 # Do search with encrypted queries
@@ -1304,10 +1994,36 @@ class Index:
 
                 search_topk = self._knn(query, k=nprobe)
 
-                assert nprobe == len(search_topk[0])
+                # FIX: Replace assert with explicit validation (asserts can be disabled with -O flag)
+                if nprobe != len(search_topk[0]):
+                    raise ValueError(f"nprobe mismatch: expected {nprobe}, got {len(search_topk[0])}")
                 logger.debug(f"Search on {nprobe} clusters by IVF-FLAT: {search_topk}")
 
-                result_ctxt = self.indexer.search(self.index_config.index_name, query, search_topk)
+                result_ctxt = self.indexer.search(
+                    self.index_config.index_name,
+                    query,
+                    topk=search_topk,
+                    nprobe=nprobe,
+                    level=plain_query_level,
+                )
+
+        elif self.index_config.index_type == "IVF_VCT":
+            self._ensure_ivf_runtime_metadata_loaded()
+            if self.index_config.query_encryption in ["plain"]:  # PC
+                nprobe = (
+                    search_params.get("nprobe", self.index_config.index_param.default_nprobe)
+                    if search_params
+                    else self.index_config.index_param.default_nprobe
+                )
+                logger.debug(f"Search on {nprobe} clusters by IVF-VCT")
+                result_ctxt = self.indexer.search(
+                    self.index_config.index_name,
+                    query,
+                    nprobe=nprobe,
+                    level=plain_query_level,
+                )
+            else:
+                raise ValueError(f"Query encryption type '{self.index_config.query_encryption}' not supported.")
 
         else:
             if self.index_config.query_encryption in ["cipher"]:  # CC
@@ -1315,15 +2031,23 @@ class Index:
                 if (
                     isinstance(query, List) and query and isinstance(query[0], List) and isinstance(query[0][0], float)
                 ) or (isinstance(query, List) and isinstance(query[0], np.ndarray)):
-                    encrypted_query = [self.cipher.encrypt(i, encode_type="query") for i in query]
+                    encrypted_query = [self.cipher.encrypt_query(i) for i in query]
                 else:
                     encrypted_query = query
                 # Do search with encrypted queries
                 result_ctxt = self.indexer.encrypted_search(self.index_config.index_name, encrypted_query)
             else:  # PC
                 # Do search with plain queries
-                result_ctxt = self.indexer.search(self.index_config.index_name, query)
+                result_ctxt = self.indexer.search(
+                    self.index_config.index_name,
+                    query,
+                    level=plain_query_level,
+                )
         result = [CipherBlock(result) for result in result_ctxt]
+        if hasattr(result_ctxt, "clear"):
+            result_ctxt.clear()
+        del result_ctxt
+
         logger.debug(f"Scoring completed successfully for {len(query)} queries. {result}")
         return result  # Return is always a list of CipherBlock
 
@@ -1348,9 +2072,14 @@ class Index:
         >>> top_k_results = index.get_topk_metadata_results(result_ctxt, top_k=3, output_fields=["metadata"])
         >>> print(top_k_results)
         """
-        result = self._multiquery_get_topk_metadata_results(results=[result], top_k=top_k, output_fields=output_fields)[
-            0
-        ]
+        if self._is_kms_managed_mode() and isinstance(result, CipherBlock):
+            result = self._multiquery_get_topk_metadata_results_via_kms(
+                results=[result], top_k=top_k, output_fields=output_fields
+            )[0]
+        else:
+            result = self._multiquery_get_topk_metadata_results(
+                results=[result], top_k=top_k, output_fields=output_fields
+            )[0]
         logger.debug(f"Top-{top_k} metadata retrieval completed successfully. result: {result}")
         return result
 
@@ -1369,6 +2098,11 @@ class Index:
             self.index_config.index_name, topk_indices_list, fields=output_fields
         )
 
+        if len(metadata_result) != len(topk_indices_list):
+            raise ValueError(
+                f"Metadata count mismatch: requested {len(topk_indices_list)}, received {len(metadata_result)}"
+            )
+
         output_result_list = []
         offset = 0
         for topk_result in topk_result_list:
@@ -1383,6 +2117,14 @@ class Index:
             ]
             output_result_list.append(output_result)
             offset += n
+
+        # Release intermediate containers before returning.
+        topk_result_list.clear()
+        topk_indices_list.clear()
+        if hasattr(metadata_result, "clear"):
+            metadata_result.clear()
+        del metadata_result
+
         return output_result_list
 
     def decrypt_score(
@@ -1410,6 +2152,11 @@ class Index:
         >>> decrypted_scores = index.decrypt_score(result_ctxt, sec_key_path="./keys/SecKey.bin")
         >>> print(decrypted_scores)
         """
+        if self._is_kms_managed_mode():
+            raise NotImplementedError(
+                "Index.decrypt_score() is not supported in KMS-managed mode. "
+                "Use Index.search(), Index.get_topk_metadata_results() with CipherBlock, or KMSClient.topk()."
+            )
         if self.index_config.index_encryption not in ["cipher", "hybrid"]:
             raise ValueError("Index encryption is not enabled. Cannot decrypt scores.")
         result = self.cipher.decrypt_score(
@@ -1425,6 +2172,10 @@ class Index:
         """
         Loads the index into memory.
 
+        This call is also used to publish pending merged shards for indexes that are
+        already loaded. Backend ``load_index`` returns an "already loaded" error when
+        there is nothing new to publish; that case is treated as a no-op here.
+
         Returns
         -------
         Index
@@ -1434,13 +2185,12 @@ class Index:
         --------
         >>> index.load()
         """
-        is_loaded = self.indexer.get_index_info(self.index_config.index_name)["is_loaded"]
-        if is_loaded:
-            logger.info("Index already loaded. No need to load.")
-            if not self.is_loaded:
-                self._is_loaded = True
-            return self
-        self.indexer.load_index(self.index_config.index_name)
+        try:
+            self.indexer.load_index(self.index_config.index_name)
+        except EnvectorApplicationError as exc:
+            if not str(exc).startswith("Index already loaded:"):
+                raise
+            logger.info("Index already loaded with no pending shards. No additional load needed.")
         self._is_loaded = True
         return self
 
@@ -1457,7 +2207,7 @@ class Index:
         --------
         >>> index.unload()
         """
-        is_loaded = self.indexer.get_index_info(self.index_config.index_name)["is_loaded"]
+        is_loaded = self.indexer.get_index_summary(self.index_config.index_name)["is_loaded"]
         if not is_loaded:
             logger.info("Index already unloaded. No need to unload.")
             if self.is_loaded:
@@ -1466,6 +2216,10 @@ class Index:
         self.indexer.unload_index(self.index_config.index_name)
         self._is_loaded = False
         return self
+
+    def _refresh_loaded_state(self) -> bool:
+        self._is_loaded = self.indexer.get_index_summary(self.index_config.index_name)["is_loaded"]
+        return self._is_loaded
 
     def drop(self):
         """
@@ -1492,6 +2246,12 @@ class Index:
         """
         Find k-nearest neighbors for each vector in the index.
         """
+        self._ensure_ivf_runtime_metadata_loaded(require_centroids=True)
+        # FIX: Add null check for centroids (was causing AttributeError instead of helpful message)
+        if self.index_config.centroids is None or (
+            hasattr(self.index_config.centroids, "size") and self.index_config.centroids.size == 0
+        ):
+            raise ValueError("Centroids not initialized. Load index metadata first.")
         dim = self.index_config.centroids.shape[1]
         nearest_indices: List[np.ndarray] = []
 
@@ -1512,6 +2272,25 @@ class Index:
             return []
 
         return np.concatenate(nearest_indices, axis=0).tolist()
+
+    def summary(self):
+        """
+        Returns a summary of the index.
+
+        Returns
+        -------
+        Dict
+            A dictionary containing the index summary. Capacity-related keys include:
+            `can_load_now`,
+            `remaining_insertable_shards`,
+            `remaining_insertable_vectors_guaranteed`,
+            `remaining_insertable_vectors_best_effort`.
+
+        Examples
+        --------
+        >>> index.summary()
+        """
+        return self.indexer.get_index_summary(self.index_config.index_name)
 
     @property
     def is_connected(self) -> bool:
@@ -1536,6 +2315,45 @@ class Index:
     @is_loaded.setter
     def is_loaded(self, value: bool):
         raise NotImplementedError("Setting is_loaded directly is not allowed.")
+
+    @property
+    def remaining_insertable_vectors(self) -> int:
+        """
+        Returns the number of remaining insertable vectors in the index.
+
+        Returns
+        -------
+        int
+            The number of remaining insertable vectors.
+        """
+        summary = self.indexer.get_index_summary(self.index_config.index_name)
+        return summary["remaining_insertable_vectors_guaranteed"]
+
+    @property
+    def remaining_insertable_shards(self) -> int:
+        """
+        Returns the number of remaining insertable shards in the index.
+
+        Returns
+        -------
+        int
+            The number of remaining insertable shards.
+        """
+        summary = self.indexer.get_index_summary(self.index_config.index_name)
+        return summary["remaining_insertable_shards"]
+
+    @property
+    def loadable(self) -> bool:
+        """
+        Checks if the index is loadable.
+
+        Returns
+        -------
+        bool
+            True if the index is loadable, False otherwise.
+        """
+        summary = self.indexer.get_index_summary(self.index_config.index_name)
+        return summary["can_load_now"]
 
     def __repr__(self):
         return (

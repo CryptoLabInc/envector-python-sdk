@@ -12,7 +12,6 @@
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional
 
 import pyenvector
 from pyenvector.crypto import KeyManager
@@ -135,6 +134,20 @@ def upload_keys_to_aws(key_dict: dict, key_id: str, region_name: str, bucket_nam
     print(f"Keys uploaded to AWS for key_id '{key_id}'.")
 
 
+def upload_keys_to_gcp(key_dict: dict, key_id: str, bucket_name: str, secret_prefix: str):
+    """
+    Upload generated keys to GCP storage using KeyManager.
+    """
+    km = KeyManager(
+        key_id=key_id,
+        key_store="gcp",
+        bucket_name=bucket_name,
+        secret_prefix=secret_prefix,
+    )
+    km.save(key_dict)
+    print(f"Keys uploaded to GCP for key_id '{key_id}'.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate a key for the enVector API (pyenvector SDK).")
     parser.add_argument(
@@ -174,18 +187,18 @@ def main():
     parser.add_argument(
         "--preset",
         type=str,
-        default="ip",
-        choices=["ip", "ip0"],
-        help="Parameter preset for the key (default: 'ip')",
+        default="ip1",
+        choices=["ip1"],
+        help="Parameter preset for the key (default: 'ip1')",
     )
     parser.add_argument(
         "--eval-mode",
         "--eval_mode",
         dest="eval_mode",
         type=str,
-        default="rmp",
-        choices=["rmp", "mm"],
-        help="Evaluation mode for the key (default: 'rmp')",
+        default="mm32",
+        choices=["mm", "mms"],
+        help="Evaluation mode for the key (default: 'mm')",
     )
     parser.add_argument(
         "--metadata-encryption",
@@ -216,8 +229,8 @@ def main():
         dest="key_store",
         type=str,
         default="local",
-        choices=["local", "aws"],
-        help="Location to store generated keys. Use 'aws' to upload to AWS (default: 'local').",
+        choices=["local", "aws", "gcp"],
+        help="Location to store generated keys. Use 'aws' or 'gcp' for cloud storage (default: 'local').",
     )
     parser.add_argument(
         "--region-name",
@@ -231,34 +244,36 @@ def main():
         "--bucket_name",
         dest="bucket_name",
         type=str,
-        help="AWS S3 bucket when --key-store aws is specified.",
+        help="Storage bucket when --key-store aws or gcp is specified.",
     )
     parser.add_argument(
         "--secret-prefix",
         "--secret_prefix",
         dest="secret_prefix",
-        type=Optional[str],
-        default=None,
-        help="AWS Secrets Manager prefix when --key-store aws is specified.",
+        type=str,
+        default="",
+        help="Secret prefix when --key-store aws or gcp is specified.",
     )
 
     args = parser.parse_args()
     outdir = args.key_path + "/" + args.key_id if args.key_id else args.key_path
 
-    use_aws = args.key_store == "aws"
-    if use_aws:
+    use_remote = args.key_store in {"aws", "gcp"}
+    if use_remote:
         if not args.key_id:
-            parser.error("--key-store aws requires --key_id to be specified.")
-        if not args.region_name or not args.bucket_name:
+            parser.error("--key-store aws or gcp requires --key_id to be specified.")
+        if args.key_store == "aws" and (not args.region_name or not args.bucket_name):
             parser.error("--key-store aws requires --region-name and --bucket-name.")
+        if args.key_store == "gcp" and not args.bucket_name:
+            parser.error("--key-store gcp requires --bucket-name.")
         if args.seal_mode != "none":
-            parser.error("--key-store aws does not support sealed key generation.")
+            parser.error("--key-store aws or gcp does not support sealed key generation.")
         if args.seal_key_path or args.seal_key_stdin:
-            parser.error("--seal_key_path and --seal_key_stdin are not supported when using --key-store aws.")
+            parser.error("--seal_key_path and --seal_key_stdin are not supported when using --key-store aws or gcp.")
     else:
         ensure_dir_empty(outdir)
 
-    if use_aws:
+    if use_remote:
         key_dict = generate_key_stream(
             args.dim,
             None,
@@ -267,7 +282,10 @@ def main():
             args.metadata_encryption,
             args.key_id,
         )
-        upload_keys_to_aws(key_dict, args.key_id, args.region_name, args.bucket_name, args.secret_prefix)
+        if args.key_store == "aws":
+            upload_keys_to_aws(key_dict, args.key_id, args.region_name, args.bucket_name, args.secret_prefix)
+        else:
+            upload_keys_to_gcp(key_dict, args.key_id, args.bucket_name, args.secret_prefix)
     else:
         seal_mode, seal_kek = ensure_kek_loaded(args, parser)
         generate_key(

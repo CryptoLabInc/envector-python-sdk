@@ -11,6 +11,7 @@
 
 import os
 import site
+from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import evi
@@ -41,8 +42,10 @@ def check_libheaan_exists():
 
 
 PARAMETER_PRESET: List[str] = [
-    "IP",
-    "IP0",
+    # "IP",
+    # "IP0",
+    "IP1",
+    "IP2",
     # "QF",
     # "QF0",
     # "QF1",
@@ -56,7 +59,19 @@ EVAL_MODE: List[str] = [
     "RMP",
     # "RMS",
     "MM",
+    "MMS",
+    "MM32",   # IP2 MM with u32 coefficient storage
+    "MMS32",  # IP2 MM + shared-A with u32 coefficient storage
 ]
+
+# Required preset for each eval mode; modes absent from this map have no forced preset.
+_EVAL_MODE_PRESET: Dict[str, str] = {
+    "MM": "IP1",
+    "MMS": "IP1",
+    "MM32": "IP2",
+    "MMS32": "IP2",
+}
+
 
 DEVICE_TYPE: List[str] = [
     "CPU",
@@ -75,6 +90,7 @@ SEAL_MODE: List[str] = [
 INDEX_TYPE: List[str] = [
     "FLAT",
     "IVF_FLAT",
+    "IVF_VCT",
 ]
 
 
@@ -99,14 +115,16 @@ class ContextParameter:
         preset: Optional[Union[str, evi.ParameterPreset]] = None,
         dim: Optional[int] = None,
         eval_mode: Optional[Union[str, evi.EvalMode]] = None,
+        level: Optional[int] = None,
         device_type: Optional[Union[str, evi.DeviceType]] = None,
     ):
         """
         Initializes the ContextParameter class.
         """
-        self.preset = preset
         self.dim = dim
+        self.preset = preset
         self.eval_mode = eval_mode
+        self.level = level
         self.device_type = device_type
 
     def __repr__(self):
@@ -121,6 +139,42 @@ class ContextParameter:
             f"  search_type={self.search_type}\n"
             ")"
         )
+
+    @property
+    def eval_mode(self):
+        if self._eval_mode is None:
+            raise ValueError("Eval mode is not set. Please set the eval mode using set_eval_mode method.")
+        return self._eval_mode
+
+    @eval_mode.setter
+    def eval_mode(self, mode: Optional[Union[str, evi.EvalMode]] = "MM32"):
+        """
+        Sets the evaluation mode for the index.
+        Args:
+            mode (str): The evaluation mode for the index.
+        Raises:
+            ValueError: If the evaluation mode is unsupported.
+        """
+        if mode is None:
+            mode = "MM32"  # Default to MM32 if not provided
+        if isinstance(mode, str):
+            mode_upper = mode.upper()
+            if mode_upper not in EVAL_MODE:
+                raise ValueError(f"Unsupported eval mode: {mode}. Supported modes are: {', '.join(EVAL_MODE)}")
+            self._eval_mode = getattr(evi.EvalMode, mode_upper)
+        else:
+            mode_upper = mode.name
+            self._eval_mode = mode
+        if mode_upper in _EVAL_MODE_PRESET:
+            self._preset = getattr(evi.ParameterPreset, _EVAL_MODE_PRESET[mode_upper])
+            self._sync_level_with_preset()
+
+    @property
+    def eval_mode_name(self):
+        """
+        Returns the name of the evaluation mode.
+        """
+        return self.eval_mode.name
 
     @property
     def preset(self):
@@ -138,15 +192,15 @@ class ContextParameter:
             ValueError: If the preset is unsupported.
         """
         if preset is None:
-            preset = "ip"
+            preset = "ip1"
         if isinstance(preset, str):
             preset_upper = preset.upper()
             if preset_upper not in PARAMETER_PRESET:
                 raise ValueError(f"Unsupported preset: {preset}. Supported presets are: {', '.join(PARAMETER_PRESET)}")
 
             if preset_upper.startswith("IP"):
-                if preset_upper == "IP":
-                    preset_upper = "IP0"
+                if preset_upper not in ("IP1", "IP2"):
+                    raise ValueError(f"Currently IP1 and IP2 supported only. Got: {preset}")
 
             elif preset_upper.startswith("QF"):
                 if not check_libheaan_exists():
@@ -155,12 +209,28 @@ class ContextParameter:
                     preset_upper = "QF0"
             else:
                 raise ValueError(f"Unsupported preset: {preset}")
+            forced = _EVAL_MODE_PRESET.get(getattr(getattr(self, "_eval_mode", None), "name", ""))
+            if forced is not None and forced != preset_upper:
+                raise ValueError(
+                    f"Preset '{preset_upper}' is incompatible with eval_mode "
+                    f"'{self._eval_mode.name}' (required: '{forced}')."
+                )
             self._preset = getattr(evi.ParameterPreset, preset_upper)
         else:
             if preset.name.startswith("QF"):
                 if not check_libheaan_exists():
                     raise ValueError("QF parameter is not allowed without libHEaaN.")
             self._preset = preset  # Assume preset is already an evi.ParameterPreset instance
+        self._sync_level_with_preset()
+
+    def _derive_level_from_preset(self) -> int:
+        preset_name = getattr(self._preset, "name", "")
+        return 1 if preset_name in ("IP1", "IP2") else 0
+
+    def _sync_level_with_preset(self) -> None:
+        if not getattr(self, "_level_is_explicit", False):
+            self._level = self._derive_level_from_preset()
+            self._level_is_explicit = False
 
     @property
     def preset_name(self):
@@ -170,40 +240,6 @@ class ContextParameter:
             str: The name of the preset.
         """
         return self.preset.name
-
-    @property
-    def eval_mode(self):
-        if self._eval_mode is None:
-            raise ValueError("Eval mode is not set. Please set the eval mode using set_eval_mode method.")
-        return self._eval_mode
-
-    @eval_mode.setter
-    def eval_mode(self, mode: Optional[Union[str, evi.EvalMode]] = "RMP"):
-        """
-        Sets the evaluation mode for the index.
-        Args:
-            mode (str): The evaluation mode for the index.
-        Raises:
-            ValueError: If the evaluation mode is unsupported.
-        """
-        if mode is None:
-            mode = "RMP"  # Default to RMP if not provided
-        if isinstance(mode, str):
-            mode_upper = mode.upper()
-            if mode_upper not in EVAL_MODE:
-                raise ValueError(f"Unsupported eval mode: {mode}. Supported modes are: {', '.join(EVAL_MODE)}")
-            self._eval_mode = getattr(evi.EvalMode, mode_upper)
-        else:
-            self._eval_mode = mode
-
-    @property
-    def eval_mode_name(self):
-        """
-        Returns the name of the evaluation mode.
-        Returns:
-            str: The name of the evaluation mode.
-        """
-        return self.eval_mode.name
 
     @property
     def device_type(self):
@@ -267,11 +303,31 @@ class ContextParameter:
         self._dim = dim
 
     @property
+    def level(self) -> int:
+        if getattr(self, "_level", None) is None:
+            self._level = self._derive_level_from_preset()
+            self._level_is_explicit = False
+        return self._level
+
+    @level.setter
+    def level(self, level: Optional[int]):
+        if level is None:
+            self._level = self._derive_level_from_preset()
+            self._level_is_explicit = False
+        else:
+            self._level = level
+            self._level_is_explicit = True
+
+    @property
+    def level_is_explicit(self) -> bool:
+        return getattr(self, "_level_is_explicit", False)
+
+    @property
     def is_ip(self):
         """
-        Checks if the preset is IP or IP0.
+        Checks if the preset is IP or any of its variants.
         Returns:
-            bool: True if the preset is IP or IP0, False otherwise.
+            bool: True if the preset is IP or any of its variants, False otherwise.
         """
         return self.preset.name.startswith("IP")
 
@@ -480,60 +536,58 @@ class IndexParameter:
     @property
     def nlist(self):
         """
-        Returns the nlist parameter for IVF_FLAT index type.
+        Returns the nlist parameter for IVF index type.
         Returns:
-            int: The nlist parameter for IVF_FLAT index type.
+            int: The nlist parameter for IVF index type.
         """
-        if self.index_type != "IVF_FLAT":
-            raise ValueError("nlist is only applicable for IVF_FLAT index type.")
+        if self.index_type != "IVF_FLAT" and self.index_type != "IVF_VCT":
+            raise ValueError("nlist is only applicable for IVF index type.")
         if "nlist" not in self.index_params:
-            raise ValueError("nlist is not set. Please set the nlist parameter for IVF_FLAT index type.")
+            raise ValueError("nlist is not set. Please set the nlist parameter for IVF index type.")
         return self.index_params["nlist"]
 
     @nlist.setter
     def nlist(self, nlist):
-        if self.index_type != "IVF_FLAT":
-            raise ValueError("nlist is only applicable for IVF_FLAT index type.")
+        if self.index_type != "IVF_FLAT" and self.index_type != "IVF_VCT":
+            raise ValueError("nlist is only applicable for IVF index type.")
         self.index_params["nlist"] = nlist
 
     @property
     def default_nprobe(self):
         """
-        Returns the default_nprobe parameter for IVF_FLAT index type.
+        Returns the default_nprobe parameter for IVF index type.
         Returns:
-            int: The default_nprobe parameter for IVF_FLAT index type.
+            int: The default_nprobe parameter for IVF index type.
         """
-        if self.index_type != "IVF_FLAT":
-            raise ValueError("default_nprobe is only applicable for IVF_FLAT index type.")
+        if self.index_type != "IVF_FLAT" and self.index_type != "IVF_VCT":
+            raise ValueError("default_nprobe is only applicable for IVF index type.")
         if "default_nprobe" not in self.index_params:
-            raise ValueError(
-                "default_nprobe is not set. Please set the default_nprobe parameter for IVF_FLAT index type."
-            )
+            raise ValueError("default_nprobe is not set. Please set the default_nprobe parameter for IVF index type.")
         return self.index_params["default_nprobe"]
 
     @default_nprobe.setter
     def default_nprobe(self, nprobe):
-        if self.index_type != "IVF_FLAT":
-            raise ValueError("default_nprobe is only applicable for IVF_FLAT index type.")
+        if self.index_type != "IVF_FLAT" and self.index_type != "IVF_VCT":
+            raise ValueError("default_nprobe is only applicable for IVF index type.")
         self.index_params["default_nprobe"] = nprobe
 
     @property
     def centroids(self):
         """
-        Returns the centroids for IVF_FLAT index type.
+        Returns the centroids for IVF index type.
         Returns:
-            np.ndarray: The centroids for IVF_FLAT index type.
+            np.ndarray: The centroids for IVF index type.
         """
-        if self.index_type != "IVF_FLAT":
-            raise ValueError("centroids is only applicable for IVF_FLAT index type.")
+        if self.index_type != "IVF_FLAT" and self.index_type != "IVF_VCT":
+            raise ValueError("centroids is only applicable for IVF index type.")
         if "centroids" not in self.index_params:
-            raise ValueError("centroids is not set. Please set the centroids parameter for IVF_FLAT index type.")
+            raise ValueError("centroids is not set. Please set the centroids parameter for IVF index type.")
         return self.index_params["centroids"]
 
     @centroids.setter
     def centroids(self, centroids):
-        if self.index_type != "IVF_FLAT":
-            raise ValueError("centroids is only applicable for IVF_FLAT index type.")
+        if self.index_type != "IVF_FLAT" and self.index_type != "IVF_VCT":
+            raise ValueError("centroids is only applicable for IVF index type.")
         self.index_params["centroids"] = centroids
 
     @property
@@ -564,9 +618,12 @@ class IndexParameter:
                 f"Unsupported index type: {index_params['index_type']}. Supported types are: {', '.join(INDEX_TYPE)}"
             )
 
-        if index_params["index_type"] == "IVF_FLAT":
+        if index_params["index_type"].startswith("IVF_"):
             if "nlist" not in index_params:
-                default_nlist = self.index_params.get("nlist", 4096)
+                if index_params["index_type"] == "IVF_FLAT":
+                    default_nlist = self.index_params.get("nlist", 4096)
+                elif index_params["index_type"] == "IVF_VCT":
+                    default_nlist = self.index_params.get("nlist", 32768)
                 index_params["nlist"] = default_nlist
             if "default_nprobe" not in index_params:
                 default_nprobe = self.index_params.get("default_nprobe", 1)
@@ -614,6 +671,8 @@ class KeyParameter:
         region_name: Optional[str] = None,
         bucket_name: Optional[str] = None,
         secret_prefix: Optional[str] = None,
+        vault_addr: Optional[str] = None,
+        vault_mount: Optional[str] = None,
     ):
         """
         Initializes the KeyParameter class.
@@ -630,10 +689,12 @@ class KeyParameter:
             eval_key (str or bytes, optional): Evaluation key stream when ``use_key_stream`` is enabled.
             sec_key (str or bytes, optional): Secret key stream when ``use_key_stream`` is enabled.
             metadata_key (str or bytes, optional): Metadata key stream when ``use_key_stream`` is enabled.
-            key_store (str, optional): External key storage provider (e.g., "aws").
+            key_store (str, optional): External key storage provider (e.g., "aws", "gcp", "vault").
             region_name (str, optional): External key store region (for AWS).
-            bucket_name (str, optional): S3 bucket name for AWS key storage.
-            secret_prefix (str, optional): Secrets Manager prefix for AWS key storage.
+            bucket_name (str, optional): Bucket name for external key storage.
+            secret_prefix (str, optional): Secret prefix for external key storage.
+            vault_addr (str, optional): Vault address for external key storage.
+            vault_mount (str, optional): Vault KV mount for external key storage.
         """
         self.use_key_stream = use_key_stream
         self.key_path = key_path
@@ -650,6 +711,8 @@ class KeyParameter:
         self.region_name = region_name
         self.bucket_name = bucket_name
         self.secret_prefix = secret_prefix
+        self.vault_addr = vault_addr
+        self.vault_mount = vault_mount
 
     #     self._init_keys()
 
@@ -685,8 +748,12 @@ class KeyParameter:
             key_store = None
         elif key_store == "aws":
             key_store = "aws"
+        elif key_store == "gcp":
+            key_store = "gcp"
+        elif key_store == "vault":
+            key_store = "vault"
         else:
-            raise ValueError(f"Unsupported key store type: {key_store}. Supported types are: aws.")
+            raise ValueError(f"Unsupported key store type: {key_store}. Supported types are: aws, gcp, vault.")
         self._key_store = key_store
 
     @property
@@ -712,6 +779,22 @@ class KeyParameter:
     @secret_prefix.setter
     def secret_prefix(self, secret_prefix: Optional[str]):
         self._secret_prefix = secret_prefix
+
+    @property
+    def vault_addr(self):
+        return getattr(self, "_vault_addr", None)
+
+    @vault_addr.setter
+    def vault_addr(self, vault_addr: Optional[str]):
+        self._vault_addr = vault_addr
+
+    @property
+    def vault_mount(self):
+        return getattr(self, "_vault_mount", None)
+
+    @vault_mount.setter
+    def vault_mount(self, vault_mount: Optional[str]):
+        self._vault_mount = vault_mount
 
     @property
     def key_path(self):
@@ -983,11 +1066,7 @@ class KeyParameter:
 
     @property
     def enc_key(self):
-        if self.enc_key_stream:
-            return utils.get_key_stream(self.enc_key_stream)
-        if self.enc_key_path:
-            return utils.get_key_stream(self.enc_key_path)
-        return None
+        return self._resolve_key_bytes("_enc_key", self.enc_key_stream, self.enc_key_path)
 
     @enc_key.setter
     def enc_key(self, enc_key):
@@ -995,11 +1074,7 @@ class KeyParameter:
 
     @property
     def eval_key(self):
-        if self.eval_key_stream:
-            return utils.get_key_stream(self.eval_key_stream)
-        if self.eval_key_path:
-            return utils.get_key_stream(self.eval_key_path)
-        return None
+        return self._resolve_key_bytes("_eval_key", self.eval_key_stream, self.eval_key_path)
 
     @eval_key.setter
     def eval_key(self, eval_key):
@@ -1007,11 +1082,7 @@ class KeyParameter:
 
     @property
     def sec_key(self):
-        if self.sec_key_stream:
-            return utils.get_key_stream(self.sec_key_stream)
-        if self.sec_key_path:
-            return utils.get_key_stream(self.sec_key_path)
-        return None
+        return self._resolve_key_bytes("_sec_key", self.sec_key_stream, self.sec_key_path)
 
     @sec_key.setter
     def sec_key(self, sec_key):
@@ -1019,25 +1090,46 @@ class KeyParameter:
 
     @property
     def metadata_key(self):
-        if self.metadata_key_stream:
-            return utils.get_key_stream(self.metadata_key_stream)
-        if self.metadata_key_path:
-            return utils.get_key_stream(self.metadata_key_path)
-        return None
+        return self._resolve_key_bytes("_metadata_key", self.metadata_key_stream, self.metadata_key_path)
 
     @metadata_key.setter
     def metadata_key(self, metadata_key):
         self._metadata_key = utils.get_key_stream(metadata_key)
 
-    def check_key_dir(self) -> bool:
+    def _resolve_key_bytes(self, cache_attr: str, stream_value, path_value):
+        """
+        Lazily loads key bytes either from an in-memory stream or from disk.
+        Returns cached data when available and quietly skips missing files so
+        callers can proceed even if certain key artifacts were removed after init.
+        """
+        cached = getattr(self, cache_attr, None)
+        if cached is not None:
+            return cached
+        if stream_value:
+            key_bytes = utils.get_key_stream(stream_value)
+            setattr(self, cache_attr, key_bytes)
+            return key_bytes
+        if path_value:
+            path_obj = Path(path_value).expanduser()
+            if path_obj.exists():
+                key_bytes = utils.get_key_stream(str(path_obj))
+                setattr(self, cache_attr, key_bytes)
+                return key_bytes
+        return None
+
+    def check_key_dir(self, strict: bool = True) -> bool:
         """
         Checks if the key directory structure is valid.
+
+        Args:
+            strict (bool, optional): When True, raise ``ValueError`` for missing files.
+                When False, simply return False if the structure is incomplete.
 
         Returns:
             bool: True if the directory structure and required files exist, False otherwise.
         """
-        from pathlib import Path
-
+        if self.key_path is None or self.key_id is None:
+            return False
         base_dir = Path(self.key_path).expanduser().resolve()
 
         # Check if key_path exists and is a directory
@@ -1054,11 +1146,9 @@ class KeyParameter:
         for file_name in required_files:
             file_path = key_dir / file_name
             if not file_path.exists():
-                raise ValueError(f"[ERROR] Required file '{file_name}' is missing in '{key_dir}'.")
-        optional_files = ["SecKey.json"]
-        if not any((key_dir / file_name).exists() for file_name in optional_files):
-            raise ValueError(f"[ERROR] At least one of {optional_files} must exist in '{key_dir}'.")
-
+                if strict:
+                    raise ValueError(f"[ERROR] Required file '{file_name}' is missing in '{key_dir}'.")
+                return False
         return True
 
     def __repr__(self):

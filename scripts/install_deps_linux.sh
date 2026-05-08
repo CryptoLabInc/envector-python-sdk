@@ -102,6 +102,7 @@ else
   RC_FILE="$HOME/.bashrc"
 fi
 # Add $HOME/.local/bin to PATH in rc file if not already present
+touch "$RC_FILE"
 if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' "$RC_FILE"; then
   echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$RC_FILE"
 fi

@@ -9,12 +9,14 @@
 #  For licensing inquiries or permission requests, please contact: pypi@cryptolab.co.kr
 # ========================================================================================
 
-from typing import List, Optional, Union
+import warnings
+from numbers import Integral
+from typing import List, Optional, Sequence, Union
 
 import evi
 from evi import Query
 
-from pyenvector.proto_gen.type_pb2 import CiphertextScore
+from pyenvector.proto_gen.v2.common.type_pb2 import CiphertextScore
 
 
 class CipherBlock:
@@ -24,10 +26,17 @@ class CipherBlock:
     Ciphertexts can be either an encrypted vector or an encrypted similarity scores.
     """
 
-    def __init__(self, data: Union[Query, CiphertextScore], enc_type: Optional[str] = None):
+    def __init__(
+        self,
+        data: Union[Query, CiphertextScore],
+        enc_type: Optional[str] = None,
+        centroids_idx: Optional[Sequence[int]] = None,
+    ):
         self._is_score = None
+        self._centroids_idx = None
         self.data = data
         self.enc_type = enc_type
+        self.centroids_idx = centroids_idx
 
     @property
     def data(self):
@@ -45,6 +54,10 @@ class CipherBlock:
     def shard_idx(self):
         return self._shard_idx
 
+    @property
+    def centroids_idx(self):
+        return self._centroids_idx
+
     @enc_type.setter
     def enc_type(self, value: Optional[str]):
         if value and value not in ["multiple", "single"]:
@@ -54,6 +67,25 @@ class CipherBlock:
     @shard_idx.setter
     def shard_idx(self, value: Optional[int]):
         self._shard_idx = value if value else None
+
+    @centroids_idx.setter
+    def centroids_idx(self, value: Optional[Sequence[int]]):
+        if value is None:
+            self._centroids_idx = None
+            return
+        if self.is_score:
+            raise ValueError("centroids_idx is only supported for vector ciphertext blocks.")
+        if isinstance(value, Integral):
+            normalized = [int(value)]
+        else:
+            if not isinstance(value, (list, tuple)):
+                raise ValueError("centroids_idx must be an integer or a list/tuple of integers.")
+            normalized = list(value)
+        if not all(isinstance(v, Integral) for v in normalized):
+            raise ValueError("centroids_idx must contain only integers.")
+        if len(normalized) != self.num_vectors:
+            raise ValueError(f"centroids_idx length {len(normalized)} must match num_vectors {self.num_vectors}.")
+        self._centroids_idx = [int(v) for v in normalized]
 
     @property
     def num_vectors(self):
@@ -93,16 +125,48 @@ class CipherBlock:
             self._is_score = True
             self._data = value
             self.shard_idx = getattr(value, "shard_idx", None)
+            if self._centroids_idx is not None:
+                warnings.warn(
+                    "centroids_idx has been reset because data was reassigned to a CiphertextScore.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            self._centroids_idx = None
             return self
         elif isinstance(value, Query):
             self._is_score = False
             self.enc_type = "single"
             self._data = [value]
+            if self._centroids_idx is not None:
+                warnings.warn(
+                    "centroids_idx has been reset because data was reassigned to a new Query.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            self._centroids_idx = None
             return self
         elif isinstance(value, list) and all(isinstance(v, Query) for v in value):
             self._is_score = False
             self.enc_type = "multiple"
             self._data = value
+            if self._centroids_idx is not None:
+                warnings.warn(
+                    "centroids_idx has been reset because data was reassigned to a new list of Queries.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            self._centroids_idx = None
+            return self
+        elif isinstance(value, list) and all(isinstance(v, bytes) for v in value):
+            self._is_score = False
+            self._data = value
+            if self._centroids_idx is not None:
+                warnings.warn(
+                    "centroids_idx has been reset because data was reassigned to a new list of bytes.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            self._centroids_idx = None
             return self
         else:
             raise ValueError("Data must be a list of Query or CiphertextScore.")

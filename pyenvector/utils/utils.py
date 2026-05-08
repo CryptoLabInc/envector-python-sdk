@@ -21,7 +21,7 @@ from typing import List, Optional, TypedDict, Union
 import evi
 from evi import SealInfo, SealMode
 
-from pyenvector.proto_gen import type_pb2 as envector_type_pb
+from pyenvector.proto_gen.v2.common import type_pb2 as envector_type_pb
 
 
 class Position(TypedDict):
@@ -113,6 +113,29 @@ def _metadata_serializable_to_bytes(metadata_serializable):
     return metadata_serializable
 
 
+def _b64url_encode(data: bytes) -> str:
+    """Base64url encode without padding (RFC 4648 S5)."""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(s: str) -> bytes:
+    """Base64url decode, re-adding padding as needed."""
+    padded = s + "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(padded)
+
+
+def _extract_v2_sealed_bytes(payload: dict) -> bytes:
+    """Extract and reassemble GCM sealed bytes (IV + tag + ciphertext) from a v2 envelope."""
+    entries = payload.get("entries", [])
+    if not entries:
+        raise ValueError("sealed-key-v2 envelope has no entries")
+    entry = entries[0]
+    iv = _b64url_decode(entry["iv"])
+    tag = _b64url_decode(entry["tag"])
+    edk = _b64url_decode(entry["edk"])
+    return iv + tag + edk
+
+
 def check_key_metadata(key_id: str, key_path: str) -> bool:
     """
     Check if the key metadata file exists and contains the specified key_id.
@@ -153,9 +176,17 @@ def convert_to_encode_type(encode_type: Union[str, evi.EncodeType]) -> evi.Encod
 
 
 def convert_to_preset(preset):
-    if preset.lower() == "ip" or preset.lower() == "ip0":
-        return evi.ParameterPreset.IP0
-    elif preset.lower() == "qf" or preset.lower() == "qf0":
+    if preset.lower().startswith("ip"):  # Case: IP
+        # if preset.lower() == "ip0":
+        #     return evi.ParameterPreset.IP0
+        if preset.lower() == "ip1":
+            return evi.ParameterPreset.IP1
+        elif preset.lower() == "ip2":
+            return evi.ParameterPreset.IP2
+        else:
+            raise ValueError(f"Unsupported IP preset: {preset}. Use IP1 or IP2.")
+    elif preset.lower().startswith("qf"):  # Case: QF
+        # Consider only QF0 for now
         return evi.ParameterPreset.QF0
     else:
         raise ValueError(f"Unknown preset: {preset}. Supported presets are: IP, QF.")
@@ -267,22 +298,86 @@ def _get_evi_key_manager():
 
 
 def _load_wrapped_metadata_key(raw_bytes: bytes):
+    # Backward compatibility: prefer provider-envelope unwrap (new evi format) before legacy pyenvector parsing.
+    unwrapped = _try_unwrap_provider_envelope(raw_bytes)
+    if unwrapped is not None:
+        return unwrapped
+
     payload = json.loads(raw_bytes.decode("utf-8"))
+    fmt = payload.get("format")
+    if fmt == "sealed-key-v2":
+        return _extract_v2_sealed_bytes(payload)
+    if fmt is not None:
+        # Provider envelope (EVI crypto): try generic unwrap before failing.
+        unwrapped = _try_unwrap_provider_envelope(raw_bytes)
+        if unwrapped is not None:
+            return unwrapped
+        metadata_entry = _extract_metadata_entry_key_data(payload)
+        if metadata_entry is not None:
+            return metadata_entry
+        raise ValueError(f"Unknown sealed-key format: {fmt!r}")
     serialized = payload.get("metadata_blob", payload)
     return _metadata_serializable_to_bytes(serialized)
+
+
+def _try_unwrap_provider_envelope(raw_bytes: bytes) -> Optional[bytes]:
+    km = _get_evi_key_manager()
+    unwrap_candidates = [km.unwrap_sec_key_bytes, km.unwrap_enc_key_bytes, km.unwrap_eval_key_bytes]
+    unwrap_metadata = getattr(km, "unwrap_metadata_key_bytes", None)
+    if callable(unwrap_metadata):
+        unwrap_candidates.append(unwrap_metadata)
+
+    for unwrap in unwrap_candidates:
+        try:
+            return unwrap(raw_bytes)
+        except Exception:
+            continue
+    return None
+
+
+def _extract_metadata_entry_key_data(payload: dict) -> Optional[bytes]:
+    entries = payload.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return None
+    entry = entries[0]
+    if not isinstance(entry, dict):
+        return None
+
+    name = str(entry.get("name", "")).lower()
+    usage = str(entry.get("usage", "")).lower()
+    role = str(entry.get("role", "")).lower()
+    is_metadata_entry = (
+        name in {"metadatakey", "metadata_key", "meta_aes"} or usage == "metadata" or ("metadata" in role)
+    )
+    if not is_metadata_entry:
+        return None
+
+    key_data = entry.get("key_data")
+    if isinstance(key_data, str):
+        try:
+            return base64.b64decode(key_data)
+        except binascii.Error:
+            return None
+    return None
 
 
 def _unwrap_key_dict_payload(payload: dict) -> bytes:
     metadata_blob = payload.get("metadata_blob")
     if metadata_blob is not None:
         return _metadata_serializable_to_bytes(metadata_blob)
+    fmt = payload.get("format")
+    if fmt == "sealed-key-v2":
+        return _extract_v2_sealed_bytes(payload)
+
     raw_bytes = json.dumps(payload).encode("utf-8")
-    km = _get_evi_key_manager()
-    for unwrap in (km.unwrap_sec_key_bytes, km.unwrap_enc_key_bytes, km.unwrap_eval_key_bytes):
-        try:
-            return unwrap(raw_bytes)
-        except Exception:
-            continue
+    unwrapped = _try_unwrap_provider_envelope(raw_bytes)
+    if unwrapped is not None:
+        return unwrapped
+
+    metadata_entry = _extract_metadata_entry_key_data(payload)
+    if metadata_entry is not None:
+        return metadata_entry
+
     raise ValueError("Unsupported JSON key payload.")
 
 
@@ -298,6 +393,19 @@ def _load_wrapped_key_from_json(path: Path) -> bytes:
         return km.unwrap_enc_key_bytes(raw_bytes)
     if filename.endswith("evalkey.json"):
         return km.unwrap_eval_key_bytes(raw_bytes)
+
+    # Fallback for arbitrary JSON filenames (e.g., sec_blob.json in external stores).
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        return _unwrap_key_dict_payload(payload)
+
+    unwrapped = _try_unwrap_provider_envelope(raw_bytes)
+    if unwrapped is not None:
+        return unwrapped
+
     raise ValueError(f"Unsupported key file: {path}")
 
 
@@ -333,14 +441,8 @@ def get_key_stream(key_path: Union[str, bytes, dict]) -> bytes:
                     raw_bytes = stripped.encode("utf-8")
                 else:
                     return _unwrap_key_dict_payload(data)
-                km = _get_evi_key_manager()
-                for unwrap in (km.unwrap_sec_key_bytes, km.unwrap_enc_key_bytes, km.unwrap_eval_key_bytes):
-                    try:
-                        key_bytes = unwrap(raw_bytes)
-                        break
-                    except Exception:
-                        continue
-                else:
+                key_bytes = _try_unwrap_provider_envelope(raw_bytes)
+                if key_bytes is None:
                     raise ValueError("Unsupported JSON key payload.")
             else:
                 import ast
@@ -349,6 +451,12 @@ def get_key_stream(key_path: Union[str, bytes, dict]) -> bytes:
     else:
         raise TypeError("key_path must be a file path (str) or bytes")
     return key_bytes
+
+
+def _normalize_key_type(key_type) -> set:
+    if key_type is None:
+        return None
+    return {key_type} if isinstance(key_type, str) else set(key_type)
 
 
 def _calculate_file_sha256(file_path: str) -> str:

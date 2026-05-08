@@ -6,10 +6,12 @@ from pyenvector.crypto.parameter import ContextParameter, IndexParameter, KeyPar
 @pytest.mark.parametrize(
     "preset, dim, eval_mode, device_type, expected_preset_name, expected_search_type",
     [
-        ("IP", 32, "RMP", "CPU", "IP0", "IP"),
-        ("IP0", 64, "RMP", "CPU", "IP0", "IP"),
-        ("QF0", 128, "RMP", "GPU", "QF0", "QF"),
-        ("IP0", 64, "RMP", "GPU", "IP0", "IP"),
+        ("IP1", 32, "MM", "CPU", "IP1", "IP"),
+        ("IP1", 64, "MM", "CPU", "IP1", "IP"),
+        ("IP2", 32, "MM", "CPU", "IP1", "IP"),  # MM forces IP1 regardless of requested preset
+        ("IP2", 64, "MM", "CPU", "IP1", "IP"),  # MM forces IP1 regardless of requested preset
+        ("QF0", 128, "MM", "GPU", "QF0", "QF"),
+        ("IP1", 64, "MM", "GPU", "IP1", "IP"),
     ],
 )
 def test_context_parameter_combinations(
@@ -59,7 +61,13 @@ def test_key_parameter_initialization(
     expected_eval_key_path,
     expected_enc_key_path,
     expect_error,
+    tmp_path,
 ):
+    if seal_kek_path is not None:
+        kek_path = tmp_path / "aes.kek"
+        kek_path.write_bytes(b"\x01" * 32)
+        seal_kek_path = str(kek_path)
+
     if expect_error:
         with pytest.raises(ValueError):
             KeyParameter(key_path=key_path, key_id=key_id, seal_mode=seal_mode, seal_kek_path=seal_kek_path)
@@ -98,3 +106,37 @@ def test_index_parameter_with_invalid_index_type():
         IndexParameter(index_encryption="cipher", query_encryption="plain", index_params={"index_type": "INVALID"})
     with pytest.raises(ValueError):
         IndexParameter(index_encryption="cipher", query_encryption="cipher", index_params={"index_type": "UNKNOWN"})
+
+
+def test_key_parameter_check_key_dir_strict_behavior(tmp_path):
+    base_dir = tmp_path / "keys"
+    key_id = "test-key"
+    key_dir = base_dir / key_id
+    key_dir.mkdir(parents=True)
+    # create required files
+    (key_dir / "EncKey.json").write_bytes(b"enc")
+    (key_dir / "EvalKey.json").write_bytes(b"eval")
+    (key_dir / "SecKey.json").write_bytes(b"sec")
+
+    param = KeyParameter(key_path=str(base_dir), key_id=key_id, seal_mode="NONE")
+    assert param.check_key_dir(strict=True) is True
+
+    # remove EvalKey to trigger strict failure
+    (key_dir / "EvalKey.json").unlink()
+    with pytest.raises(ValueError):
+        param.check_key_dir(strict=True)
+    assert param.check_key_dir(strict=False) is False
+
+
+def test_key_parameter_check_key_dir_missing_optional(tmp_path):
+    base_dir = tmp_path / "keys"
+    key_id = "partial-key"
+    key_dir = base_dir / key_id
+    key_dir.mkdir(parents=True)
+    (key_dir / "EncKey.json").write_bytes(b"enc")
+    (key_dir / "EvalKey.json").write_bytes(b"eval")
+    # SecKey.json is optional (fully-managed mode has no local SK)
+
+    param = KeyParameter(key_path=str(base_dir), key_id=key_id, seal_mode="NONE")
+    assert param.check_key_dir(strict=True) is True
+    assert param.check_key_dir(strict=False) is True

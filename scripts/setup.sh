@@ -10,7 +10,7 @@
 # 4. Create a Pipenv virtual environment and install dependencies
 # 5. Generate Protobuf code and run additional scripts
 #
-# Usage: ./setup.sh
+# Usage: ./setup.sh [--python <version>] [--type <install|wheel>] [--macosx-target <version>] [--evi-commit <sha|branch|tag>] [--skip-build-evi] [--aws] [--gcp] [-j <jobs>|--jobs <jobs>]
 # ==============================================================================
 
 # --- Script Configuration ---
@@ -45,6 +45,9 @@ function warn() {
     echo -e "${COLOR_YELLOW}WARN:${COLOR_NC} $1"
 }
 
+function is_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
 
 # --- Function Definitions ---
 
@@ -98,11 +101,11 @@ function setup_pipenv() {
 # 5. Function to initialize and update submodules
 function init_submodule() {
     msg "Initializing and updating submodules..."
-    local EVI_CRYPTO_COMMIT=${1:-}
-    if [[ -n "$EVI_CRYPTO_COMMIT" ]]; then
-        ./scripts/init_evi_crypto.sh --evi-crypto-commit "$EVI_CRYPTO_COMMIT"
+    local EVI_COMMIT=${1:-}
+    if [[ -n "$EVI_COMMIT" ]]; then
+        ./scripts/init_evi.sh --evi-commit "$EVI_COMMIT"
     else
-        ./scripts/init_evi_crypto.sh
+        ./scripts/init_evi.sh
     fi
     success "Submodules initialized and updated."
 }
@@ -112,16 +115,30 @@ function build_project() {
     local BUILD_TYPE=${1:-install}
     local MACOSX_TARGET=${2:-11.0}
     local SKIP_BUILD=${3:-false}
+    local PREFER_AWS_SDK=${4:-false}
+    local PREFER_GCP_SDK=${5:-false}
+    local JOBS=${6:-}
     msg "Starting project build..."
     if [[ "$SKIP_BUILD" == "true" ]]; then
         msg "--skip-build-evi set: Skipping build_and_install step."
         success "Project proto installation complete."
         return 0
     fi
-    # Run the evi-crypto installation script inside the virtual environment.
+    # Run the EVI installation script inside the virtual environment.
     msg "Running the installation script..."
 
-    pipenv run ./scripts/build_and_install.sh --type $BUILD_TYPE --macosx-target $MACOSX_TARGET
+    local BUILD_ARGS=(--type "$BUILD_TYPE" --macosx-target "$MACOSX_TARGET")
+    if [[ "$PREFER_AWS_SDK" == "true" ]]; then
+        BUILD_ARGS+=(--aws)
+    fi
+    if [[ "$PREFER_GCP_SDK" == "true" ]]; then
+        BUILD_ARGS+=(--gcp)
+    fi
+    if [[ -n "$JOBS" ]]; then
+        BUILD_ARGS+=(--jobs "$JOBS")
+    fi
+
+    pipenv run ./scripts/build_and_install.sh "${BUILD_ARGS[@]}"
 
     success "Project build complete."
 }
@@ -135,8 +152,11 @@ function main() {
     PYTHON_VERSION=3.12  # Default Python version
     BUILD_TYPE=install   # Default build type
     MACOSX_TARGET=11.0   # Default macOS deployment target
-    EVI_CRYPTO_COMMIT=""
-    SKIP_BUILD_EVI_CRYPTO=false
+    EVI_COMMIT=""
+    SKIP_BUILD_EVI=false
+    PREFER_AWS_SDK=false
+    PREFER_GCP_SDK=false
+    JOBS=""
     while [[ $# -gt 0 ]]; do
         case $1 in
             --python)
@@ -151,18 +171,38 @@ function main() {
                 MACOSX_TARGET=$2
                 shift 2
                 ;;
-            --evi-crypto-commit)
+            --evi-commit)
                 if [[ $# -gt 1 && -n "$2" && "$2" != --* ]]; then
-                    EVI_CRYPTO_COMMIT=$2
+                    EVI_COMMIT=$2
                     shift 2
                 else
-                    EVI_CRYPTO_COMMIT=""
+                    EVI_COMMIT=""
                     shift 1
                 fi
                 ;;
-            --skip-build-evi-crypto)
-                SKIP_BUILD_EVI_CRYPTO=true
+            --skip-build-evi)
+                SKIP_BUILD_EVI=true
                 shift 1
+                ;;
+            --aws)
+                PREFER_AWS_SDK=true
+                shift 1
+                ;;
+            --gcp)
+                PREFER_GCP_SDK=true
+                shift 1
+                ;;
+            -j|--jobs)
+                if [[ $# -lt 2 ]]; then
+                    echo "Option $1 requires a positive integer value."
+                    exit 1
+                fi
+                if ! is_positive_integer "$2"; then
+                    echo "Invalid jobs value: $2. Expected a positive integer."
+                    exit 1
+                fi
+                JOBS=$2
+                shift 2
                 ;;
             *)
                 echo "Unknown option: $1"
@@ -173,9 +213,9 @@ function main() {
 
     check_dependencies $PYTHON_VERSION
     cleanup
-    init_submodule "$EVI_CRYPTO_COMMIT"
+    init_submodule "$EVI_COMMIT"
     setup_pipenv $PYTHON_VERSION
-    build_project $BUILD_TYPE $MACOSX_TARGET $SKIP_BUILD_EVI_CRYPTO
+    build_project $BUILD_TYPE $MACOSX_TARGET $SKIP_BUILD_EVI $PREFER_AWS_SDK $PREFER_GCP_SDK $JOBS
 
     echo # Newline for spacing
     success "All setup steps completed successfully!"

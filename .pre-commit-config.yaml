@@ -21,7 +21,7 @@ repos:
     -   id: clang-format
 
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.4
+    rev: v0.4.4  # 원하는 버전으로 고정
     hooks:
     -   id: ruff
         args: [--fix, --show-fixes, --config=pyproject.toml]

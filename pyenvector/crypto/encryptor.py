@@ -9,9 +9,12 @@
 #  For licensing inquiries or permission requests, please contact: pypi@cryptolab.co.kr
 # ========================================================================================
 
-from typing import List
+import math
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional
 
 import evi
+from threadpoolctl import threadpool_limits
 
 from pyenvector.crypto.context import Context
 from pyenvector.crypto.parameter import ContextParameter, EncodingType
@@ -127,7 +130,7 @@ class Encryptor:
     #     """
     #     self.encryptor.load_enc_key_from_stream(enc_key_stream)
 
-    def encrypt(self, msg: List[float], encoding: str):
+    def encrypt(self, msg: List[float], encoding: str, level: Optional[bool] = None):
         """
         Encrypts a vector.
 
@@ -144,10 +147,57 @@ class Encryptor:
             The encrypted vector as a Query object.
         """
         enc_type = EncodingType(encoding)
+        if level is None:
+            level = getattr(self._context.parameter, "level", 0)
 
-        return self.encryptor.encrypt(msg, self._enc_key, enc_type.encoding_type, False)  # No considering qf now
+        return self.encryptor.encrypt(msg, self._enc_key, enc_type.encoding_type, bool(level))  # No considering qf now
 
-    def encrypt_multiple(self, msg: List[List[float]], encoding: str):
+    def encrypt_row(self, msg: List[List[float]], encoding: str, level: int = 0, n_workers: int = 1) -> List[bytes]:
+        """
+        Encrypts a batch of vectors and returns raw serialized bytes (one per row).
+
+        Parameters
+        ----------
+        msg : List[List[float]]
+            Batch of vectors to encrypt.
+        encoding : str
+            Encoding type, e.g. "item".
+        level : int, optional
+            Encryption level. Default 0.
+        n_workers : int, optional
+            Number of parallel worker threads. Default 1 (single-threaded).
+            When > 1, the batch is split evenly across workers, each using an
+            independent Encryptor instance. OpenMP threads inside evi are
+            capped to 1 per worker to avoid oversubscription.
+
+        Returns
+        -------
+        List[bytes]
+            Serialized ciphertexts in the same order as input rows.
+        """
+        enc_type = EncodingType(encoding)
+
+        if n_workers <= 1 or len(msg) == 0:
+            return self.encryptor.encrypt_row(msg, self._enc_key, enc_type.encoding_type, level)
+
+        chunk_size = math.ceil(len(msg) / n_workers)
+        chunks = [msg[i : i + chunk_size] for i in range(0, len(msg), chunk_size)]
+        ctx = Encryptor._context._context
+        enc_key = self._enc_key
+        encode_type = enc_type.encoding_type
+
+        def worker(chunk):
+            enc = evi.Encryptor(ctx)
+            return enc.encrypt_row(chunk, enc_key, encode_type, level)
+
+        results = []
+        with threadpool_limits(limits=1, user_api="openmp"):
+            with ThreadPoolExecutor(max_workers=min(n_workers, len(chunks))) as pool:
+                for partial in pool.map(worker, chunks):
+                    results.extend(partial)
+        return results
+
+    def encrypt_multiple(self, msg: List[List[float]], encoding: str, level: int = 0):
         """
         Encrypts multiple vectors.
 
@@ -165,7 +215,7 @@ class Encryptor:
         """
         enc_type = EncodingType(encoding)
 
-        return self.encryptor.encrypt_bulk(msg, self._enc_key, enc_type.encoding_type, False)
+        return self.encryptor.encrypt_bulk(msg, self._enc_key, enc_type.encoding_type, level)
 
     # def encrypt_with_key(self, msg: List[float], sec_key_path: str, encoding: str):
     #     """
