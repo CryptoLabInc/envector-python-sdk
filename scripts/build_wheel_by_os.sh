@@ -108,7 +108,7 @@ else
     export CIBW_BUILD="${CIBW_BUILD:-cp39-* cp310-* cp311-* cp312-* cp313-*}"
     export CIBW_BUILD_VERBOSITY="${CIBW_BUILD_VERBOSITY:-1}"
     export CIBW_BEFORE_ALL="bash /project/scripts/cibw_before_all.sh"
-    STATIC_CMAKE_ARGS="-DBUILD_PYTHON=ON -DEVI_KM_PREFER_AWS_SDK=ON -DEVI_KM_PREFER_GCP_SDK=ON -DOPENSSL_ROOT_DIR=/opt/openssl-static -DOPENSSL_INCLUDE_DIR=/opt/openssl-static/include -DOPENSSL_CRYPTO_LIBRARY=/opt/openssl-static/lib/libcrypto.a -DOPENSSL_SSL_LIBRARY=/opt/openssl-static/lib/libssl.a -DOPENSSL_USE_STATIC_LIBS=TRUE -DZLIB_INCLUDE_DIR=/opt/zlib-static/include -DZLIB_LIBRARY=/opt/zlib-static/lib/libz.a"
+    STATIC_CMAKE_ARGS="-DBUILD_PYTHON=ON -DEVI_KM_PREFER_AWS_SDK=OFF -DEVI_KM_PREFER_GCP_SDK=OFF -DOPENSSL_ROOT_DIR=/opt/openssl-static -DOPENSSL_INCLUDE_DIR=/opt/openssl-static/include -DOPENSSL_CRYPTO_LIBRARY=/opt/openssl-static/lib/libcrypto.a -DOPENSSL_SSL_LIBRARY=/opt/openssl-static/lib/libssl.a -DOPENSSL_USE_STATIC_LIBS=TRUE -DZLIB_INCLUDE_DIR=/opt/zlib-static/include -DZLIB_LIBRARY=/opt/zlib-static/lib/libz.a"
     export CIBW_ENVIRONMENT="GITHUB_TOKEN=${GITHUB_TOKEN:-} CXXFLAGS='-include cstdint' CMAKE_ARGS='${CMAKE_ARGS:-} ${STATIC_CMAKE_ARGS}' CIBW_OPENSSL_PREFIX=/opt/openssl-static CIBW_ZLIB_PREFIX=/opt/zlib-static"
 
     # Build multiple manylinux policies so pip can select the best compatible

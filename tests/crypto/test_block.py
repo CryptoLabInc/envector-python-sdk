@@ -97,3 +97,26 @@ def test_cipherblock_centroids_idx_type_error_before_length_error(query):
         query.getInnerItemCount.return_value = 1
         with pytest.raises(ValueError, match="must contain only integers"):
             CipherBlock(query, centroids_idx=["not_int"])
+
+
+def test_cipherblock_num_vectors_for_serialized_row_ciphertexts():
+    block = CipherBlock([b"ctxt-1", b"ctxt-2"])
+
+    assert block.num_vectors == 2
+
+
+def test_cipherblock_num_item_list_for_serialized_row_ciphertexts():
+    block = CipherBlock([b"ctxt-1", b"ctxt-2", b"ctxt-3"])
+
+    assert block.num_item_list == [1, 1, 1]
+
+
+def test_cipherblock_centroids_idx_accepts_serialized_row_ciphertexts():
+    block = CipherBlock([b"ctxt-1", b"ctxt-2"], centroids_idx=[4, 5])
+
+    assert block.centroids_idx == [4, 5]
+
+
+def test_cipherblock_centroids_idx_length_mismatch_for_serialized_row_ciphertexts():
+    with pytest.raises(ValueError, match="centroids_idx length"):
+        CipherBlock([b"ctxt-1", b"ctxt-2"], centroids_idx=[1])

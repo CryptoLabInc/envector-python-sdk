@@ -3,6 +3,8 @@ import os
 import re
 
 import evi
+from google.api_core.exceptions import AlreadyExists, NotFound
+from google.cloud import secretmanager, storage
 
 from pyenvector.utils.utils import _normalize_key_type
 
@@ -21,10 +23,17 @@ class GCPClient:
         self.bucket_name = bucket_name or self.DEFAULT_BUCKET
         self.secret_prefix = secret_prefix or self.DEFAULT_PREFIX
 
-        gcp_cfg = evi.GcpConfig()
-        gcp_cfg.bucket_name = self.bucket_name
-        self._client = evi.KeyManager(evi.KeyStorageConfig.make_gcp(gcp_cfg))
+        self._secretmanager = secretmanager.SecretManagerServiceClient()
+        self._storage = storage.Client()
+        self._exc_not_found = NotFound
+        self._exc_already_exists = AlreadyExists
         self._codec = evi.KeyManager()
+
+        self._project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or os.getenv("GCLOUD_PROJECT")
+        if not self._project_id:
+            self._project_id = self._storage.project
+        if not self._project_id:
+            raise GCPKeyStorageError("Unable to determine GCP project id for Secret Manager client.")
 
     @staticmethod
     def _to_json_string(value):
@@ -82,13 +91,33 @@ class GCPClient:
         raise GCPKeyStorageError(message, original_error=error) from error
 
     def list_keys(self):
+        prefix = (self.secret_prefix or "").rstrip("/")
+        use_prefix = f"{prefix}/" if prefix else None
         try:
-            return sorted(set(self._client.list_keys()))
+            keys = set()
+            for blob in self._storage.list_blobs(self.bucket_name, prefix=use_prefix):
+                if blob.name:
+                    key_id = self._extract_key_id(blob.name, prefix=prefix)
+                    if key_id:
+                        keys.add(key_id)
+            return sorted(keys)
         except Exception as e:
             self._raise_storage_error("list keys", e)
 
+    @staticmethod
+    def _extract_key_id(storage_key: str, *, prefix: str = ""):
+        base = f"{prefix}/" if prefix else ""
+        if base:
+            if not storage_key.startswith(base):
+                return None
+            storage_key = storage_key[len(base) :]
+        parts = storage_key.split("/")
+        if len(parts) != 2 or not parts[0] or not parts[1].endswith(".json"):
+            return None
+        return parts[0]
+
     def _secret_id(self, key_id: str, blob_type: str, *, secret_prefix: str = None) -> str:
-        prefix = (secret_prefix or self.secret_prefix or "").strip("/")
+        prefix = (secret_prefix or self.secret_prefix or "").rstrip("/")
         parts = [part for part in (prefix, key_id, blob_type) if part]
         raw = "-".join(parts)
         sanitized = re.sub(r"[^A-Za-z0-9_-]", "-", raw)
@@ -99,14 +128,13 @@ class GCPClient:
         return sanitized[:255]
 
     def _secret_path(self, secret_id: str) -> str:
-        return secret_id
+        return f"projects/{self._project_id}/secrets/{secret_id}"
 
     def _secret_version_path(self, secret_id: str, version: str = "latest") -> str:
-        _ = version
-        return secret_id
+        return f"projects/{self._project_id}/secrets/{secret_id}/versions/{version}"
 
     def _storage_key(self, key_id: str, blob_type: str, *, secret_prefix: str = None) -> str:
-        prefix = (self.secret_prefix if secret_prefix is None else secret_prefix or "").strip("/")
+        prefix = (self.secret_prefix if secret_prefix is None else secret_prefix or "").rstrip("/")
         key = f"{key_id}/{blob_type}.json"
         if prefix:
             return f"{prefix}/{key}"
@@ -116,16 +144,37 @@ class GCPClient:
         return bucket_name or self.bucket_name
 
     def _create_secret(self, secret_id: str):
-        return {"name": secret_id}
+        parent = f"projects/{self._project_id}"
+        try:
+            return self._secretmanager.create_secret(
+                request={
+                    "parent": parent,
+                    "secret_id": secret_id,
+                    "secret": {"replication": {"automatic": {}}},
+                }
+            )
+        except self._exc_already_exists:
+            return None
 
-    def _read_remote_blob(self, storage_key: str, *, is_secret: bool) -> bytes:
+    def _read_remote_blob(self, storage_key: str, *, is_secret: bool, bucket_name: str = None) -> bytes:
         if is_secret:
-            return self._client.get_sec_key(storage_key)
-        return self._client.get_pub_key(storage_key)
+            response = self._secretmanager.access_secret_version(
+                request={"name": self._secret_version_path(storage_key, "latest")}
+            )
+            return bytes(response.payload.data)
+
+        blob = self._storage.bucket(self._bucket(bucket_name)).blob(storage_key)
+        return blob.download_as_bytes()
 
     def put_secret_string(self, secret_id: str, secret_string: str):
         try:
-            self._client.put_sec_key(secret_id, secret_string.encode("utf-8"))
+            self._create_secret(secret_id)
+            self._secretmanager.add_secret_version(
+                request={
+                    "parent": self._secret_path(secret_id),
+                    "payload": {"data": secret_string.encode("utf-8")},
+                }
+            )
         except Exception as e:
             self._raise_storage_error(f"store secret '{secret_id}'", e)
 
@@ -133,35 +182,38 @@ class GCPClient:
         try:
             return self._read_remote_blob(secret_id, is_secret=True).decode("utf-8")
         except Exception as e:
-            if allow_missing:
+            if allow_missing and isinstance(e, self._exc_not_found):
                 return None
             self._raise_storage_error(f"load secret '{secret_id}'", e)
 
     def _secret_exists(self, secret_id: str) -> bool:
-        return self.get_secret_string(secret_id, allow_missing=True) is not None
+        try:
+            self._secretmanager.get_secret(request={"name": self._secret_path(secret_id)})
+            return True
+        except Exception as e:
+            if isinstance(e, self._exc_not_found):
+                return False
+            self._raise_storage_error(f"check secret '{secret_id}'", e)
 
     def _blob_exists(self, storage_key: str, *, bucket_name: str = None) -> bool:
-        _ = bucket_name
-        try:
-            self._read_remote_blob(storage_key, is_secret=False)
-            return True
-        except Exception:
-            return False
+        bucket = self._storage.bucket(self._bucket(bucket_name))
+        return bucket.blob(storage_key).exists()
 
     def _delete_secret(self, secret_id: str, *, allow_missing: bool = True):
         try:
-            self._client.delete_sec_key(secret_id)
+            self._secretmanager.delete_secret(request={"name": self._secret_path(secret_id)})
         except Exception as e:
-            if allow_missing:
+            if allow_missing and isinstance(e, self._exc_not_found):
                 return
             self._raise_storage_error(f"delete secret '{secret_id}'", e)
 
     def _delete_blob(self, storage_key: str, *, bucket_name: str = None, allow_missing: bool = True):
-        _ = bucket_name
         try:
-            self._client.delete_pub_key(storage_key)
+            bucket = self._storage.bucket(self._bucket(bucket_name))
+            blob = bucket.blob(storage_key)
+            blob.delete()
         except Exception as e:
-            if allow_missing:
+            if allow_missing and isinstance(e, self._exc_not_found):
                 return
             self._raise_storage_error(f"delete object '{storage_key}'", e)
 
@@ -418,14 +470,22 @@ class GCPClient:
         self.put_secret_string(meta_name, metadata_payload)
 
     def store_enc_key(self, enc_blob, key_id: str, *, bucket_name: str = None, secret_prefix: str = None):
-        _ = bucket_name
         payload = self._to_json_string(enc_blob).encode("utf-8")
-        self._client.put_pub_key(self._storage_key(key_id, "enc_blob", secret_prefix=secret_prefix), payload)
+        key = self._storage_key(key_id, "enc_blob", secret_prefix=secret_prefix)
+        try:
+            bucket = self._storage.bucket(self._bucket(bucket_name))
+            bucket.blob(key).upload_from_string(payload, content_type="application/json")
+        except Exception as e:
+            self._raise_storage_error(f"store enc key object '{key}'", e)
 
     def store_eval_key(self, eval_blob, key_id: str, *, bucket_name: str = None, secret_prefix: str = None):
-        _ = bucket_name
         payload = self._to_json_string(eval_blob).encode("utf-8")
-        self._client.put_pub_key(self._storage_key(key_id, "eval_blob", secret_prefix=secret_prefix), payload)
+        key = self._storage_key(key_id, "eval_blob", secret_prefix=secret_prefix)
+        try:
+            bucket = self._storage.bucket(self._bucket(bucket_name))
+            bucket.blob(key).upload_from_string(payload, content_type="application/json")
+        except Exception as e:
+            self._raise_storage_error(f"store eval key object '{key}'", e)
 
     def load_sec_key(self, key_id: str, *, secret_prefix: str = None):
         sec_name = self._secret_id(key_id, "sec_blob", secret_prefix=secret_prefix)
@@ -447,21 +507,16 @@ class GCPClient:
             unwrapped = self._codec.unwrap_eval_key_bytes(metadata_payload.encode("utf-8"))
             return json.loads(unwrapped.decode("utf-8"))
         except Exception:
-            # Backward compatibility: preserve previously stored JSON if unwrap fails.
             return parsed_payload
 
     def load_enc_key(self, key_id: str, *, bucket_name: str = None, secret_prefix: str = None):
-        _ = bucket_name
-        payload = self._read_remote_blob(
-            self._storage_key(key_id, "enc_blob", secret_prefix=secret_prefix), is_secret=False
-        )
+        key = self._storage_key(key_id, "enc_blob", secret_prefix=secret_prefix)
+        payload = self._read_remote_blob(key, is_secret=False, bucket_name=bucket_name)
         return json.loads(payload.decode("utf-8"))
 
     def load_eval_key(self, key_id: str, *, bucket_name: str = None, secret_prefix: str = None):
-        _ = bucket_name
-        payload = self._read_remote_blob(
-            self._storage_key(key_id, "eval_blob", secret_prefix=secret_prefix), is_secret=False
-        )
+        key = self._storage_key(key_id, "eval_blob", secret_prefix=secret_prefix)
+        payload = self._read_remote_blob(key, is_secret=False, bucket_name=bucket_name)
         return json.loads(payload.decode("utf-8"))
 
     def delete_sec_key(self, key_id: str, *, secret_prefix: str = None):

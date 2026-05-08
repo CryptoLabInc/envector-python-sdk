@@ -4,8 +4,6 @@ set -e
 # Parse input arguments first
 TYPE="install"  # Default to install
 MACOSX_TARGET="11.0"  # Default macOS deployment target
-PREFER_AWS_SDK=false
-PREFER_GCP_SDK=false
 JOBS=""
 
 is_positive_integer() {
@@ -21,14 +19,6 @@ while [[ $# -gt 0 ]]; do
     --macosx-target)
       MACOSX_TARGET="$2"
       shift 2
-      ;;
-    --aws)
-      PREFER_AWS_SDK=true
-      shift 1
-      ;;
-    --gcp)
-      PREFER_GCP_SDK=true
-      shift 1
       ;;
     -j|--jobs)
       if [[ $# -lt 2 ]]; then
@@ -79,15 +69,7 @@ if [[ -n "$base_cmake_args" ]]; then
   cmake_args="$base_cmake_args $cmake_args"
 fi
 
-AWS_SDK_CMAKE_VALUE=OFF
-GCP_SDK_CMAKE_VALUE=OFF
-if [[ "$PREFER_AWS_SDK" == "true" ]]; then
-  AWS_SDK_CMAKE_VALUE=ON
-fi
-if [[ "$PREFER_GCP_SDK" == "true" ]]; then
-  GCP_SDK_CMAKE_VALUE=ON
-fi
-cmake_args+=" -DEVI_KM_PREFER_AWS_SDK=$AWS_SDK_CMAKE_VALUE -DEVI_KM_PREFER_GCP_SDK=$GCP_SDK_CMAKE_VALUE"
+cmake_args+=" -DEVI_KM_PREFER_AWS_SDK=OFF -DEVI_KM_PREFER_GCP_SDK=OFF"
 
 # Pin CMake to the active Python so it does not pick up a stale toolcache binary
 PYTHON_EXE="$(command -v python3 || command -v python)"
