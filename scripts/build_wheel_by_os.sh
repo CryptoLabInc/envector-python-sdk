@@ -18,19 +18,19 @@ Examples:
   # Python 3.12 + manylinux_2_28 only
   CIBW_BUILD='cp312-*' \
   CIBW_MANYLINUX_POLICIES='manylinux_2_28' \
-  WHEEL_VERSION=1.4.0a5 \
+  WHEEL_VERSION=1.4.3 \
   ./scripts/build_wheel_by_os.sh
 
   # Python 3.10 + manylinux2014 only
   CIBW_BUILD='cp310-*' \
   CIBW_MANYLINUX_POLICIES='manylinux2014' \
-  WHEEL_VERSION=1.4.0a5 \
+  WHEEL_VERSION=1.4.3 \
   ./scripts/build_wheel_by_os.sh
 
   # Python 3.11 + both Linux policies
   CIBW_BUILD='cp311-*' \
   CIBW_MANYLINUX_POLICIES='manylinux_2_28 manylinux2014' \
-  WHEEL_VERSION=1.4.0a5 \
+  WHEEL_VERSION=1.4.3 \
   ./scripts/build_wheel_by_os.sh
 EOF
 }
