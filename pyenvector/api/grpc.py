@@ -9,21 +9,25 @@
 #  For licensing inquiries or permission requests, please contact: pypi@cryptolab.co.kr
 # ========================================================================================
 
-import json
 import logging as _stdlib_logging
 import os
 import secrets
-import threading
 import time
-from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
-from urllib import error as urllib_error
-from urllib import parse as urllib_parse
-from urllib import request as urllib_request
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import evi
 import grpc
 import numpy as np
 
+from pyenvector.api.auth_session import (
+    AccessTokenInput,
+    AccessTokenProvider,
+    _AuthSession,
+    build_auth_metadata,
+    is_auth_return_code,
+    is_auth_rpc_error,
+    resolve_access_token,
+)
 from pyenvector.api.connection import Connection
 from pyenvector.crypto import CipherBlock
 from pyenvector.errors import (
@@ -66,143 +70,6 @@ _INDEX_OPERATION_STATE_RANK = {
     envector_op_pb2.SEARCHABLE: 6,
     envector_op_pb2.FAILED: 99,
 }
-
-AccessTokenProvider = Callable[[], Optional[str]]
-AccessTokenInput = Optional[Union[str, AccessTokenProvider]]
-
-
-class _AuthSession:
-    def __init__(
-        self,
-        access_token: AccessTokenInput = None,
-        refresh_token: Optional[str] = None,
-        oidc_issuer: Optional[str] = None,
-        token_endpoint: Optional[str] = None,
-        client_id: Optional[str] = None,
-        client_secret: Optional[str] = None,
-        scope: Optional[str] = None,
-    ):
-        if callable(access_token) and refresh_token:
-            raise EnvectorValidationError(
-                message=(
-                    "access_token callable cannot be combined with refresh_token; "
-                    "either let the callable manage refresh, or omit it and use the "
-                    "SDK's OIDC refresh flow"
-                ),
-            )
-        if refresh_token and not (client_id and (token_endpoint or oidc_issuer)):
-            raise EnvectorValidationError(
-                message=(
-                    "refresh_token requires client_id and either token_endpoint or "
-                    "oidc_issuer to perform OIDC refresh"
-                ),
-            )
-        self._access_token_input = access_token
-        self._current_access_token = None if callable(access_token) else access_token
-        self._refresh_token = refresh_token
-        self._oidc_issuer = oidc_issuer.rstrip("/") if oidc_issuer else None
-        self._token_endpoint = token_endpoint
-        self._client_id = client_id
-        self._client_secret = client_secret
-        self._scope = scope
-        self._lock = threading.Lock()
-
-    def uses_auth(self) -> bool:
-        return bool(self._access_token_input or self._refresh_token)
-
-    def can_refresh(self) -> bool:
-        return bool(self._refresh_token and (self._token_endpoint or self._oidc_issuer) and self._client_id)
-
-    def get_access_token(self) -> Optional[str]:
-        token_input = self._access_token_input if callable(self._access_token_input) else self._current_access_token
-        token = Indexer._resolve_access_token(token_input)
-        if token and not callable(self._access_token_input):
-            self._current_access_token = token
-        return token
-
-    def refresh_access_token(self) -> Optional[str]:
-        if not self.can_refresh():
-            return None
-        # Resolve the token endpoint outside the lock so a slow OIDC discovery
-        # I/O on cold start does not block other threads waiting to refresh.
-        # Discovery is idempotent and the resolved endpoint is cached on the
-        # instance, so concurrent first-time resolves race benignly.
-        token_endpoint = self._resolve_token_endpoint()
-        # Snapshot before acquiring the lock. If another thread refreshes while we
-        # wait, skip the network round-trip — critical for IdPs that enforce
-        # single-use refresh tokens or reuse detection.
-        pre_refresh_access_token = self._current_access_token
-        with self._lock:
-            if self._current_access_token != pre_refresh_access_token:
-                return self._current_access_token
-            form = {
-                "grant_type": "refresh_token",
-                "refresh_token": self._refresh_token,
-                "client_id": self._client_id,
-            }
-            if self._client_secret:
-                form["client_secret"] = self._client_secret
-            if self._scope:
-                form["scope"] = self._scope
-
-            body = urllib_parse.urlencode(form).encode("utf-8")
-            request = urllib_request.Request(
-                token_endpoint,
-                data=body,
-                headers={"content-type": "application/x-www-form-urlencoded"},
-                method="POST",
-            )
-            try:
-                with urllib_request.urlopen(request, timeout=10) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-            except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, ValueError) as e:
-                raise EnvectorTransportError(
-                    message=f"Failed to refresh access token: {e}",
-                    retryable=True,
-                    action="Check OIDC token endpoint, refresh token, and client credentials",
-                ) from e
-
-            refreshed_access_token = payload.get("access_token") or payload.get("id_token")
-            if not isinstance(refreshed_access_token, str) or not refreshed_access_token.strip():
-                raise EnvectorTransportError(
-                    message="Failed to refresh access token: token endpoint response missing access_token",
-                    action="Check OIDC client scope and token response fields",
-                )
-
-            refreshed_refresh_token = payload.get("refresh_token")
-            self._current_access_token = refreshed_access_token.strip()
-            self._access_token_input = self._current_access_token
-            if isinstance(refreshed_refresh_token, str) and refreshed_refresh_token.strip():
-                self._refresh_token = refreshed_refresh_token.strip()
-            return self._current_access_token
-
-    def _resolve_token_endpoint(self) -> str:
-        if self._token_endpoint:
-            return self._token_endpoint
-        if not self._oidc_issuer:
-            raise EnvectorValidationError(
-                message="token_endpoint or oidc_issuer must be provided when refresh_token is configured",
-            )
-        discovery_url = f"{self._oidc_issuer}/.well-known/openid-configuration"
-        try:
-            with urllib_request.urlopen(discovery_url, timeout=10) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, ValueError) as e:
-            raise EnvectorTransportError(
-                message=f"Failed to discover OIDC token endpoint: {e}",
-                retryable=True,
-                action="Check OIDC issuer URL and discovery endpoint availability",
-            ) from e
-
-        token_endpoint = payload.get("token_endpoint")
-        if not isinstance(token_endpoint, str) or not token_endpoint.strip():
-            raise EnvectorTransportError(
-                message="Failed to discover OIDC token endpoint: discovery response missing token_endpoint",
-                action="Check OIDC issuer discovery document",
-            )
-        self._token_endpoint = token_endpoint.strip()
-        return self._token_endpoint
-
 
 def _validate_index_operation_target_state(target_state: int) -> str:
     if target_state not in _INDEX_OPERATION_STATE_RANK:
@@ -336,6 +203,20 @@ class Indexer:
             }
         return cls._GRPC_STATUS_MAP
 
+    @staticmethod
+    def _return_code_name(return_code) -> str:
+        """Best-effort human-readable name for a ReturnCode enum value.
+
+        Protobuf enum fields are plain `int`, so `str(rc)` would render as a
+        number (e.g. "3"). Use ReturnCode.Name() to surface "NoSuchIndex"
+        instead, falling back to the raw value if the int isn't a known enum
+        member (e.g. a future server emits a code this SDK doesn't know yet).
+        """
+        try:
+            return envector_type_pb.ReturnCode.Name(return_code)
+        except (ValueError, TypeError):
+            return str(return_code)
+
     def _to_application_error(self, header, operation):
         """Convert ResponseHeader with error return_code to typed exception."""
         exc_map = self._get_return_code_map()
@@ -354,10 +235,21 @@ class Indexer:
         )
 
         _error_logger.error(
-            "Application error from server",
+            "Application error from server: operation=%s return_code=%s "
+            "error_message=%r request_id=%s retryable=%s exception_class=%s",
+            operation,
+            self._return_code_name(header.return_code),
+            header.error_message or "",
+            header.id if header.id else None,
+            retryable,
+            exc_class.__name__,
             extra={
                 "operation": operation,
-                "return_code": str(header.return_code),
+                # Keep `return_code` aligned with the message body (enum name)
+                # so structured handlers and the rendered message agree.
+                # `return_code_value` preserves the raw int for machine filters.
+                "return_code": self._return_code_name(header.return_code),
+                "return_code_value": int(header.return_code),
                 "error_message": header.error_message,
                 "request_id": header.id if header.id else None,
                 "trace_id": header.id if header.id else None,
@@ -378,12 +270,20 @@ class Indexer:
         return_code, retryable, action = status_map.get(code, (rc.Fail, False, "Contact support with request ID"))
 
         _error_logger.error(
-            "gRPC transport error",
+            "gRPC transport error: operation=%s grpc_code=%s grpc_details=%r "
+            "return_code=%s request_id=%s",
+            operation,
+            code.name,
+            str(error.details()) if hasattr(error, "details") else None,
+            self._return_code_name(return_code),
+            request_id,
             extra={
                 "operation": operation,
                 "grpc_code": code.name,
                 "grpc_details": str(error.details()) if hasattr(error, "details") else None,
-                "return_code": str(return_code),
+                # Aligned with message body (enum name); raw int preserved separately.
+                "return_code": self._return_code_name(return_code),
+                "return_code_value": int(return_code),
                 "request_id": request_id,
                 "trace_id": request_id,
                 "target_address": getattr(getattr(self, "connection", None), "server_address", None),
@@ -409,42 +309,12 @@ class Indexer:
         except Exception:
             return "unknown"
 
-    @staticmethod
-    def _resolve_access_token(access_token: AccessTokenInput) -> Optional[str]:
-        if access_token is None:
-            return None
-        if callable(access_token):
-            try:
-                access_token = access_token()
-            except Exception as e:
-                raise EnvectorValidationError(message=f"access_token provider failed: {e}") from e
-        if access_token is None:
-            return None
-        if not isinstance(access_token, str):
-            raise EnvectorValidationError(
-                message="access_token must be a str, None, or a callable returning str or None",
-            )
-        token = access_token.strip()
-        return token or None
-
-    @classmethod
-    def _build_auth_metadata(cls, access_token: AccessTokenInput) -> Optional[List[Tuple[str, str]]]:
-        token = cls._resolve_access_token(access_token)
-        if not token:
-            return None
-        return [("authorization", f"Bearer {token}")]
-
-    @classmethod
-    def _is_auth_return_code(cls, return_code: Optional[int]) -> bool:
-        auth_code = getattr(envector_type_pb.ReturnCode, "AuthenticationError", None)
-        return auth_code is not None and return_code == auth_code
-
-    @staticmethod
-    def _is_auth_rpc_error(error: grpc.RpcError) -> bool:
-        try:
-            return error.code() in (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED)
-        except Exception:
-            return False
+    # Thin wrappers over shared auth helpers; kept so subclasses/tests that
+    # reach for these names on Indexer continue to work.
+    _resolve_access_token = staticmethod(resolve_access_token)
+    _build_auth_metadata = staticmethod(build_auth_metadata)
+    _is_auth_return_code = staticmethod(is_auth_return_code)
+    _is_auth_rpc_error = staticmethod(is_auth_rpc_error)
 
     def _refresh_access_token(self) -> bool:
         if self._auth_session is None or not self._auth_session.can_refresh():
@@ -455,6 +325,30 @@ class Indexer:
             getattr(self.connection, "server_address", "<unknown>"),
         )
         return bool(refreshed_token)
+
+    @staticmethod
+    def _is_nonfatal_return_code(return_code: Optional[int]) -> bool:
+        return return_code in (
+            envector_type_pb.ReturnCode.Success,
+            getattr(envector_type_pb.ReturnCode, "Warning", None),
+        )
+
+    def _normalize_nonfatal_unary_response(self, response, operation: str, request_id: Optional[str] = None):
+        if not hasattr(response, "header") or response.header is None:
+            return response
+
+        return_code = getattr(response.header, "return_code", None)
+        warning_code = getattr(envector_type_pb.ReturnCode, "Warning", None)
+        if self._is_nonfatal_return_code(return_code) and return_code == warning_code:
+            logger.warning(
+                "Server returned non-fatal warning during {}: {} (request_id={})",
+                operation,
+                getattr(response.header, "error_message", "") or warning_code,
+                request_id or getattr(response.header, "id", None) or "-",
+            )
+            response.header.return_code = envector_type_pb.ReturnCode.Success
+
+        return response
 
     def _call_unary_with_refresh(self, rpc, request, operation: str, request_id: Optional[str] = None):
         allow_refresh = self._auth_session is not None and self._auth_session.can_refresh()
@@ -489,7 +383,7 @@ class Indexer:
             ):
                 attempt += 1
                 continue
-            return response
+            return self._normalize_nonfatal_unary_response(response, operation, request_id=request_id)
 
     def _call_unary_with_call_and_refresh(self, rpc, request, operation: str, request_id: Optional[str] = None):
         allow_refresh = self._auth_session is not None and self._auth_session.can_refresh()
@@ -520,7 +414,48 @@ class Indexer:
             ):
                 attempt += 1
                 continue
-            return response, call
+            return self._normalize_nonfatal_unary_response(response, operation, request_id=request_id), call
+
+    def _call_client_stream_with_refresh(self, rpc, request_factory, operation: str, request_id: Optional[str] = None):
+        """Invoke a client-streaming RPC with a single auth-refresh retry.
+
+        Unlike the unary helpers, the request payload is a consumable iterator that
+        cannot be replayed once streamed to the server. ``request_factory`` must
+        therefore be a zero-argument callable returning a *fresh* request iterator
+        on each call, so the retry after a token refresh streams from the start.
+
+        Returns the raw response; the caller is responsible for inspecting
+        ``response.header.return_code`` and raising an application error as needed.
+        """
+        allow_refresh = self._auth_session is not None and self._auth_session.can_refresh()
+        attempt = 0
+        while True:
+            try:
+                response = rpc(
+                    request_factory(),
+                    metadata=self.grpc_metadata,
+                )
+            except grpc.RpcError as e:
+                if attempt == 0 and allow_refresh and self._is_auth_rpc_error(e):
+                    try:
+                        refreshed = self._refresh_access_token()
+                    except EnvectorTransportError as refresh_err:
+                        raise refresh_err from e
+                    if refreshed:
+                        attempt += 1
+                        continue
+                raise self._normalize_transport_error(e, operation, request_id=request_id) from e
+
+            if (
+                attempt == 0
+                and allow_refresh
+                and hasattr(response, "header")
+                and self._is_auth_return_code(getattr(response.header, "return_code", None))
+                and self._refresh_access_token()
+            ):
+                attempt += 1
+                continue
+            return response
 
     def _is_safe_memory_mode(self):
         """
@@ -890,7 +825,7 @@ class Indexer:
     ###################################
 
     def register_key(
-        self, key_id: str, key: bytes, key_type: str = "EvalKey", preset: str = "IP2", eval_mode: str = "MM32"
+        self, key_id: str, key: bytes, key_type: str = "EvalKey", preset: str = "IP3", eval_mode: str = "MM32"
     ):
         """
         Registers a public key from the specified file path to enVector server.
@@ -902,7 +837,7 @@ class Indexer:
         key_path : str
             The file path to the key to be registered.
         preset : str
-            The preset to use for the key. Default is "IP2".
+            The preset to use for the key. Default is "IP3".
         eval_mode : str
             The evaluation mode to use for the key. Default is "MM32".
 
@@ -952,6 +887,8 @@ class Indexer:
             )
         except grpc.RpcError as e:
             raise self._normalize_transport_error(e, "register key", request_id=header_id) from e
+
+        response = self._normalize_nonfatal_unary_response(response, "register key", request_id=header_id)
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
             raise self._to_application_error(response.header, "register key")
@@ -1206,6 +1143,7 @@ class Indexer:
                 message=f"Invalid index_encryption: {index_encryption}. Expected 'plain' or 'cipher'.",
             )
 
+        centroids = None
         if isinstance(index_params["index_type"], str):
             if index_params["index_type"].upper() == "FLAT":
                 index_type = envector_type_pb.IndexType.FLAT
@@ -1241,10 +1179,6 @@ class Indexer:
                     raise EnvectorValidationError(
                         message=f"Centroids size ({len(centroids)}) does not match nlist ({index_params['nlist']})",
                     )
-                for centroid in centroids:
-                    dt = envector_type_pb.DataType()
-                    dt.plain_vector.data.extend(centroid)
-                    request.index_info.index_detail.ivf_detail.centroids.append(dt)
 
                 request.index_info.index_detail.ivf_detail.nlist = index_params["nlist"]
                 request.index_info.index_detail.ivf_detail.default_nprobe = index_params["default_nprobe"]
@@ -1260,8 +1194,23 @@ class Indexer:
         if description is not None:
             request.index_info.description = description
 
+        # Chunk centroids across stream messages so the backend unmarshal buffer + decoded proto
+        # do not coexist at full nlist*dim size. Server appends centroids from subsequent messages.
+        centroids_per_chunk = max(1, CHUNK_SIZE_1MB // (dim * 4 + 16)) if centroids is not None else 0
+
         def request_generator():
-            yield request
+            if centroids is None or len(centroids) == 0:
+                yield request
+                return
+            msg = request
+            for offset in range(0, len(centroids), centroids_per_chunk):
+                if offset > 0:
+                    msg = envector_msg_pb2.CreateIndexRequest()
+                for centroid in centroids[offset : offset + centroids_per_chunk]:
+                    dt = envector_type_pb.DataType()
+                    dt.plain_vector.data.extend(centroid)
+                    msg.index_info.index_detail.ivf_detail.centroids.append(dt)
+                yield msg
 
         try:
             response = self.stub.create_index(
@@ -1449,6 +1398,9 @@ class Indexer:
             "remaining_insertable_shards": summary.remaining_insertable_shards,
             "remaining_insertable_vectors_guaranteed": summary.remaining_insertable_vectors_guaranteed,
             "remaining_insertable_vectors_best_effort": summary.remaining_insertable_vectors_best_effort,
+            # IVF clustering params (0 for non-IVF / older servers); getattr guards stub skew.
+            "nlist": getattr(summary, "nlist", 0),
+            "default_nprobe": getattr(summary, "default_nprobe", 0),
         }
 
     _SUPPORTED_OPERATION_TYPES = frozenset({
@@ -1461,6 +1413,7 @@ class Indexer:
         index_name: str,
         request_id: str,
         operation_type: Union[str, int] = "INSERT",
+        partition_name: Optional[str] = None,
     ) -> envector_op_pb2.GetIndexOperationStatusResponse:
         """
         Retrieve completion status for a specific index operation.
@@ -1523,6 +1476,8 @@ class Indexer:
         request.index_name = index_name
         request.request_id = request_id
         request.operation_type = operation_type
+        if partition_name:
+            request.partition_name = partition_name
 
         response = self._call_unary_with_refresh(
             self.stub.get_index_operation_status,
@@ -1621,6 +1576,7 @@ class Indexer:
         timeout_s: float = 60.0,
         poll_interval_s: float = 1.0,
         operation_type: Union[str, int] = "INSERT",
+        partition_name: Optional[str] = None,
     ) -> envector_op_pb2.GetIndexOperationStatusResponse:
         """Wait until a request reaches the target lifecycle state.
 
@@ -1648,6 +1604,7 @@ class Indexer:
                 index_name=index_name,
                 request_id=request_id,
                 operation_type=operation_type,
+                partition_name=partition_name,
             )
             state = getattr(last, "state", envector_op_pb2.INDEX_OPERATION_STATE_UNSPECIFIED)
             if state == envector_op_pb2.FAILED:
@@ -1690,6 +1647,7 @@ class Indexer:
         timeout_s: float = 60.0,
         poll_interval_s: float = 1.0,
         operation_type: Union[str, int] = "INSERT",
+        partition_name: Optional[str] = None,
     ) -> List[envector_op_pb2.GetIndexOperationStatusResponse]:
         """Wait until multiple requests reach the same target lifecycle state.
 
@@ -1747,6 +1705,7 @@ class Indexer:
                     timeout_s=deadline - now,
                     poll_interval_s=poll_interval_s,
                     operation_type=operation_type,
+                    partition_name=partition_name,
                 )
             )
 
@@ -1791,7 +1750,7 @@ class Indexer:
         return self.wait_for_index_operations_state(
             index_name=index_name,
             request_ids=request_ids,
-            target_state=envector_op_pb2.SEARCHABLE,
+            target_state=envector_op_pb2.MERGED_SAVED,
             timeout_s=timeout_s,
             poll_interval_s=poll_interval_s,
         )
@@ -1927,6 +1886,57 @@ class Indexer:
         }
 
     ###################################
+    # Partition Management
+    ###################################
+
+    def create_partition(self, index_name: str, partition_name: str):
+        """Create a named partition in an index."""
+        request = envector_msg_pb2.CreatePartitionRequest()
+        request.header.type = envector_type_pb.MessageType.CreatePartition
+        request.header.id = secrets.token_hex(10)
+        request.index_name = index_name
+        request.partition_name = partition_name
+
+        response = self._call_unary_with_refresh(
+            self.stub.create_partition, request, "create partition", request_id=request.header.id
+        )
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "create partition")
+        logger.info(f"Partition '{partition_name}' created in index '{index_name}'.")
+
+    def drop_partition(self, index_name: str, partition_name: str):
+        """Drop a named partition from an index."""
+        request = envector_msg_pb2.DropPartitionRequest()
+        request.header.type = envector_type_pb.MessageType.DropPartition
+        request.header.id = secrets.token_hex(10)
+        request.index_name = index_name
+        request.partition_name = partition_name
+
+        response = self._call_unary_with_refresh(
+            self.stub.drop_partition, request, "drop partition", request_id=request.header.id
+        )
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "drop partition")
+        logger.info(f"Partition '{partition_name}' dropped from index '{index_name}'.")
+
+    def list_partitions(self, index_name: str):
+        """List partitions of an index as dicts {name, status, num_vectors}."""
+        request = envector_msg_pb2.ListPartitionsRequest()
+        request.header.type = envector_type_pb.MessageType.ListPartitions
+        request.header.id = secrets.token_hex(10)
+        request.index_name = index_name
+
+        response = self._call_unary_with_refresh(
+            self.stub.list_partitions, request, "list partitions", request_id=request.header.id
+        )
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "list partitions")
+        return [
+            {"name": p.partition_name, "status": p.status, "num_vectors": p.num_vectors}
+            for p in response.partitions
+        ]
+
+    ###################################
     # Data Management
     ###################################
 
@@ -1979,12 +1989,16 @@ class Indexer:
         # Use a unique header ID as an async split batch API identifier.
         header_id = secrets.token_hex(10)
         normalized_centroid_idx = _normalize_cluster_id_sequence(centroid_idx, "centroid_idx")
-        cluster_ids_sent = False
 
         def insert_data_request_generator():
-            nonlocal cluster_ids_sent
+            # Local to each generator instance so an auth-refresh retry (which
+            # re-invokes this factory) re-sends the cluster ids on the new stream.
+            cluster_ids_sent = False
             for vec_idx, vec in enumerate(enc_vec):
-                data = evi.Query.serializeTo(vec)
+                # Batch insert stores rows server-side, where only the first
+                # `dim` b-part coefficients are consulted; truncate the zero-pad
+                # tail to cut upload size (server zero-fills on decode).
+                data = evi.Query.serializeToTruncated(vec)
                 chunk_size = CHUNK_SIZE_257MB
                 for offset in range(0, len(data), chunk_size):
                     request = envector_msg_pb2.BatchInsertDataRequest()
@@ -2013,13 +2027,12 @@ class Indexer:
 
                     yield request
 
-        try:
-            response = self.stub.persist_batch(
-                insert_data_request_generator(),
-                metadata=self.grpc_metadata,
-            )
-        except grpc.RpcError as e:
-            raise self._normalize_transport_error(e, "async split batch data", request_id=header_id) from e
+        response = self._call_client_stream_with_refresh(
+            self.stub.persist_batch,
+            insert_data_request_generator,
+            "async split batch data",
+            request_id=header_id,
+        )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
             raise self._to_application_error(response.header, "async split batch data")
@@ -2039,6 +2052,7 @@ class Indexer:
         metadata: Optional[List[List[str]]] = None,
         centroid_idx: Optional[List[int]] = None,
         out_request_id: Optional[List[str]] = None,
+        partition_name: Optional[str] = None,
     ) -> List[Any]:
         """
         Bulk insert encrypted vectors and stop at split completion.
@@ -2049,11 +2063,16 @@ class Indexer:
         self._check_insertable(index_name)
         header_id = secrets.token_hex(10)
         normalized_centroid_idx = _normalize_cluster_id_sequence(centroid_idx, "centroid_idx")
-        cluster_ids_sent = False
+
         def insert_data_request_generator():
-            nonlocal cluster_ids_sent
+            # Local to each generator instance so an auth-refresh retry (which
+            # re-invokes this factory) re-sends the cluster ids on the new stream.
+            cluster_ids_sent = False
             for vec_idx, vec in enumerate(enc_vec):
-                data = evi.Query.serializeTo(vec)
+                # Batch insert stores rows server-side, where only the first
+                # `dim` b-part coefficients are consulted; truncate the zero-pad
+                # tail to cut upload size (server zero-fills on decode).
+                data = evi.Query.serializeToTruncated(vec)
                 chunk_size = CHUNK_SIZE_257MB
                 for offset in range(0, len(data), chunk_size):
                     request = envector_msg_pb2.BatchInsertDataRequest()
@@ -2061,6 +2080,8 @@ class Indexer:
                     request.header.id = header_id
 
                     request.index_name = index_name
+                    if partition_name:
+                        request.partition_name = partition_name
                     if normalized_centroid_idx is not None and not cluster_ids_sent:
                         request.cluster_ids.extend(normalized_centroid_idx)
                         cluster_ids_sent = True
@@ -2081,13 +2102,12 @@ class Indexer:
 
                     yield request
 
-        try:
-            response = self.stub.persist_batch(
-                insert_data_request_generator(),
-                metadata=self.grpc_metadata,
-            )
-        except grpc.RpcError as e:
-            raise self._normalize_transport_error(e, "async split batch data", request_id=header_id) from e
+        response = self._call_client_stream_with_refresh(
+            self.stub.persist_batch,
+            insert_data_request_generator,
+            "async split batch data",
+            request_id=header_id,
+        )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
             raise self._to_application_error(response.header, "async split batch data")
@@ -2106,6 +2126,7 @@ class Indexer:
         metadata_list: List[str],
         cluster_ids: Optional[List[int]] = None,
         out_request_id: Optional[List[str]] = None,
+        partition_name: Optional[str] = None,
     ) -> List[Any]:
         """
         Submit multiple row-encrypted vectors to async split processing in one streaming RPC call.
@@ -2145,6 +2166,8 @@ class Indexer:
                     request.header.type = envector_type_pb.MessageType.PersistRows
                     request.header.id = header_id
                     request.index_name = index_name
+                    if partition_name:
+                        request.partition_name = partition_name
 
                     if cluster_ids is not None:
                         request.cluster_id = cluster_ids[vec_idx]
@@ -2160,13 +2183,12 @@ class Indexer:
 
                     yield request
 
-        try:
-            response = self.stub.persist_rows(
-                insert_data_request_generator(),
-                metadata=self.grpc_metadata,
-            )
-        except grpc.RpcError as e:
-            raise self._normalize_transport_error(e, "async split data", request_id=header_id) from e
+        response = self._call_client_stream_with_refresh(
+            self.stub.persist_rows,
+            insert_data_request_generator,
+            "async split data",
+            request_id=header_id,
+        )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
             raise self._to_application_error(response.header, "async split data")
@@ -2185,6 +2207,7 @@ class Indexer:
         metadata_list: List[str],
         cluster_ids: Optional[List[int]] = None,
         out_request_id: Optional[List[str]] = None,
+        partition_name: Optional[str] = None,
     ) -> List[Any]:
         """
         Insert multiple row-encrypted vectors and stop at split completion.
@@ -2209,6 +2232,8 @@ class Indexer:
                     request.header.type = envector_type_pb.MessageType.PersistRows
                     request.header.id = header_id
                     request.index_name = index_name
+                    if partition_name:
+                        request.partition_name = partition_name
 
                     if cluster_ids is not None:
                         request.cluster_id = cluster_ids[vec_idx]
@@ -2224,13 +2249,12 @@ class Indexer:
 
                     yield request
 
-        try:
-            response = self.stub.persist_rows(
-                insert_data_request_generator(),
-                metadata=self.grpc_metadata,
-            )
-        except grpc.RpcError as e:
-            raise self._normalize_transport_error(e, "async split data", request_id=header_id) from e
+        response = self._call_client_stream_with_refresh(
+            self.stub.persist_rows,
+            insert_data_request_generator,
+            "async split data",
+            request_id=header_id,
+        )
 
         if response.header.return_code != envector_type_pb.ReturnCode.Success:
             raise self._to_application_error(response.header, "async split data")
@@ -2245,12 +2269,17 @@ class Indexer:
     def async_merge_by_request_ids(
         self,
         index_name: str,
-        request_ids: Sequence[str],
+        request_ids: Optional[Sequence[str]] = None,
+        partition_name: Optional[str] = None,
     ) -> str:
-        """Submit an async merge request for previously split insert request IDs."""
-        if not request_ids:
-            raise EnvectorValidationError(message="request_ids must be non-empty")
-        request_ids_list = list(request_ids)
+        """Submit an async merge request for previously split insert request IDs.
+
+        When ``request_ids`` is empty or ``None``, the server auto-expands to all
+        eligible split-only operations on this index; if every eligible op is
+        already in an active manual-merge group, the call returns success as a
+        no-op.
+        """
+        request_ids_list = list(request_ids) if request_ids is not None else []
         for request_id in request_ids_list:
             self._validate_request_id(request_id)
         if len(set(request_ids_list)) != len(request_ids_list):
@@ -2261,6 +2290,8 @@ class Indexer:
         request.header.id = secrets.token_hex(10)
         request.index_name = index_name
         request.request_ids.extend(request_ids_list)
+        if partition_name:
+            request.partition_name = partition_name
 
         response = self._call_unary_with_refresh(
             self.stub.merge_by_request_ids,
@@ -2300,6 +2331,7 @@ class Indexer:
         self,
         index_name: str,
         item_ids: List[int],
+        partition_name: Optional[str] = None,
     ) -> str:
         """
         Submit a DeleteData request to remove items from an index.
@@ -2353,6 +2385,8 @@ class Indexer:
         request.index_name = index_name
         # item_ids: values returned by InsertData response (auto-increment PK, must be > 0)
         request.item_ids.extend(item_ids)
+        if partition_name:
+            request.partition_name = partition_name
 
         response = self._call_unary_with_refresh(
             self.stub.delete_data,
@@ -2368,12 +2402,94 @@ class Indexer:
         logger.info(f"DeleteData submitted for index '{index_name}' with {len(item_ids)} item(s). request_id='{request_id}'")
         return request_id
 
+    def update_metadata(
+        self, index_name: str, item_ids: List[int], data_strings: List[str], partition_name: Optional[str] = None
+    ) -> dict:
+        """
+        Submit an UpdateMetadata request to replace the metadata of existing items.
+
+        Items are identified by ``item_id`` (values returned by InsertData). Each
+        ``data_strings[i]`` is the full, already-encoded metadata string for
+        ``item_ids[i]`` — :meth:`Index.update_metadata` encodes (and, when
+        metadata_encryption is enabled, encrypts) each full value before calling
+        this; the server replaces the stored string wholesale (last-writer-wins).
+
+        Parameters
+        ----------
+        index_name : str
+            The index whose item metadata is updated.
+        item_ids : List[int]
+            Positive, unique item IDs to update.
+        data_strings : List[str]
+            Full replacement metadata strings, one per ``item_ids`` entry (same order).
+
+        Returns
+        -------
+        dict
+            ``{"updated_count": int, "not_found_item_ids": List[int]}``. Missing or
+            soft-deleted items are reported in ``not_found_item_ids``; the request
+            still succeeds (lenient semantics).
+
+        Raises
+        ------
+        EnvectorValidationError
+            If ``index_name`` is empty, ``item_ids`` is empty/non-positive/duplicated,
+            or ``data_strings`` length does not match ``item_ids``.
+        EnvectorApplicationError
+            If the server returns a failure status.
+        EnvectorTransportError
+            If the gRPC call fails.
+        """
+        if not index_name:
+            raise EnvectorValidationError(message="index_name must be non-empty")
+        if not item_ids:
+            raise EnvectorValidationError(message="item_ids must be non-empty")
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in item_ids):
+            raise EnvectorValidationError(message="item_ids must contain only int values")
+        if not all(i > 0 for i in item_ids):
+            raise EnvectorValidationError(message="item_ids must contain only positive integers (> 0)")
+        if len(set(item_ids)) != len(item_ids):
+            raise EnvectorValidationError(message="item_ids must not contain duplicates")
+        if len(data_strings) != len(item_ids):
+            raise EnvectorValidationError(message="data_strings length must match item_ids length")
+
+        request = envector_msg_pb2.UpdateMetadataRequest()
+        request.header.type = envector_type_pb.MessageType.UpdateMetadata
+        request.header.id = secrets.token_hex(10)
+        request.index_name = index_name
+        if partition_name:
+            request.partition_name = partition_name
+        for item_id, data in zip(item_ids, data_strings):
+            u = request.updates.add()
+            u.item_id = item_id
+            u.data = data
+
+        response = self._call_unary_with_refresh(
+            self.stub.update_metadata,
+            request,
+            "update metadata",
+            request_id=request.header.id,
+        )
+
+        if response.header.return_code != envector_type_pb.ReturnCode.Success:
+            raise self._to_application_error(response.header, "update metadata")
+
+        logger.info(
+            f"UpdateMetadata for index '{index_name}': updated={response.updated_count}, "
+            f"not_found={len(response.not_found_item_ids)}"
+        )
+        return {
+            "updated_count": int(response.updated_count),
+            "not_found_item_ids": list(response.not_found_item_ids),
+        }
+
     def wait_for_delete_completion(
         self,
         index_name: str,
         request_id: str,
         timeout_s: float = 600.0,
         poll_interval_s: float = 1.0,
+        partition_name: Optional[str] = None,
     ) -> envector_op_pb2.GetIndexOperationStatusResponse:
         """
         Wait until a DELETE operation completes (shard rebuild becomes searchable).
@@ -2409,6 +2525,7 @@ class Indexer:
             timeout_s=timeout_s,
             poll_interval_s=poll_interval_s,
             operation_type="DELETE",
+            partition_name=partition_name,
         )
 
     ###################################
@@ -2419,9 +2536,10 @@ class Indexer:
         self,
         index_name: str,
         query: List[List[float]],
-        topk: List[List[int]] = [],
+        topk: Sequence[Sequence[int]] = (),
         nprobe: int = None,
         level: Optional[int] = None,
+        partition_names: Optional[List[str]] = None,
     ):
         """
         Performs encrypted similarity search on the specified index from enVector server.
@@ -2446,6 +2564,8 @@ class Indexer:
         request.index_name = index_name
         if nprobe is not None:
             request.nprobe = nprobe
+        if partition_names:
+            request.partition_names.extend(partition_names)
 
         for i, q in enumerate(query):
             dt = envector_type_pb.DataType()
@@ -2472,6 +2592,7 @@ class Indexer:
 
         shard_idx = {k: [] for k in query_ids}
         results = {k: [] for k in query_ids}
+        partition_by_query = {k: "" for k in query_ids}
         try:
             for response in response_stream:
                 if response.header.return_code != envector_type_pb.ReturnCode.Success:
@@ -2482,6 +2603,8 @@ class Indexer:
                 output = response.ctxt_score[0]
                 results[output.id].append(output.ctxt_score[0])
                 shard_idx[output.id].extend(output.shard_idx)
+                if output.partition_name:
+                    partition_by_query[output.id] = output.partition_name
         except grpc.RpcError as e:
             raise self._normalize_transport_error(e, "search (stream)", request_id=request.header.id) from e
 
@@ -2490,6 +2613,7 @@ class Indexer:
                 id=query_id,
                 ctxt_score=results[query_id],
                 shard_idx=shard_idx[query_id],
+                partition_name=partition_by_query[query_id],
             )
             for query_id in query_ids
         ]
@@ -2500,7 +2624,7 @@ class Indexer:
 
         return outputs
 
-    def encrypted_search(self, index_name: str, enc_query: List[CipherBlock], topk: List[List[int]] = []):
+    def encrypted_search(self, index_name: str, enc_query: List[CipherBlock], topk: Sequence[Sequence[int]] = (), partition_names: Optional[List[str]] = None):
         """
         Performs encrypted similarity search on the specified index from enVector server.
         enVector server performs secure homomorphic encryption operations with the registered evaluation key.
@@ -2522,6 +2646,8 @@ class Indexer:
         request.header.type = envector_type_pb.MessageType.InnerProduct
         request.header.id = secrets.token_hex(10)  # unique header ID
         request.index_name = index_name
+        if partition_names:
+            request.partition_names.extend(partition_names)
 
         for i, vec in enumerate(enc_query):
             dt = envector_type_pb.DataType()
@@ -2545,6 +2671,7 @@ class Indexer:
 
         shard_idx = {k: [] for k in query_ids}
         results = {k: [] for k in query_ids}
+        partition_by_query = {k: "" for k in query_ids}
         try:
             for response in response_stream:
                 if response.header.return_code != envector_type_pb.ReturnCode.Success:
@@ -2555,6 +2682,8 @@ class Indexer:
                 output = response.ctxt_score[0]
                 results[output.id].append(output.ctxt_score[0])
                 shard_idx[output.id].extend(output.shard_idx)
+                if output.partition_name:
+                    partition_by_query[output.id] = output.partition_name
         except grpc.RpcError as e:
             raise self._normalize_transport_error(e, "encrypted search (stream)", request_id=request.header.id) from e
 
@@ -2563,6 +2692,7 @@ class Indexer:
                 id=query_id,
                 ctxt_score=results[query_id],
                 shard_idx=shard_idx[query_id],
+                partition_name=partition_by_query[query_id],
             )
             for query_id in query_ids
         ]
@@ -2577,7 +2707,7 @@ class Indexer:
     # Query APIs
     ###################################
 
-    def get_metadata(self, index_name: str, idx: Union[List, Tuple], fields: list[str] = []):
+    def get_metadata(self, index_name: str, idx: Union[List, Tuple], fields: Sequence[str] = (), partition_name: Optional[str] = None):
         """
         Retrieves metadata for specified indices and output fields in an index from enVector server.
 
@@ -2622,6 +2752,9 @@ class Indexer:
         if fields:
             for field in fields:
                 request.output_fields.append(field)
+
+        if partition_name:
+            request.partition_name = partition_name
 
         response = self._call_unary_with_refresh(
             self.stub.get_metadata,

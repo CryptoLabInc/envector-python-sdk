@@ -21,10 +21,10 @@ def get_random_vector(dim):
     return vec
 
 
-def main():
+def main(args):
     # Key Path
     key_path = "./keys"
-    key_id = "test-key"
+    key_id = args.key_id
     key_dir = f"{key_path}/{key_id}"
 
     # Skip key generation if keys already exist
@@ -32,12 +32,12 @@ def main():
         print(f"Keys already exist in {key_dir}. Skipping key generation.")
     else:
         # Generate keys
-        keygen = KeyGenerator(key_dir)
+        keygen = KeyGenerator(key_dir, eval_mode=args.eval_mode, preset=args.preset)
         keygen.generate_keys()
 
     # Connect to endpoint of enVector
     ENVECTOR_ADDRESS = f"{args.host}:{args.port}"
-    ev.init(address=ENVECTOR_ADDRESS, key_path=key_path, auto_key_setup=False)
+    ev.init(address=ENVECTOR_ADDRESS, key_path=key_path, eval_mode=args.eval_mode, preset=args.preset, auto_key_setup=False)
     if ev.is_connected():
         print("Connected to Indexer.")
     else:
@@ -45,17 +45,23 @@ def main():
         return
 
     # # Register eval key to enVector
+    if key_id in ev.get_key_list():
+        print("Skipping: Key is alread registered.")
+        return
     print("Registering evaluation key...")
     ev.register_key(key_id)
     print("Evaluation key registered successfully.")
-    print("Delete Key...")
-    ev.delete_key(key_id)
-    print("Key Deleted.")
+    print("Unload Key...")
+    ev.unload_key(key_id)
+    print("Key Unloaded.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="enVector API Example")
     parser.add_argument("--host", type=str, default="localhost", help="Host for enVector connection")
     parser.add_argument("--port", type=int, default=50050, help="Port for enVector connection")
+    parser.add_argument("--key-id", type=str, default="test-key-mm32-ip3", help="Key ID")
+    parser.add_argument("--eval-mode", type=str, choices=["mm", "mms", "mm32", "mms32"], default="mm32", help="Evaluation mode")
+    parser.add_argument("--preset", type=str, default="ip3", help="Parameter preset")
     args = parser.parse_args()
-    main()
+    main(args)

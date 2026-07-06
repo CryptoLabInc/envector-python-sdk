@@ -14,6 +14,7 @@ from typing import Optional
 import evi
 
 from pyenvector.crypto.parameter import ContextParameter
+from pyenvector.utils.utils import validate_preset_evalmode
 
 ###################################
 # Context Class
@@ -28,7 +29,8 @@ class Context:
     Parameters
     ----------
     preset : str
-        The parameter preset to use for the context. Currently, only "ip1" is supported.
+        The parameter preset to use for the context. Supported: "ip1"/"ip2"
+        (mm/mms), "ip3" (mm32/mms32).
     dim : int
         The dimension of the context, which should be a power of 2 (e.g., 32, 64, ..., 4096).
     eval_mode : str, optional
@@ -40,6 +42,8 @@ class Context:
     """
 
     def __init__(self, preset: str, dim: int, eval_mode: Optional[str] = None):
+        if eval_mode is not None:
+            validate_preset_evalmode(preset, eval_mode)
         self._parameter: ContextParameter = ContextParameter(preset, dim, eval_mode)
         self._context = evi.Context(
             self.parameter.preset, self.parameter.device_type, self.parameter.dim, self.parameter.eval_mode

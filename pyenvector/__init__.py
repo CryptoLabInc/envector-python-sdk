@@ -9,6 +9,8 @@
 #  For licensing inquiries or permission requests, please contact: pypi@cryptolab.co.kr
 # ========================================================================================
 
+from importlib import import_module
+
 # Prevent core dumps that could leak secret key material.
 def _disable_core_dumps():
     try:
@@ -43,11 +45,46 @@ from pyenvector.errors import (
     ResourceLimitError,
 )
 from pyenvector.index import Index
+from pyenvector.index.index import SealedBlob
 
 try:
     from pyenvector.kms import KMSClient
 except ImportError:
     KMSClient = None
-from pyenvector.utils import AWSClient, GCPClient, VaultClient
+from pyenvector.utils import VaultClient
 
-__version__ = "1.4.3"
+__all__ = [
+    "api",
+    "crypto",
+    "utils",
+    "Cipher",
+    "SealedBlob",
+    "KeyGenerator",
+    "Index",
+    "VaultClient",
+    "KMSClient",
+    "AWSClient",
+    "GCPClient",
+    "AuthError",
+    "DependencyError",
+    "EnvectorApplicationError",
+    "EnvectorError",
+    "EnvectorTimeoutError",
+    "EnvectorTransportError",
+    "EnvectorValidationError",
+    "InternalError",
+    "InvalidInputError",
+    "KeyManagementError",
+    "NotReadyError",
+    "ResourceLimitError",
+]
+
+
+def __getattr__(name: str):
+    if name == "AWSClient":
+        return getattr(import_module("pyenvector.utils"), name)
+    if name == "GCPClient":
+        return getattr(import_module("pyenvector.utils"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+__version__ = "1.5.0"

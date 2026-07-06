@@ -22,25 +22,32 @@ Classes:
 
 import base64
 import json
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, Iterable, List, Optional, Union
 
 import numpy as np
+from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from pyenvector.api import Indexer
 from pyenvector.crypto.block import CipherBlock
 from pyenvector.crypto.cipher import Cipher
 from pyenvector.crypto.parameter import ContextParameter, IndexParameter, KeyParameter, SealInfo
-from pyenvector.errors import EnvectorApplicationError
+from pyenvector.errors import EnvectorApplicationError, EnvectorValidationError
 from pyenvector.proto_gen.v2.common import index_operation_message_pb2 as envector_op_pb2
 from pyenvector.proto_gen.v2.common import type_pb2 as common_type_pb2
-from pyenvector.utils.aes import decrypt_metadata, encrypt_metadata
+from pyenvector.utils.aes import decrypt_metadata, encrypt_metadata, resolve_metadata_key
 from pyenvector.utils.logging_config import logger
 from pyenvector.utils.utils import topk
 
 ENCRYPTION_BATCH_SIZE = 4096
-KNN_BATCH_SIZE = 4096
+KNN_BATCH_SIZE_MAX = 4096
+# Caps the (batch, nlist) float32 score matrix in _knn; prevents OOM at large nlist (e.g., face-recognition ~60k).
+KNN_DIST_MATRIX_BUDGET_BYTES = 32 * 1024 * 1024
 MAX_REQUEST_ID_LENGTH = 30
 _IVF_INDEX_TYPES: frozenset = frozenset({"IVF_FLAT", "IVF_VCT"})
 AccessTokenInput = Optional[Union[str, Callable[[], Optional[str]]]]
@@ -52,6 +59,39 @@ class _NormalizedInsertData:
 
     kind: str  # "plain" or "cipher"
     data: Union[List[Any], np.ndarray]
+
+
+@dataclass
+class SealedBlob:
+    """AES pre-encrypted payload sealed to the server — opaque storage only.
+
+    Wraps the output of AES encryption (e.g. ``KMSClient.encrypt_metadata`` or
+    ``encrypt_metadata``) and signals ``Index.insert()`` to skip re-encryption.
+    The server stores the ciphertext as-is; only the client can decrypt it.
+    Contrast with ``CipherBlock`` / ``CipherText`` where the server can perform
+    homomorphic computation on the ciphertext.
+
+    Accepted forms:
+
+    - ``KMSClient.encrypt_metadata`` → raw ``bytes``; the SDK Base64-wraps it
+      to match the stored wire format.
+    - ``encrypt_metadata`` → already a Base64 ``str``; stored as-is.
+
+    Has no effect when ``metadata_encryption`` is disabled on the index.
+
+    Examples
+    --------
+    >>> raw_cts = kms_client.encrypt_metadata(key_id, plaintext_metas)
+    >>> index.insert(data, [SealedBlob(ct) for ct in raw_cts])
+    """
+
+    ciphertext: Union[str, bytes, bytearray]
+
+    def __post_init__(self):
+        if not isinstance(self.ciphertext, (str, bytes, bytearray)):
+            raise TypeError(
+                f"SealedBlob expects str/bytes/bytearray, got {type(self.ciphertext).__name__}"
+            )
 
 
 class IndexConfig:
@@ -445,7 +485,9 @@ class IndexConfig:
         Args:
             index_type (str): Type of the index.
         """
-        index_params = {"index_type": index_type}
+        # Carry existing params forward so a type swap doesn't drop IVF settings (nlist/nprobe).
+        index_params = dict(self.index_params)
+        index_params["index_type"] = index_type
         self.index_param = IndexParameter(
             index_encryption=self.index_encryption,
             query_encryption=self.query_encryption,
@@ -749,7 +791,16 @@ class IndexConfig:
         Returns:
             IndexConfig: A deep copy of the index configuration.
         """
-        new_config = IndexConfig(
+        copied_use_key_stream = self.key_param.use_key_stream if use_key_stream is None else use_key_stream
+
+        def copy_key_stream(explicit_value, key_attr: str):
+            if explicit_value is not None:
+                return explicit_value
+            if not copied_use_key_stream:
+                return None
+            return getattr(self.key_param, key_attr, None)
+
+        return IndexConfig(
             index_name=self._index_name if index_name is None else index_name,
             dim=self.context_param.dim if dim is None else dim,
             key_path=self.key_param.key_path if key_path is None else key_path,
@@ -765,11 +816,11 @@ class IndexConfig:
                 self.key_param.metadata_encryption if metadata_encryption is None else metadata_encryption
             ),
             description=self.description if description is None else description,
-            use_key_stream=self.key_param.use_key_stream if use_key_stream is None else use_key_stream,
-            enc_key=self.key_param.enc_key if enc_key is None else enc_key,
-            eval_key=self.key_param.eval_key if eval_key is None else eval_key,
-            sec_key=self.key_param.sec_key if sec_key is None else sec_key,
-            metadata_key=self.key_param.metadata_key if metadata_key is None else metadata_key,
+            use_key_stream=copied_use_key_stream,
+            enc_key=copy_key_stream(enc_key, "enc_key"),
+            eval_key=copy_key_stream(eval_key, "eval_key"),
+            sec_key=copy_key_stream(sec_key, "sec_key"),
+            metadata_key=copy_key_stream(metadata_key, "metadata_key"),
             seal_kek=seal_kek if seal_kek is not None else None,
             key_store=self.key_param.key_store if key_store is None else key_store,
             region_name=self.key_param.region_name if region_name is None else region_name,
@@ -778,18 +829,54 @@ class IndexConfig:
             vault_addr=self.key_param.vault_addr if vault_addr is None else vault_addr,
             vault_mount=self.key_param.vault_mount if vault_mount is None else vault_mount,
         )
-        return new_config
 
     def __repr__(self):
-        return (
-            "IndexConfig(\n"
-            f"  index_name={self.index_name!r},\n"
-            f"  dim={self.dim!r},\n"
-            f"  key_path={self.key_path!r},\n"
-            f"  key_id={self.key_id!r},\n"
-            f"  index_type={self.index_type!r},\n"
-            ")"
-        )
+        # Fields worth surfacing for a human reading the config. Each value is
+        # resolved lazily so a property that raises does not break ``repr``.
+        candidates = [
+            ("index_name", lambda: self.index_name),
+            ("dim", lambda: self.dim),
+            ("preset", lambda: self.preset),
+            ("eval_mode", lambda: self.eval_mode),
+            ("index_type", lambda: self.index_type),
+        ]
+
+        # IVF-family indexes carry clustering params worth showing together.
+        try:
+            is_ivf = "IVF" in (self.index_type or "")
+        except Exception:
+            is_ivf = False
+        if is_ivf:
+            candidates += [
+                ("nlist", lambda: self.nlist),
+                ("default_nprobe", lambda: self.default_nprobe),
+            ]
+
+        candidates += [
+            ("metadata_encryption", lambda: self.metadata_encryption),
+            ("key_id", lambda: self.key_id),
+            ("key_path", lambda: self.key_path),
+            ("seal_mode", lambda: self.seal_mode),
+            ("description", lambda: self.description),
+        ]
+
+        fields = []
+        for name, getter in candidates:
+            try:
+                value = getter()
+            except Exception:
+                value = None
+            # Skip unset/irrelevant fields to keep the output focused.
+            if value is None:
+                continue
+            fields.append((name, value))
+
+        if not fields:
+            return "IndexConfig()"
+
+        width = max(len(name) for name, _ in fields)
+        body = "\n".join(f"    {name:<{width}} = {value!r}" for name, value in fields)
+        return f"IndexConfig(\n{body}\n)"
 
 
 class Index:
@@ -842,13 +929,14 @@ class Index:
 
     def __init__(self, index_name: str, index_config: Optional[IndexConfig] = None):
         """
-        Initializes the Index class.
-        Check server connection and check if the index exists.
+        Open an existing index by name.
 
         Args:
             index_name (str): Name of the index.
-            index_config (IndexConfig, optional): Configuration object to override defaults
-                (such as key paths and encryption options). Falls back to ``Index._default_index_config``.
+            index_config (IndexConfig, optional): Supplies client-side settings (key paths,
+                encryption keys, seal mode). Server-owned properties (dim, key_id, nlist, ...) are
+                always read from the server; a configured value that differs is ignored with a
+                warning. Falls back to ``Index._default_index_config``.
         """
         if Index._default_indexer is None:
             raise ValueError("Indexer not connected. Please call Index.init_connect() first.")
@@ -865,25 +953,67 @@ class Index:
         index_config.key_id = metadata["key_id"]
         index_config.index_encryption = metadata["index_encryption"]
         index_config.query_encryption = metadata["query_encryption"]
-        index_config.index_type = metadata["index_type"]
         index_config.description = metadata.get("description")
+        # Restore metadata_encryption from the server (authoritative). It's a non-optional proto bool,
+        # so None only when the generated stub predates the field; then keep config (setter coerces None->True).
+        server_metadata_encryption = metadata.get("metadata_encryption")
+        if server_metadata_encryption is not None:
+            index_config.key_param.metadata_encryption = server_metadata_encryption
+        # IVF nlist/default_nprobe are server-owned: take them from the summary when present, warn on
+        # mismatch. If the summary omits them (older servers), the setter falls back to configured/default.
+        index_params = {"index_type": metadata["index_type"]}
+        for name in ("nlist", "default_nprobe"):
+            server_val = metadata.get(name)
+            configured = index_config.index_params.get(name)
+            if server_val:
+                index_params[name] = server_val
+            if configured and server_val and configured != server_val:
+                logger.warning(
+                    "Configured %s (%s) for index '%s' differs from server (%s); using server value.",
+                    name,
+                    configured,
+                    index_name,
+                    server_val,
+                )
+        index_config.index_param.index_params = index_params
+        # preset/eval_mode aren't in the summary; restore from the key (authoritative), best-effort, atomically.
+        try:
+            key_info = indexer.get_key_info(metadata["key_id"])
+        except Exception:
+            key_info = None
+            logger.debug(
+                "get_key_info failed for key_id=%s; keeping configured preset/eval_mode",
+                metadata["key_id"],
+            )
+        if key_info:
+            key_preset = key_info.get("preset")
+            key_eval_mode = key_info.get("eval_mode")
+            if isinstance(key_preset, str) and key_preset and isinstance(key_eval_mode, str) and key_eval_mode:
+                ctx = index_config.context_param
+                level = ctx.level if ctx.level_is_explicit else None
+                index_config.context_param = ContextParameter(
+                    preset=key_preset,
+                    dim=index_config.dim,
+                    eval_mode=key_eval_mode,
+                    level=level,
+                )
         self.index_config = index_config
-        self._ivf_runtime_metadata_loaded = index_config.index_type not in ("IVF_FLAT", "IVF_VCT")
         self._ivf_centroids_loaded = False
         self.num_entities = metadata["row_count"]
+        # Guards num_entities accumulation when sends run on the parallel pool.
+        self._num_entities_lock = threading.Lock()
         self.kms_client = Index._default_kms_client
         self.cipher = Cipher._create_from_index_config(self.index_config) if self.index_config.need_cipher else None
         self._is_loaded = metadata["is_loaded"]
 
-    def _ensure_ivf_runtime_metadata_loaded(self, require_centroids: bool = False) -> None:
-        """Populate IVF runtime metadata lazily when an operation actually needs it."""
+    def _ensure_ivf_centroids_loaded(self, require_centroids: bool = False) -> None:
+        """Load IVF centroids lazily on first use (nlist/default_nprobe come from the summary)."""
         index_type = self.index_config.index_type
         if index_type not in ("IVF_FLAT", "IVF_VCT"):
             return
-
-        needs_runtime = not self._ivf_runtime_metadata_loaded
-        needs_centroids = require_centroids and index_type == "IVF_FLAT" and not self._ivf_centroids_loaded
-        if not needs_runtime and not needs_centroids:
+        # Centroids are needed for IVF_FLAT, and for any IVF type when require_centroids is set
+        # (e.g. _knn during an IVF_VCT insert).
+        if self._ivf_centroids_loaded or not (index_type == "IVF_FLAT" or require_centroids):
             return
 
         metadata = self.indexer.get_index_info(self.index_config.index_name)
@@ -892,21 +1022,15 @@ class Index:
             raise ValueError(
                 f"IVF metadata for index '{self.index_config.index_name}' is unavailable from get_index_info()."
             )
-
-        self.index_config.index_param.nlist = ivf_detail.nlist
-        self.index_config.index_param.default_nprobe = ivf_detail.default_nprobe
-        self._ivf_runtime_metadata_loaded = True
-
-        if index_type == "IVF_FLAT" or require_centroids:
-            if not getattr(ivf_detail, "centroids", None):
-                raise ValueError(
-                    f"Centroids for IVF_FLAT index '{self.index_config.index_name}' are missing from index detail."
-                )
-            self.index_config.index_param.centroids = np.array(
-                [np.array(centroid.plain_vector.data) for centroid in ivf_detail.centroids],
-                dtype=np.float32,
+        if not getattr(ivf_detail, "centroids", None):
+            raise ValueError(
+                f"Centroids for {index_type} index '{self.index_config.index_name}' are missing from index detail."
             )
-            self._ivf_centroids_loaded = True
+        self.index_config.index_param.centroids = np.array(
+            [np.array(centroid.plain_vector.data) for centroid in ivf_detail.centroids],
+            dtype=np.float32,
+        )
+        self._ivf_centroids_loaded = True
 
     @classmethod
     def init_connect(
@@ -1027,7 +1151,7 @@ class Index:
             raise ValueError(f"Key ID '{index_config.key_id}' not found in Server. Please register key first.")
         if index_config.eval_mode == "MM" and index_config.query_encryption == "cipher":
             raise ValueError("Query encryption is not supported in MM mode.")
-        active_indexer.create_index(
+        create_kwargs = dict(
             index_name=index_config.index_name,
             key_id=index_config.key_id,
             dim=index_config.dim,
@@ -1038,6 +1162,7 @@ class Index:
             index_params=index_config.index_params,
             description=index_config.description,
         )
+        active_indexer.create_index(**create_kwargs)
         return cls(index_config.index_name, index_config)
 
     def indexing(
@@ -1049,16 +1174,46 @@ class Index:
             request_ids,
         )
 
+    def create_partition(self, partition_name: str):
+        """Create a named partition in this index.
+
+        A partition is an isolated subset of the index; pass its name to
+        ``insert(partition_name=...)`` to route data into it, and to
+        ``search(partition_names=[...])`` to scope a query to it. The reserved
+        ``_default`` partition is created automatically with the index.
+
+        Parameters
+        ----------
+        partition_name : str
+            Name of the partition to create. Must not be ``_default`` and must
+            not already exist.
+        """
+        return self.indexer.create_partition(self.index_config.index_name, partition_name)
+
+    def drop_partition(self, partition_name: str):
+        """Drop a named partition from this index (its data is removed).
+
+        ``_default`` cannot be dropped. Mirrors the module-level
+        ``drop_partition`` / ``client`` API at the index-instance level.
+        """
+        return self.indexer.drop_partition(self.index_config.index_name, partition_name)
+
+    def list_partitions(self):
+        """List this index's partitions as dicts ``{name, status, num_vectors}``."""
+        return self.indexer.list_partitions(self.index_config.index_name)
+
     def insert(
         self,
         data: Union[CipherBlock, List[List[float]], List[np.ndarray], np.ndarray, List[CipherBlock]],
-        metadata: List[Any] = None,
+        metadata: Union[List[Any], List["SealedBlob"], None] = None,
         request_ids: Optional[List[str]] = None,
         await_completion: bool = False,
         execute_until: str = "segmentation",
         load: bool = True,
         use_row_insert: bool = False,
         encryptor=None,
+        n_workers: int = 1,
+        partition_name: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -1075,8 +1230,17 @@ class Index:
         data : CipherBlock, list of floats, list of np.ndarray, 2D np.ndarray, or list of CipherBlock
             Data to be inserted. It can be plaintext (list of lists, list of numpy arrays, or 2D numpy array) or
             ciphertext (``CipherBlock`` or list of ``CipherBlock``).
-        metadata : str
-            Metadata for the data.
+        metadata : list of Any or list of SealedBlob, optional
+            Metadata for the data. To insert pre-encrypted metadata without double encryption,
+            wrap each ciphertext in :class:`SealedBlob`::
+
+                raw_cts = kms_client.encrypt_metadata(key_id, plaintext_metas)
+                index.insert(data, [SealedBlob(ct) for ct in raw_cts])
+
+            ``SealedBlob`` accepts the direct output of ``KMSClient.encrypt_metadata``
+            (raw ``bytes``, Base64-wrapped by the SDK) or ``encrypt_metadata`` (Base64 ``str``,
+            stored as-is). The list must be all ``SealedBlob`` or all plain — mixing
+            raises ``TypeError``. Has no effect when ``metadata_encryption`` is disabled.
         request_ids : Optional[List[str]], optional
             Out list for server-generated request identifiers (from response ``header.id``).
 
@@ -1084,15 +1248,14 @@ class Index:
               poll completion for this insert.
             - If provided, the list is cleared and filled with the server-generated request IDs
               (one per underlying async split request). These are the split request IDs; use
-              them with :meth:`get_index_operation_status`, :meth:`wait_for_inserts_searchable`,
-              or :meth:`async_merge_by_request_ids`.
+              them with :meth:`get_index_operation_status` or :meth:`async_merge_by_request_ids`.
         await_completion : bool, optional
             If ``True``, block until the selected server-side stage is reached. ``"flush"``
             waits for ``SPLIT_COMPLETED``; ``"segmentation"`` waits for ``MERGED_SAVED``.
             When ``load=True`` is also set, the SDK then calls :meth:`load` after that stage
             wait completes. The SDK does not perform an additional searchable wait
-            automatically; use :meth:`wait_for_inserts_searchable` when callers need a
-            ``done=true`` searchable guarantee.
+            automatically; callers needing a ``MERGED_SAVED`` guarantee should pass
+            ``await_completion=True``.
         execute_until : str, optional
             Server-side completion stage for this insert. Supported values are:
 
@@ -1101,9 +1264,9 @@ class Index:
         load : bool, optional
             If ``True``, call :meth:`load` after submission, or after the selected stage wait
             when ``await_completion=True``. This triggers backend publication work but does not
-            add an SDK-side searchable wait on its own. When invoked before merge completion,
-            backend ``LoadIndex`` may expose raw fallback shards while request-scoped merge
-            work is still unfinished.
+            add an SDK-side searchable wait on its own. When invoked before merge completion
+            (``execute_until="flush"``), backend ``LoadIndex`` may expose raw fallback shards
+            while request-scoped merge work is still unfinished.
         use_row_insert : bool, optional
             If ``True``, small plaintext chunks (fewer vectors than ``dim``) use the
             row-insert path instead of bulk insertion. Default: ``False``.
@@ -1114,6 +1277,12 @@ class Index:
             with an independent PRNG state. Accepts either an ``Encryptor``
             instance or a ``Cipher`` instance (its internal encryptor is used).
             If ``None`` (default), ``self.cipher`` is used.
+        n_workers : int, optional
+            Worker threads used for BOTH chunk encoding and chunk sending
+            (results are still consumed in chunk order). Values >1 overlap the
+            gRPC round-trips of multiple chunks. Default 1 overlaps one encode
+            with one send; each stage holds at most ``n_workers+1`` chunks in
+            memory.
 
         Returns
         -------
@@ -1132,19 +1301,21 @@ class Index:
         >>> index.insert(data=data, metadata=metadata, encryptor=cipher)
         """
         normalized_data = self._normalize_insert_data(data)
+        metadata = self._normalize_metadata(metadata)
 
-        if normalized_data.kind == "cipher":
-            available_shards = self.remaining_insertable_shards
-            if len(normalized_data.data) > available_shards:
-                raise ValueError(f"index is not insertable for {len(normalized_data.data)} ciphertexts, {available_shards} available")
+        if self.indexer._is_safe_memory_mode():
+            if normalized_data.kind == "cipher":
+                available_shards = self.remaining_insertable_shards
+                if len(normalized_data.data) > available_shards:
+                    raise ValueError(f"index is not insertable for {len(normalized_data.data)} ciphertexts, {available_shards} available")
+                else:
+                    logger.info(f"Index is insertable for {len(normalized_data.data)} ciphertexts, {available_shards} available")
             else:
-                logger.info(f"Index is insertable for {len(normalized_data.data)} ciphertexts, {available_shards} available")
-        else:
-            available_vectors = self.remaining_insertable_vectors
-            if len(normalized_data.data) > available_vectors:
-                raise ValueError(f"Index is not insertable for {len(normalized_data.data)} vectors, {available_vectors} available")
-            else:
-                logger.info(f"Index is insertable for {len(normalized_data.data)} vectors, {available_vectors} available")
+                available_vectors = self.remaining_insertable_vectors
+                if len(normalized_data.data) > available_vectors:
+                    raise ValueError(f"Index is not insertable for {len(normalized_data.data)} vectors, {available_vectors} available")
+                else:
+                    logger.info(f"Index is insertable for {len(normalized_data.data)} vectors, {available_vectors} available")
 
         # Resolve encryptor: Cipher → extract _encryptor, Encryptor → use directly
         resolved_encryptor = None
@@ -1180,12 +1351,15 @@ class Index:
             use_row_insert=use_row_insert,
             out_request_ids=out_request_ids,
             encryptor=resolved_encryptor,
+            n_workers=n_workers,
+            partition_name=partition_name,
         )
 
         if execute_until in ("segmentation") and out_request_ids:
             self.indexer.async_merge_by_request_ids(
                 self.index_config.index_name,
                 out_request_ids,
+                partition_name=partition_name,
             )
 
         if await_completion:
@@ -1193,11 +1367,12 @@ class Index:
             poll_interval_s = kwargs.get("poll_interval_s", 1.0)
             logger.debug(f"Async data insertion submitted. Waiting until '{execute_until}'.")
             if out_request_ids:
-                self._wait_for_insert_stage(
+                self.wait_for_insert_stage(
                     request_ids=out_request_ids,
                     target_stage=execute_until,
                     timeout_s=timeout_s,
                     poll_interval_s=poll_interval_s,
+                    partition_name=partition_name,
                 )
             else:
                 logger.warning("await_completion requested but no request_ids were captured; skipping wait.")
@@ -1214,6 +1389,7 @@ class Index:
         await_completion: bool = True,
         timeout_s: float = 600.0,
         poll_interval_s: float = 1.0,
+        partition_name: Optional[str] = None,
     ) -> str:
         """
         Deletes items from the index by item ID.
@@ -1272,6 +1448,7 @@ class Index:
         request_id = self.indexer.delete_data(
             index_name=self.index_config.index_name,
             item_ids=item_ids,
+            partition_name=partition_name,
         )
 
         if await_completion:
@@ -1281,17 +1458,117 @@ class Index:
                 request_id=request_id,
                 timeout_s=timeout_s,
                 poll_interval_s=poll_interval_s,
+                partition_name=partition_name,
             )
             logger.debug("DeleteData completed successfully.")
 
         return request_id
 
-    def _wait_for_insert_stage(
+    def update_metadata(
+        self,
+        item_ids: List[int],
+        metadata: List[Any],
+        partition_name: Optional[str] = None,
+    ) -> dict:
+        """
+        Replaces the metadata of existing items by item ID.
+
+        Each item's stored metadata is overwritten WHOLESALE with the value given in
+        ``metadata[i]`` — there is no read-modify-write merge. To change a single field
+        you must supply the item's full new metadata; any field you omit is dropped. The
+        server stores the value opaquely (whole-string replacement); the vector data and
+        shards are untouched.
+
+        Concurrency is LAST-WRITER-WINS: there is no optimistic locking, so concurrent
+        writers to the same item simply clobber one another — the last write wins.
+
+        Items that are missing or have been (soft-)deleted are skipped and reported,
+        not raised (lenient).
+
+        Parameters
+        ----------
+        item_ids : List[int]
+            Item IDs to update (positive, unique). These are values returned by
+            ``Index.insert()`` and surfaced as ``id`` in search results.
+        metadata : List[Any]
+            The full new metadata for each item_id (same order). Each entry replaces
+            the item's stored metadata wholesale.
+
+        Returns
+        -------
+        dict
+            ``{"updated": List[int], "skipped": List[int]}`` — item IDs successfully
+            updated, and those skipped because they were missing or soft-deleted.
+
+        Raises
+        ------
+        ValueError
+            If the index is not loaded.
+        EnvectorValidationError
+            If inputs are empty/mismatched, item_ids are non-positive/duplicated, or
+            metadata_encryption is enabled but no key is configured.
+
+        Examples
+        --------
+        >>> item_ids = index.insert(data=vectors, metadata=[{"label": "a", "v": 1}])
+        >>> # Wholesale replace: stored metadata becomes exactly {"label": "a", "v": 2}.
+        >>> report = index.update_metadata(item_ids=[item_ids[0]], metadata=[{"label": "a", "v": 2}])
+        >>> report["updated"], report["skipped"]
+        """
+        if not self.is_loaded:
+            raise ValueError("Index not loaded. Please call Index.load() first.")
+        if not item_ids:
+            raise EnvectorValidationError(message="item_ids must be non-empty")
+        if not isinstance(metadata, (list, tuple)):
+            raise EnvectorValidationError(message="metadata must be a list")
+        if len(metadata) != len(item_ids):
+            raise EnvectorValidationError(message="metadata length must match item_ids length")
+        # Wholesale replacement: None would silently clobber the stored value to ""
+        # (and behaves differently per mode), so reject it as ambiguous intent.
+        if any(m is None for m in metadata):
+            raise EnvectorValidationError(message="metadata entries must not be None")
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in item_ids):
+            raise EnvectorValidationError(message="item_ids must contain only int values")
+        if not all(i > 0 for i in item_ids):
+            raise EnvectorValidationError(message="item_ids must contain only positive integers (> 0)")
+        if len(set(item_ids)) != len(item_ids):
+            raise EnvectorValidationError(message="item_ids must not contain duplicates")
+        if self.index_config.metadata_encryption and not (
+            self._is_kms_managed_mode()
+            or self.index_config.metadata_key_path
+            or self.index_config.metadata_key
+        ):
+            raise EnvectorValidationError(
+                message="metadata_encryption is enabled but no metadata key is configured"
+            )
+
+        index_name = self.index_config.index_name
+        write_item_ids = list(item_ids)
+        write_data = [self._encode_metadata_for_wire(m) for m in metadata]
+
+        resp = self.indexer.update_metadata(index_name, write_item_ids, write_data, partition_name=partition_name)
+        server_not_found = set(resp.get("not_found_item_ids", []))
+        updated = [iid for iid in write_item_ids if iid not in server_not_found]
+        skipped = [iid for iid in write_item_ids if iid in server_not_found]
+        return {"updated": updated, "skipped": skipped}
+
+    def all_merged_saved(self, request_ids: List[str]) -> bool:
+        """Return True iff every request_id has reached MERGED_SAVED. Non-blocking."""
+        for rid in request_ids:
+            resp = self.indexer.get_index_operation_status(
+                self.index_config.index_name, rid, operation_type="INSERT"
+            )
+            if resp.state != envector_op_pb2.MERGED_SAVED:
+                return False
+        return True
+
+    def wait_for_insert_stage(
         self,
         request_ids: List[str],
         target_stage: str,
         timeout_s: float,
         poll_interval_s: float,
+        partition_name: Optional[str] = None,
     ) -> None:
         target_state_map = {
             "flush": envector_op_pb2.SPLIT_COMPLETED,
@@ -1305,6 +1582,7 @@ class Index:
             target_state=target_state,
             timeout_s=timeout_s,
             poll_interval_s=poll_interval_s,
+            partition_name=partition_name,
         )
 
     def _normalize_insert_data(
@@ -1315,6 +1593,44 @@ class Index:
         normalized = self._validate_insert_data(data)
         is_cipher_data = isinstance(normalized, list) and normalized and isinstance(normalized[0], CipherBlock)
         return _NormalizedInsertData(kind="cipher" if is_cipher_data else "plain", data=normalized)
+
+    def _normalize_metadata(self, metadata: Optional[List[Any]]) -> Optional[List[Any]]:
+        """Normalize metadata list to the stored wire format before insert.
+
+        Items wrapped in ``SealedBlob`` are already encrypted — they are
+        converted to the Base64 wire string without a second encryption pass.
+        Plain items are encrypted when ``metadata_encryption`` is enabled.
+
+        Raises ``TypeError`` if the list mixes ``SealedBlob`` and plain values,
+        or if ``SealedBlob`` is used while ``metadata_encryption`` is disabled.
+        """
+        if not metadata:
+            return metadata
+
+        has_wrapped = any(isinstance(m, SealedBlob) for m in metadata)
+        has_plain = any(not isinstance(m, SealedBlob) for m in metadata)
+
+        if has_wrapped and has_plain:
+            raise TypeError(
+                "metadata list must be all SealedBlob or all plain values, not mixed"
+            )
+
+        if has_wrapped:
+            if not self.index_config.metadata_encryption:
+                raise ValueError(
+                    "SealedBlob cannot be used when metadata_encryption is disabled"
+                )
+            return [
+                base64.b64encode(bytes(m.ciphertext)).decode("ascii")
+                if isinstance(m.ciphertext, (bytes, bytearray))
+                else m.ciphertext
+                for m in metadata
+            ]
+
+        if self.index_config.metadata_encryption:
+            return self._encrypt_metadata_list(metadata)
+
+        return metadata
 
     def _validate_insert_data(
         self,
@@ -1425,17 +1741,23 @@ class Index:
                 plaintext_metadata = [self._stringify_metadata_value(m) for m in metadata]
                 encrypted_metadata = self.kms_client.encrypt_metadata(self.index_config.key_id, plaintext_metadata)
                 return [base64.b64encode(item).decode("ascii") for item in encrypted_metadata]
+            if not metadata:
+                return metadata
             key_source = self.index_config.metadata_key_path or self.index_config.metadata_key
-            encrypted_metadata = [
-                encrypt_metadata(m, key_source, kek=self.index_config.seal_kek_path) for m in metadata
-            ]
+            # Resolve the metadata key once per call; passing the resolved bytes
+            # (kek omitted) skips the file read + KeyManager unwrap that would
+            # otherwise repeat for every item in the batch.
+            key = resolve_metadata_key(key_source, kek=self.index_config.seal_kek_path)
+            encrypted_metadata = [encrypt_metadata(m, key) for m in metadata]
             return encrypted_metadata
         return metadata
 
-    def _decrypt_metadata(self, metadata: List[Any]):
+    def _decrypt_metadata(self, metadata: List[Any], key: Optional[bytes] = None):
         if metadata and self.index_config.metadata_encryption:
-            key_source = self.index_config.metadata_key_path or self.index_config.metadata_key
-            return decrypt_metadata(metadata, key_source, kek=self.index_config.seal_kek_path)
+            if key is None:
+                key_source = self.index_config.metadata_key_path or self.index_config.metadata_key
+                key = resolve_metadata_key(key_source, kek=self.index_config.seal_kek_path)
+            return decrypt_metadata(metadata, key)
         else:
             return metadata
 
@@ -1467,6 +1789,20 @@ class Index:
             return entry.data
         return getattr(entry, "infos", None)
 
+    def _encode_metadata_for_wire(self, value: Any) -> str:
+        """Serialize one metadata value to the stored wire string per mode
+        (encrypted: EVI/KMS envelope; plaintext: str/bytes pass through, else str()).
+        Unlike insert, plaintext list/tuple are NOT spread and dict uses repr (not JSON)."""
+        if self.index_config.metadata_encryption:
+            return self._encrypt_metadata_list([value])[0]
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="ignore")
+        if isinstance(value, str):
+            return value
+        return str(value)
+
     def _kms_topk(self, result_ctxt: CipherBlock, top_k: int):
         encrypted_scores = [
             common_type_pb2.EVCiphertext(degree=score.degree, data=score.data) for score in result_ctxt.data.ctxt_score
@@ -1480,7 +1816,7 @@ class Index:
         )
 
     def _multiquery_get_topk_metadata_results_via_kms(
-        self, results: List[CipherBlock], top_k: int, output_fields: List[str] = None
+        self, results: List[CipherBlock], top_k: int, output_fields: List[str] = None, partition_name: Optional[str] = None
     ):
         ranked_results_list = []
         topk_indices_list = []
@@ -1498,7 +1834,7 @@ class Index:
                 )
 
         metadata_result = self.indexer.get_metadata(
-            self.index_config.index_name, topk_indices_list, fields=output_fields
+            self.index_config.index_name, topk_indices_list, fields=output_fields, partition_name=partition_name
         )
 
         if len(metadata_result) != len(topk_indices_list):
@@ -1530,6 +1866,13 @@ class Index:
             output_result = []
             for i in range(n):
                 metadata_entry = metadata_result[i + offset]
+                # Backend uses Metadata{Id:0} as a sentinel for slots whose
+                # underlying item was soft-deleted between scoring and metadata
+                # fetch (DeleteData Phase 1). Drop those positions so callers
+                # see only live results — matches the user-visible contract of
+                # "top_k may shrink when some hits were just deleted".
+                if metadata_entry.id == 0:
+                    continue
                 payload = self._metadata_payload(metadata_entry)
                 metadata_value = payload
                 if self.index_config.metadata_encryption:
@@ -1541,7 +1884,21 @@ class Index:
                         "metadata": metadata_value,
                     }
                 )
-            output_result_list.append(output_result)
+            # Drop id==0 sentinels (DeleteData soft-delete + post-cutover stale coords)
+            # and dedup by id since partial-merge can score the same item via raw +
+            # merged shards; keep the best score, preserving rank order.
+            filtered = []
+            seen = {}
+            for entry in output_result:
+                if entry["id"] == 0:
+                    continue
+                prev = seen.get(entry["id"])
+                if prev is None:
+                    seen[entry["id"]] = len(filtered)
+                    filtered.append(entry)
+                elif entry["score"] > filtered[prev]["score"]:
+                    filtered[prev] = entry
+            output_result_list.append(filtered)
             offset += n
 
         ranked_results_list.clear()
@@ -1597,6 +1954,7 @@ class Index:
         data_chunk: CipherBlock,
         metadata: List[any] = None,
         out_request_ids: Optional[List[str]] = None,
+        partition_name: Optional[str] = None,
     ):
         """Inserts a single data chunk (CipherBlock) and its metadata into the indexer."""
         input_metadata = self._prepare_metadata_for_chunk(metadata, data_chunk.num_item_list)
@@ -1611,8 +1969,10 @@ class Index:
             input_metadata,
             centroid_idx,
             out_request_id=out_request_ids,
+            partition_name=partition_name,
         )
-        self.num_entities += data_chunk.num_vectors
+        with self._num_entities_lock:
+            self.num_entities += data_chunk.num_vectors
         return item_ids
 
     def _insert_row(
@@ -1620,6 +1980,7 @@ class Index:
         data_chunk: CipherBlock,
         metadata: List[any] = None,
         out_request_ids: Optional[List[str]] = None,
+        partition_name: Optional[str] = None,
     ):
         """Inserts a single data chunk (CipherBlock) and its metadata into the indexer."""
         enc_vecs = data_chunk.data
@@ -1633,9 +1994,11 @@ class Index:
             metadata_list,
             cluster_ids,
             out_request_id=out_request_ids,
+            partition_name=partition_name,
         )
 
-        self.num_entities += len(enc_vecs)
+        with self._num_entities_lock:
+            self.num_entities += len(enc_vecs)
         return result
 
     def _insert_ivf_bulk(
@@ -1645,6 +2008,8 @@ class Index:
         use_row_insert: bool = False,
         out_request_ids: Optional[List[str]] = None,
         encryptor=None,
+        n_workers: int = 1,
+        partition_name: Optional[str] = None,
     ):
         """
         Bulk inserts data into the index for IVF-FLAT.
@@ -1673,6 +2038,7 @@ class Index:
                     data_chunk,
                     metadata_chunk,
                     out_request_ids=out_request_ids,
+                    partition_name=partition_name,
                 )
                 self._extend_item_ids(item_ids, item_id_chunk)
 
@@ -1688,38 +2054,39 @@ class Index:
         ]
 
         num_items = len(data)
-        for i in range(0, num_items, ENCRYPTION_BATCH_SIZE):
-            batch_num = i // ENCRYPTION_BATCH_SIZE
-            end_idx = min(i + ENCRYPTION_BATCH_SIZE, num_items)
-            raw_data_chunk = list(data[i:end_idx])
-            metadata_chunk = metadata[i:end_idx] if metadata else None
-            centroid_idx_chunk = close_idxs[i:end_idx]
-            try:
-                item_id_chunk = self._encrypt_and_insert(
-                    raw_data_chunk,
-                    metadata_chunk,
-                    centroid_idx=centroid_idx_chunk,
-                    use_row_insert=use_row_insert,
-                    out_request_ids=out_request_ids,
-                    encryptor=encryptor,
-                )
-                self._extend_item_ids(item_ids, item_id_chunk)
-            except Exception as e:
-                raise RuntimeError(f"Batch {batch_num} insert failed: {e}") from e
+
+        def make_jobs():
+            for i in range(0, num_items, ENCRYPTION_BATCH_SIZE):
+                end_idx = min(i + ENCRYPTION_BATCH_SIZE, num_items)
+                yield {
+                    "data": list(data[i:end_idx]),
+                    "metadata": metadata[i:end_idx] if metadata else None,
+                    "centroid_idx": close_idxs[i:end_idx],
+                    "use_row_insert": use_row_insert,
+                    "encryptor": encryptor,
+                    "partition_name": partition_name,
+                }
+
+        self._pipelined_encrypt_insert(
+            make_jobs(),
+            item_ids,
+            n_workers,
+            out_request_ids=out_request_ids,
+            wrap_batch_errors=True,
+        )
 
         logger.debug("IVF Data insertion completed successfully.")
         return item_ids
 
-    def _encrypt_and_insert(
+    def _encode_chunk(
         self,
         data_chunk: Union[List[any], np.ndarray],
-        metadata_chunk: List[any] = None,
         centroid_idx: Optional[List[int]] = None,
         use_row_insert: bool = False,
-        out_request_ids: Optional[List[str]] = None,
         encryptor=None,
     ):
-        """Encrypts and inserts a data chunk into the indexer."""
+        """Encodes one data chunk; returns (encrypted_chunk, is_row).
+        Thread-safe: the encrypt methods use a fresh native encryptor per call."""
         cipher = self.cipher if encryptor is None else None
         enc = encryptor or self.cipher._encryptor
 
@@ -1740,11 +2107,7 @@ class Index:
                     enc_type="single",
                     centroids_idx=centroid_idx,
                 )
-            return self._insert_row(
-                encrypted_chunk,
-                metadata_chunk,
-                out_request_ids=out_request_ids,
-            )
+            return encrypted_chunk, True
         # Encrypt data chunk in bulk
         if cipher is not None:
             encrypted_chunk = cipher.encrypt_multiple(data_chunk, encode_type="item", centroids_idx=centroid_idx)
@@ -1754,11 +2117,127 @@ class Index:
                 enc_type="multiple",
                 centroids_idx=centroid_idx,
             )
+        return encrypted_chunk, False
+
+    def _encrypt_and_insert(
+        self,
+        data_chunk: Union[List[any], np.ndarray],
+        metadata_chunk: List[any] = None,
+        centroid_idx: Optional[List[int]] = None,
+        use_row_insert: bool = False,
+        out_request_ids: Optional[List[str]] = None,
+        encryptor=None,
+    ):
+        """Encrypts and inserts a data chunk into the indexer."""
+        encrypted_chunk, is_row = self._encode_chunk(
+            data_chunk,
+            centroid_idx=centroid_idx,
+            use_row_insert=use_row_insert,
+            encryptor=encryptor,
+        )
+        if is_row:
+            return self._insert_row(
+                encrypted_chunk,
+                metadata_chunk,
+                out_request_ids=out_request_ids,
+            )
         return self._insert_chunk(
             encrypted_chunk,
             metadata_chunk,
             out_request_ids=out_request_ids,
         )
+
+    def _pipelined_encrypt_insert(
+        self,
+        jobs: Iterable[dict],
+        item_ids: List[Any],
+        n_workers: int = 1,
+        out_request_ids: Optional[List[str]] = None,
+        progress_desc: Optional[str] = None,
+        wrap_batch_errors: bool = False,
+        total_jobs: Optional[int] = None,
+    ):
+        """Encodes and sends chunks on two n_workers pools, consuming results in
+        chunk order so item_id/request_id order is preserved. Each stage holds at
+        most n_workers+1 chunks, bounding in-flight memory.
+        """
+        n_workers = max(1, n_workers)
+        encode_pool = ThreadPoolExecutor(max_workers=n_workers)
+        send_pool = ThreadPoolExecutor(max_workers=n_workers)
+        encode_pending = deque()  # (idx, job, encode_future)
+        send_pending = deque()  # (idx, send_future)
+        max_inflight = n_workers + 1
+        progress = tqdm(total=total_jobs, desc=progress_desc) if progress_desc else None
+        job_iter = iter(enumerate(jobs))
+        failed = False
+
+        def fill_encode():
+            while len(encode_pending) < max_inflight:
+                nxt = next(job_iter, None)
+                if nxt is None:
+                    return
+                idx, job = nxt
+                encode_pending.append(
+                    (
+                        idx,
+                        job,
+                        encode_pool.submit(
+                            self._encode_chunk,
+                            job["data"],
+                            centroid_idx=job.get("centroid_idx"),
+                            use_row_insert=job.get("use_row_insert", False),
+                            encryptor=job.get("encryptor"),
+                        ),
+                    )
+                )
+
+        def fail(idx, e):
+            nonlocal failed
+            failed = True
+            if wrap_batch_errors:
+                raise RuntimeError(f"Batch {idx} insert failed: {e}") from e
+            raise e
+
+        # Cap OpenMP per worker only when fanning out; the default
+        # single-worker path keeps today's unrestricted-OpenMP behavior.
+        omp_guard = threadpool_limits(limits=1, user_api="openmp") if n_workers > 1 else nullcontext()
+        try:
+            with omp_guard:
+                fill_encode()
+                while encode_pending or send_pending:
+                    # Hand encoded chunks to the send pool in chunk order,
+                    # without letting in-flight sends exceed the cap.
+                    while encode_pending and len(send_pending) < max_inflight:
+                        idx, job, encode_future = encode_pending.popleft()
+                        try:
+                            encrypted_chunk, is_row = encode_future.result()
+                        except Exception as e:
+                            fail(idx, e)
+                        send = self._insert_row if is_row else self._insert_chunk
+                        # Capture request IDs per chunk and merge them in chunk
+                        # order below, so parallel sends stay ordered.
+                        chunk_reqs = [] if out_request_ids is not None else None
+                        send_pending.append(
+                            (idx, chunk_reqs, send_pool.submit(send, encrypted_chunk, job.get("metadata"), out_request_ids=chunk_reqs, partition_name=job.get("partition_name")))
+                        )
+                        fill_encode()
+                    # Collect one finished send in chunk order.
+                    idx, chunk_reqs, send_future = send_pending.popleft()
+                    try:
+                        chunk_ids = send_future.result()
+                    except Exception as e:
+                        fail(idx, e)
+                    self._extend_item_ids(item_ids, chunk_ids)
+                    if chunk_reqs:
+                        out_request_ids.extend(chunk_reqs)
+                    if progress:
+                        progress.update(1)
+        finally:
+            # On failure, don't block the raise on in-flight encodes/sends.
+            encode_pool.shutdown(wait=not failed, cancel_futures=True)
+            send_pool.shutdown(wait=not failed, cancel_futures=True)
+            if progress:
+                progress.close()
 
     def _insert_flat_bulk(
         self,
@@ -1767,6 +2246,8 @@ class Index:
         use_row_insert: bool = False,
         out_request_ids: Optional[List[str]] = None,
         encryptor=None,
+        n_workers: int = 1,
+        partition_name: Optional[str] = None,
     ):
         """
         Bulk inserts data into the index.
@@ -1784,18 +2265,26 @@ class Index:
 
             num_items = data.shape[0] if isinstance(data, np.ndarray) else len(data)
             logger.debug(f"Bulk encrypting {num_items} entities for index '{self.index_config.index_name}'.")
-            for i in tqdm(range(0, num_items, ENCRYPTION_BATCH_SIZE), desc="Encrypt and Insert"):
-                end_idx = min(i + ENCRYPTION_BATCH_SIZE, num_items)
-                raw_data_chunk = list(data[i:end_idx]) if isinstance(data, np.ndarray) else data[i:end_idx]
-                metadata_chunk = metadata[i:end_idx] if metadata else None
-                item_id_chunk = self._encrypt_and_insert(
-                    raw_data_chunk,
-                    metadata_chunk,
-                    use_row_insert=use_row_insert,
-                    out_request_ids=out_request_ids,
-                    encryptor=encryptor,
-                )
-                self._extend_item_ids(item_ids, item_id_chunk)
+
+            def make_jobs():
+                for i in range(0, num_items, ENCRYPTION_BATCH_SIZE):
+                    end_idx = min(i + ENCRYPTION_BATCH_SIZE, num_items)
+                    yield {
+                        "data": list(data[i:end_idx]) if isinstance(data, np.ndarray) else data[i:end_idx],
+                        "metadata": metadata[i:end_idx] if metadata else None,
+                        "use_row_insert": use_row_insert,
+                        "encryptor": encryptor,
+                        "partition_name": partition_name,
+                    }
+
+            self._pipelined_encrypt_insert(
+                make_jobs(),
+                item_ids,
+                n_workers,
+                out_request_ids=out_request_ids,
+                progress_desc="Encrypt and Insert",
+                total_jobs=(num_items + ENCRYPTION_BATCH_SIZE - 1) // ENCRYPTION_BATCH_SIZE,
+            )
 
         # Case 2: Data is already a list of CipherBlock objects
         else:
@@ -1817,6 +2306,7 @@ class Index:
                     data_chunk,
                     metadata_chunk,
                     out_request_ids=out_request_ids,
+                    partition_name=partition_name,
                 )
                 item_ids.extend(item_id_chunk)
 
@@ -1830,16 +2320,17 @@ class Index:
         use_row_insert: bool = False,
         out_request_ids: Optional[List[str]] = None,
         encryptor=None,
+        n_workers: int = 1,
+        partition_name: Optional[str] = None,
     ):
         """
         Bulk inserts data into the index.
         If the data is not encrypted, it will be encrypted before insertion.
+        Metadata is expected to be already normalized to wire format by the caller.
         """
-        # Metadata Encryption if needed
-        if metadata and self.index_config.metadata_encryption:
-            metadata = self._encrypt_metadata_list(metadata)
-
-        # Before insert get index info
+        # Partition routing is threaded as an explicit parameter to the send
+        # sites (no shared instance state), so concurrent insert() calls on the
+        # same Index cannot race on the partition target.
         if self.index_config.index_type.upper() == "IVF_FLAT" or self.index_config.index_type.upper() == "IVF_VCT":
             return self._insert_ivf_bulk(
                 normalized_data,
@@ -1847,6 +2338,8 @@ class Index:
                 use_row_insert=use_row_insert,
                 out_request_ids=out_request_ids,
                 encryptor=encryptor,
+                n_workers=n_workers,
+                partition_name=partition_name,
             )
         elif self.index_config.index_type.upper() == "FLAT":
             return self._insert_flat_bulk(
@@ -1855,6 +2348,8 @@ class Index:
                 use_row_insert=use_row_insert,
                 out_request_ids=out_request_ids,
                 encryptor=encryptor,
+                n_workers=n_workers,
+                partition_name=partition_name,
             )
         else:
             raise ValueError(f"Index type '{self.index_config.index_type}' not supported for insertion.")
@@ -1865,6 +2360,7 @@ class Index:
         top_k: int,
         output_fields: List[str] = None,
         search_params: dict = None,
+        partition_names: Optional[List[str]] = None,
     ):
         """
         Searches the index.
@@ -1889,29 +2385,82 @@ class Index:
         >>> results = index.search(query=query, top_k=3, output_fields=["metadata"])
         >>> print(results)
         """
-        result_ctxt_list = self.scoring(query, search_params=search_params)
+        # Multi-partition search: each result must be scored and have its metadata
+        # fetched from its own partition's physical index. Run one single-partition
+        # search per partition (each already correct end-to-end) and merge the
+        # per-partition top-k client-side. Items belong to exactly one partition,
+        # so the union has no cross-partition duplicates.
+        metadata_partition_name = None
+        if partition_names:
+            # De-duplicate (order-preserving): a repeated partition name would
+            # otherwise be searched twice and double-count its hits in the merge.
+            seen = set()
+            partition_names = [n for n in partition_names if not (n in seen or seen.add(n))]
+            if len(partition_names) > 1:
+                return self._search_multi_partition(query, top_k, output_fields, search_params, partition_names)
+            metadata_partition_name = partition_names[0]
+
+        result_ctxt_list = self.scoring(query, search_params=search_params, partition_names=partition_names)
         if len(result_ctxt_list) == 0:
             return []
         if self._is_kms_managed_mode():
             output_result_list = self._multiquery_get_topk_metadata_results_via_kms(
-                result_ctxt_list, top_k, output_fields
+                result_ctxt_list, top_k, output_fields, partition_name=metadata_partition_name
             )
             result_ctxt_list.clear()
             del result_ctxt_list
+            self._tag_partition_name(output_result_list, metadata_partition_name)
             return output_result_list
         result_list = [self.decrypt_score(result_ctxt) for result_ctxt in result_ctxt_list]
         result_ctxt_list.clear()
         del result_ctxt_list
 
-        output_result_list = self._multiquery_get_topk_metadata_results(result_list, top_k, output_fields)
+        output_result_list = self._multiquery_get_topk_metadata_results(
+            result_list, top_k, output_fields, partition_name=metadata_partition_name
+        )
         result_list.clear()
         del result_list
+        self._tag_partition_name(output_result_list, metadata_partition_name)
         return output_result_list
+
+    @staticmethod
+    def _tag_partition_name(result_lists, partition_name):
+        """Stamp every hit with its source partition so search() returns the same
+        dict shape across single-, multi-, and no-partition queries (empty = default)."""
+        name = partition_name or ""
+        for q_list in result_lists:
+            for r in q_list:
+                r["partition_name"] = name
+
+    def _search_multi_partition(self, query, top_k, output_fields, search_params, partition_names):
+        """Search several partitions and merge their per-query top-k by score.
+
+        Each partition is searched on its own (the verified single-partition path,
+        with correct per-partition metadata, which already tags each hit's
+        partition_name); the results are then merged. Returns the same shape as
+        search(): one list of result dicts per query.
+        """
+        per_partition = [
+            self.search(query, top_k, output_fields=output_fields, search_params=search_params, partition_names=[name])
+            for name in partition_names
+        ]
+        num_queries = max((len(p) for p in per_partition), default=0)
+        merged = []
+        for q in range(num_queries):
+            combined = []
+            for p in per_partition:
+                if q < len(p):
+                    combined.extend(p[q])
+            # Score desc; tie-break on (partition_name, id) so equal scores order deterministically.
+            combined.sort(key=lambda r: (r.get("score", float("-inf")), r.get("partition_name", ""), r.get("id", 0)), reverse=True)
+            merged.append(combined[:top_k])
+        return merged
 
     def scoring(
         self,
         query: Union[List[float], np.ndarray, CipherBlock, List[List[float]], List[np.ndarray], List[CipherBlock]],
         search_params: dict = None,
+        partition_names: Optional[List[str]] = None,
     ):
         """
         Computes the scores for a query against the index.
@@ -1958,7 +2507,7 @@ class Index:
             else self.index_config.level
         )
         if self.index_config.index_type == "IVF_FLAT":
-            self._ensure_ivf_runtime_metadata_loaded(require_centroids=True)
+            self._ensure_ivf_centroids_loaded(require_centroids=True)
             if self.index_config.query_encryption in ["cipher"]:  # CC
                 # Encrypt multiple queries for each, if query was plaintext
                 if (
@@ -1982,7 +2531,9 @@ class Index:
                 logger.debug(f"Search on {nprobe} clusters by IVF-FLAT: {search_topk}")
 
                 # Do search with encrypted queries
-                result_ctxt = self.indexer.encrypted_search(self.index_config.index_name, encrypted_query, search_topk)
+                result_ctxt = self.indexer.encrypted_search(
+                    self.index_config.index_name, encrypted_query, search_topk, partition_names=partition_names
+                )
 
             else:  # PC
                 # Do search with plain queries
@@ -2005,10 +2556,11 @@ class Index:
                     topk=search_topk,
                     nprobe=nprobe,
                     level=plain_query_level,
+                    partition_names=partition_names,
                 )
 
         elif self.index_config.index_type == "IVF_VCT":
-            self._ensure_ivf_runtime_metadata_loaded()
+            # nlist/default_nprobe came from the summary at open; no centroids needed.
             if self.index_config.query_encryption in ["plain"]:  # PC
                 nprobe = (
                     search_params.get("nprobe", self.index_config.index_param.default_nprobe)
@@ -2021,6 +2573,7 @@ class Index:
                     query,
                     nprobe=nprobe,
                     level=plain_query_level,
+                    partition_names=partition_names,
                 )
             else:
                 raise ValueError(f"Query encryption type '{self.index_config.query_encryption}' not supported.")
@@ -2035,13 +2588,16 @@ class Index:
                 else:
                     encrypted_query = query
                 # Do search with encrypted queries
-                result_ctxt = self.indexer.encrypted_search(self.index_config.index_name, encrypted_query)
+                result_ctxt = self.indexer.encrypted_search(
+                    self.index_config.index_name, encrypted_query, partition_names=partition_names
+                )
             else:  # PC
                 # Do search with plain queries
                 result_ctxt = self.indexer.search(
                     self.index_config.index_name,
                     query,
                     level=plain_query_level,
+                    partition_names=partition_names,
                 )
         result = [CipherBlock(result) for result in result_ctxt]
         if hasattr(result_ctxt, "clear"):
@@ -2083,7 +2639,9 @@ class Index:
         logger.debug(f"Top-{top_k} metadata retrieval completed successfully. result: {result}")
         return result
 
-    def _multiquery_get_topk_metadata_results(self, results, top_k: int, output_fields: List[str] = None):
+    def _multiquery_get_topk_metadata_results(
+        self, results, top_k: int, output_fields: List[str] = None, partition_name: Optional[str] = None
+    ):
         topk_result_list = []
         topk_indices_list = []
         for result in results:
@@ -2094,14 +2652,25 @@ class Index:
             topk_result_list.append(topk_result)
             topk_indices_list.extend(topk_indices)
 
+        # Fetch metadata from the scoped partition's physical index (None =
+        # _default = the parent index).
         metadata_result = self.indexer.get_metadata(
-            self.index_config.index_name, topk_indices_list, fields=output_fields
+            self.index_config.index_name, topk_indices_list, fields=output_fields, partition_name=partition_name
         )
 
         if len(metadata_result) != len(topk_indices_list):
             raise ValueError(
                 f"Metadata count mismatch: requested {len(topk_indices_list)}, received {len(metadata_result)}"
             )
+
+        # Resolve the metadata key once for the whole result set instead of
+        # per item; _decrypt_metadata reuses these bytes without re-reading the
+        # key file or rebuilding a KeyManager for each row. Guard on a non-empty
+        # result so an empty search does not raise on a missing/misconfigured key.
+        meta_key = None
+        if self.index_config.metadata_encryption and len(metadata_result) > 0:
+            key_source = self.index_config.metadata_key_path or self.index_config.metadata_key
+            meta_key = resolve_metadata_key(key_source, kek=self.index_config.seal_kek_path)
 
         output_result_list = []
         offset = 0
@@ -2111,11 +2680,25 @@ class Index:
                 {
                     "id": metadata_result[i + offset].id,
                     "score": topk_result[i][1],
-                    "metadata": self._decrypt_metadata(metadata_result[i + offset].data),
+                    "metadata": self._decrypt_metadata(metadata_result[i + offset].data, meta_key),
                 }
                 for i in range(n)
             ]
-            output_result_list.append(output_result)
+            # Drop id==0 sentinels (DeleteData soft-delete + post-cutover stale coords)
+            # and dedup by id since partial-merge can score the same item via raw +
+            # merged shards; keep the best score, preserving rank order.
+            filtered = []
+            seen = {}
+            for entry in output_result:
+                if entry["id"] == 0:
+                    continue
+                prev = seen.get(entry["id"])
+                if prev is None:
+                    seen[entry["id"]] = len(filtered)
+                    filtered.append(entry)
+                elif entry["score"] > filtered[prev]["score"]:
+                    filtered[prev] = entry
+            output_result_list.append(filtered)
             offset += n
 
         # Release intermediate containers before returning.
@@ -2124,6 +2707,7 @@ class Index:
         if hasattr(metadata_result, "clear"):
             metadata_result.clear()
         del metadata_result
+        del meta_key
 
         return output_result_list
 
@@ -2246,25 +2830,31 @@ class Index:
         """
         Find k-nearest neighbors for each vector in the index.
         """
-        self._ensure_ivf_runtime_metadata_loaded(require_centroids=True)
+        self._ensure_ivf_centroids_loaded(require_centroids=True)
         # FIX: Add null check for centroids (was causing AttributeError instead of helpful message)
         if self.index_config.centroids is None or (
             hasattr(self.index_config.centroids, "size") and self.index_config.centroids.size == 0
         ):
             raise ValueError("Centroids not initialized. Load index metadata first.")
-        dim = self.index_config.centroids.shape[1]
+        nlist, dim = self.index_config.centroids.shape
+        if not 1 <= k <= nlist:
+            raise ValueError(f"k={k} is out of range; must satisfy 1 <= k <= nlist ({nlist}).")
+        batch_size = max(1, min(KNN_BATCH_SIZE_MAX, KNN_DIST_MATRIX_BUDGET_BYTES // (nlist * 4)))
         nearest_indices: List[np.ndarray] = []
 
         # batch inner product to find nearest centroids
-        for i in range(0, len(data), KNN_BATCH_SIZE):
-            data_matrix = np.asarray(data[i : i + KNN_BATCH_SIZE], dtype=np.float32)
+        for i in range(0, len(data), batch_size):
+            data_matrix = np.asarray(data[i : i + batch_size], dtype=np.float32)
             if data_matrix.shape[1] != dim:
                 raise ValueError(f"Centroid dimension {dim} does not match data dimension {data_matrix.shape[1]}.")
 
             dist_matrix = data_matrix @ self.index_config.centroids.T
 
-            # Efficiently get top-k indices for each row using np.argpartition
-            search_topk = np.argpartition(dist_matrix, -k, axis=1)[:, -k:]
+            # Efficiently get top-k indices for each row using np.argpartition.
+            # .copy() is required: the slice is a view into the full (batch_size, nlist)
+            # argpartition result, so appending it would keep every batch's full base
+            # array alive (O(num_vectors * nlist)) and OOM at large nlist.
+            search_topk = np.argpartition(dist_matrix, -k, axis=1)[:, -k:].copy()
 
             nearest_indices.append(search_topk)
 
@@ -2356,10 +2946,12 @@ class Index:
         return summary["can_load_now"]
 
     def __repr__(self):
+        # Indent the nested IndexConfig repr so it aligns under "Index(".
+        config_repr = "\n".join(f"  {line}" for line in repr(self.index_config).splitlines())
         return (
             "Index(\n"
-            f"  {repr(self.index_config)},\n"
-            f"  num_entities={self.num_entities},\n"
-            f"  cipher={self.cipher if self.cipher else None}\n"
+            f"  config       = {config_repr.lstrip()}\n"
+            f"  num_entities = {self.num_entities!r}\n"
+            f"  is_loaded    = {self.is_loaded!r}\n"
             ")"
         )

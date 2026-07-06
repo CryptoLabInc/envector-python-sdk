@@ -20,6 +20,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 import pyenvector as ev
+from pyenvector.utils.utils import resolve_preset
 
 BASE_VECTOR_SEED = 42
 
@@ -49,17 +50,7 @@ def main(args):
 
     address = f"{args.host}:{args.port}"
 
-    if args.reset:
-        ev.init_connect(address=address)
-        ev.reset()
-
-    mode_to_preset = {
-        "mm": "ip1",
-        "mms": "ip1",
-        "mm32": "ip2",
-        "mms32": "ip2",
-    }
-    preset = mode_to_preset[args.eval_mode]
+    preset = resolve_preset(args.preset, args.eval_mode)
     key_id = args.key_id or f"test-key-{args.eval_mode}-{preset}"
 
     index_name = f"{args.index_name}_{args.eval_mode}"
@@ -67,6 +58,11 @@ def main(args):
     ev.init(address=address, key_path="./keys", key_id=key_id, eval_mode=args.eval_mode, preset=preset)
     print("enVector initialized.")
     print(ev.info())
+    if args.reset:
+        if index_name in ev.get_index_list():
+            ev.drop_index(index_name)
+        if key_id in ev.get_key_list():
+            ev.unload_key(key_id)
 
     index_exists = index_name in ev.get_index_list()
     if index_exists:
@@ -175,9 +171,9 @@ if __name__ == "__main__":
         type=str,
         choices=["mm", "mms", "mm32", "mms32"],
         default="mm32",
-        help="Evaluation mode: mm (IP1), mms (IP1 + shared-A), mm32 (IP2 u32), mms32 (IP2 u32 + shared-A)",
+        help="Evaluation mode: mm (IP1), mms (IP1 + shared-A), mm32 (IP3 u32), mms32 (IP3 u32 + shared-A)",
     )
-    parser.add_argument("--index-name", type=str, default="test_index", help="Name of the index to create/use")
+    parser.add_argument("--index-name", type=str, default="e2e_enc_idx", help="Name of the index to create/use")
     parser.add_argument(
         "--type",
         type=str,
@@ -197,5 +193,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--skip-cleanup", action="store_true", default=False, help="Skip cleanup after test")
     parser.add_argument("--reset", action="store_true", default=False, help="Reset server before tests")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=["ip1", "ip2", "ip3"],
+        default=None,
+        help="Parameter preset. Default: ip1 for mm/mms, ip3 for mm32/mms32.",
+    )
 
     main(parser.parse_args())

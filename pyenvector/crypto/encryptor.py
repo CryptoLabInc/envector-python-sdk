@@ -178,7 +178,10 @@ class Encryptor:
         enc_type = EncodingType(encoding)
 
         if n_workers <= 1 or len(msg) == 0:
-            return self.encryptor.encrypt_row(msg, self._enc_key, enc_type.encoding_type, level)
+            # Fresh instance per call: the shared one reloads keys and shares an
+            # RNG natively, so concurrent calls race once the GIL is released.
+            enc = evi.Encryptor(Encryptor._context._context)
+            return enc.encrypt_row(msg, self._enc_key, enc_type.encoding_type, level)
 
         chunk_size = math.ceil(len(msg) / n_workers)
         chunks = [msg[i : i + chunk_size] for i in range(0, len(msg), chunk_size)]
@@ -215,7 +218,9 @@ class Encryptor:
         """
         enc_type = EncodingType(encoding)
 
-        return self.encryptor.encrypt_bulk(msg, self._enc_key, enc_type.encoding_type, level)
+        # Fresh instance per call — same thread-safety rationale as encrypt_row.
+        enc = evi.Encryptor(Encryptor._context._context)
+        return enc.encrypt_bulk(msg, self._enc_key, enc_type.encoding_type, level)
 
     # def encrypt_with_key(self, msg: List[float], sec_key_path: str, encoding: str):
     #     """

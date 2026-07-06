@@ -20,6 +20,7 @@ Classes:
 
 Functions:
     init_connect: Initializes the connection to the enVector server.
+    init_kms_connect: Initializes the connection to the enVector KMS service.
     init_index_config: Initializes the index configuration.
     create_index: Creates a new index.
     init: Initializes the PyEnvector client environment.
@@ -27,6 +28,7 @@ Functions:
 
 import json
 import os
+import time
 import warnings
 from typing import Callable, Optional, Union
 
@@ -34,7 +36,7 @@ from pyenvector.api import Indexer
 from pyenvector.crypto import KeyGenerator
 from pyenvector.crypto.key_manager import KeyManager
 from pyenvector.crypto.parameter import ContextParameter, KeyParameter
-from pyenvector.errors import KeyManagementError
+from pyenvector.errors import EnvectorApplicationError, KeyManagementError
 from pyenvector.index import Index, IndexConfig
 from pyenvector.proto_gen.v2.common import type_pb2 as _type_pb2
 from pyenvector.utils import utils
@@ -60,6 +62,7 @@ class EnvectorClient:
 
     Methods:
         init_connect(host, port, address, access_token): Initializes the connection to the enVector server.
+        init_kms_connect(kms_address, secure, access_token): Initializes the connection to the enVector KMS service.
         register_key(key_id, key_path): Registers a key with the enVector server.
         generate_and_register_key(key_id, key_path, preset): Generates and registers a key.
         init_index_config(key_path, key_id, preset, query_encryption, index_encryption, index_type):
@@ -297,6 +300,8 @@ class EnvectorClient:
             preset=self.index_config.preset,
             eval_mode=self.index_config.eval_mode,
         )
+        if not self.index_config.use_key_stream and hasattr(self.index_config.key_param, "_eval_key"):
+            self.index_config.key_param._eval_key = None
         return
 
     def load_key(self, key_id: Optional[str] = None):
@@ -311,6 +316,9 @@ class EnvectorClient:
         """
         if key_id is None:
             key_id = self.index_config.key_id
+        if self._is_key_loaded(key_id):
+            logger.info(f"Key {self.index_config.key_id} already loaded.")
+            return
         self.indexer.load_key(key_id=key_id)
 
     def unload_key(self, key_id: Optional[str] = None):
@@ -367,6 +375,18 @@ class EnvectorClient:
             return False
         return bool(key_list and key_id in key_list)
 
+    def _is_key_loaded(self, key_id: Optional[str] = None) -> bool:
+        """
+        Helper to check whether the given key ID is already loaded on the server.
+        """
+        if not self._is_key_registered(key_id):
+            return False
+        try:
+            key_info = self.indexer.get_key_info(key_id)
+        except Exception:
+            return False
+        return key_info["is_loaded"]
+
     def get_index_list(self):
         """
         Retrieves the list of registered index.
@@ -409,6 +429,18 @@ class EnvectorClient:
             ValueError: If the indexer is not initialized.
         """
         return self.indexer.clone_index(source_index_name, target_index_name)
+
+    def create_partition(self, index_name: str, partition_name: str):
+        """Create a named partition in an index."""
+        return self.indexer.create_partition(index_name, partition_name)
+
+    def drop_partition(self, index_name: str, partition_name: str):
+        """Drop a named partition from an index (its data is removed)."""
+        return self.indexer.drop_partition(index_name, partition_name)
+
+    def list_partitions(self, index_name: str):
+        """List an index's partitions as dicts {name, status, num_vectors}."""
+        return self.indexer.list_partitions(index_name)
 
     def generate_and_store_remote(self, key_store: str, key_id: Optional[str] = None):
         """
@@ -466,12 +498,13 @@ class EnvectorClient:
         metadata_key = pick("metadata_blob", "metadata_key")
         return enc_key, eval_key, sec_key, metadata_key
 
-    def generate_key(self, key_id: Optional[str] = None):
+    def generate_key(self, key_id: Optional[str] = None, seed: Optional[bytes] = None):
         """
         Generates a key using the KeyGenerator.
 
         Args:
             key_id (str, optional): Override for ``index_config.key_id`` when generating the key.
+            seed (bytes, optional): 64-byte deterministic seed forwarded to KMS-managed key generation.
 
         Returns:
             KeyGenerator: The KeyGenerator instance used to generate the key.
@@ -487,6 +520,7 @@ class EnvectorClient:
                     metadata_encryption=self.index_config.metadata_encryption,
                     preset=ctx.preset_name,
                     eval_mode=ctx.eval_mode_name,
+                    seed=seed,
                 )
                 if "READY" not in str(result.get("status", "")):
                     self._kms_client.wait_for_key(self.index_config.key_id)
@@ -663,6 +697,105 @@ class EnvectorClient:
         except Exception:
             # let the caller handle strict-mode exception; do not swallow
             raise
+        return self
+
+    def init_kms_connect(
+        self,
+        kms_address: str,
+        secure: Optional[bool] = None,
+        access_token: AccessTokenInput = None,
+        refresh_token: Optional[str] = None,
+        oidc_issuer: Optional[str] = None,
+        token_endpoint: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        scope: Optional[str] = None,
+        ca_cert: Union[str, bytes, None] = None,
+    ):
+        """
+        Initializes the connection to the enVector KMS service.
+
+        When called after ``init_connect()``, the resulting KMSClient shares the
+        indexer's auth session so a single refresh updates the access token for
+        both clients. When no indexer session is available (e.g. tests that
+        bypass ``init_connect``), a standalone session is built from the OIDC
+        parameters.
+
+        Args:
+            kms_address (str): ``host:port`` of the KMS combined service (gRPC).
+            secure (bool, optional): Whether to use a secure KMS connection. Defaults to True.
+            access_token (str or callable, optional): Bearer token used for KMS authentication.
+            refresh_token (str, optional): OIDC refresh token used to renew bearer tokens.
+            oidc_issuer (str, optional): OIDC issuer URL used to discover the token endpoint.
+            token_endpoint (str, optional): Explicit token endpoint for refresh token exchange.
+            client_id (str, optional): OIDC client ID for refresh token exchange.
+            client_secret (str, optional): OIDC client secret for refresh token exchange.
+            scope (str, optional): Optional scope value included in refresh requests.
+            ca_cert (str or bytes, optional): PEM CA bundle used to verify KMS TLS.
+                Pass a file path (``str``) or PEM data (``bytes``) directly.
+
+        Returns:
+            EnvectorClient: The EnvectorClient with KMS client attached.
+
+        Raises:
+            ValueError: If ``kms_address`` is not provided.
+
+        Examples:
+            Connect to the KMS service after init_connect():
+                >>> pyenvector_client.init_connect(address="localhost:50050")
+                >>> pyenvector_client.init_kms_connect(kms_address="localhost:50090")
+        """
+        if not kms_address:
+            raise ValueError("kms_address must be provided.")
+
+        from pyenvector.kms.client import KMSClient
+
+        resolved_secure = bool(secure) if secure is not None else True
+        # init_connect always builds a fresh Indexer with a new _AuthSession, so
+        # the old KMSClient (if any) is referencing a stale session. Reuse only
+        # when address/secure match AND the KMSClient is already bound to the
+        # current indexer's session — that's the case we want sharing for: one
+        # refresh updates both.
+        indexer_session = self._indexer._auth_session if self._indexer is not None else None
+        reuse_kms_client = (
+            self._kms_client is not None
+            and self._kms_client._address == kms_address
+            and self._kms_client._secure == resolved_secure
+            and self._kms_client._ca_cert == ca_cert
+            and self._kms_client._auth_session is indexer_session
+            and indexer_session is not None
+        )
+        if not reuse_kms_client:
+            if self._kms_client is not None:
+                self._kms_client.close()
+            if indexer_session is not None:
+                self._kms_client = KMSClient(
+                    address=kms_address,
+                    secure=resolved_secure,
+                    ca_cert=ca_cert,
+                    auth_session=indexer_session,
+                )
+            else:
+                # No indexer yet (e.g. tests that bypass init_connect). Build a
+                # standalone session from the OIDC parameters.
+                self._kms_client = KMSClient(
+                    address=kms_address,
+                    secure=resolved_secure,
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    oidc_issuer=oidc_issuer,
+                    token_endpoint=token_endpoint,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    scope=scope,
+                    ca_cert=ca_cert,
+                )
+        Index._default_kms_client = self._kms_client
+        logger.info(
+            "KMS client %s (kms_address=%s)",
+            "reused" if reuse_kms_client else "initialized",
+            kms_address,
+        )
         return self
 
     def init_index_config(
@@ -931,6 +1064,8 @@ class EnvectorClient:
         vault_addr: Optional[str] = None,
         vault_mount: Optional[str] = None,
         kms_address: Optional[str] = None,
+        kms_secure: bool = True,
+        kms_ca_cert: Union[str, bytes, None] = None,
     ):
         """
         Initializes the EnvectorClient environment (connection, key, and index config).
@@ -1010,6 +1145,12 @@ class EnvectorClient:
             ``host:port`` of the KMS combined service (gRPC). When provided,
             the KMS client is activated for key generation, secret management,
             and TopK operations.
+        kms_secure : bool, optional
+            Whether to use a secure KMS connection. Defaults to ``True`` and
+            is independent from the enVector endpoint ``secure`` option.
+        kms_ca_cert : str or bytes, optional
+            PEM CA bundle used to verify KMS TLS.
+            Pass a file path (``str``) or PEM data (``bytes``) directly.
 
         Returns
         -------
@@ -1035,6 +1176,8 @@ class EnvectorClient:
         """
         if host is None and port is None and address is None:
             raise ValueError("Either host and port or address must be provided.")
+        if preset is not None and eval_mode is not None:
+            utils.validate_preset_evalmode(preset, eval_mode)
         self.init_connect(
             host=host,
             port=port,
@@ -1049,28 +1192,17 @@ class EnvectorClient:
             scope=scope,
         )
         if kms_address is not None:
-            from pyenvector.kms.client import KMSClient
-
-            kms_secure = bool(secure) if secure is not None else False
-            reuse_kms_client = (
-                self._kms_client is not None
-                and self._kms_client._address == kms_address
-                and self._kms_client._secure == kms_secure
-                and self._kms_client._access_token == access_token
-            )
-            if not reuse_kms_client:
-                if self._kms_client is not None:
-                    self._kms_client.close()
-                self._kms_client = KMSClient(
-                    address=kms_address,
-                    secure=kms_secure,
-                    access_token=access_token,
-                )
-            Index._default_kms_client = self._kms_client
-            logger.info(
-                "KMS client %s (kms_address=%s)",
-                "reused" if reuse_kms_client else "initialized",
-                kms_address,
+            self.init_kms_connect(
+                kms_address=kms_address,
+                secure=kms_secure,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                oidc_issuer=oidc_issuer,
+                token_endpoint=token_endpoint,
+                client_id=client_id,
+                client_secret=client_secret,
+                scope=scope,
+                ca_cert=kms_ca_cert,
             )
         else:
             if self._kms_client is not None:
@@ -1233,6 +1365,73 @@ class EnvectorClient:
             raise ValueError("Indexer not connected. Please call Index.init_connect() first.")
 
         self.indexer.delete_index(index_name)
+        return self
+
+    def delete_index(self, index_name: str):
+        """
+        Delete the index with the given name. Alias for :meth:`drop_index`.
+
+        Args:
+            index_name (str): The name of the index to delete.
+
+        Returns:
+            EnvectorClient: The client after deleting the index.
+
+        Raises:
+            ValueError: If the indexer is not connected.
+        """
+        return self.drop_index(index_name)
+
+    def load_index(self, index_name: str):
+        """
+        Load the index with the given name into memory.
+
+        This call is also used to publish pending merged shards for indexes that are
+        already loaded. Backend ``load_index`` returns an "already loaded" error when
+        there is nothing new to publish; that case is treated as a no-op here.
+
+        Args:
+            index_name (str): The name of the index to load.
+
+        Returns:
+            EnvectorClient: The client after loading the index.
+
+        Raises:
+            ValueError: If the indexer is not connected.
+        """
+        if not self.indexer or not self.indexer.is_connected():
+            raise ValueError("Indexer not connected. Please call Index.init_connect() first.")
+        try:
+            self.indexer.load_index(index_name)
+        except EnvectorApplicationError as exc:
+            if not str(exc).startswith("Index already loaded:"):
+                raise
+            logger.info("Index already loaded with no pending shards. No additional load needed.")
+        logger.info(f"Index '{index_name}' loaded successfully.")
+        return self
+
+    def unload_index(self, index_name: str):
+        """
+        Unload the index with the given name from memory.
+
+        Unloading an index that is not currently loaded is treated as a no-op.
+
+        Args:
+            index_name (str): The name of the index to unload.
+
+        Returns:
+            EnvectorClient: The client after unloading the index.
+
+        Raises:
+            ValueError: If the indexer is not connected.
+        """
+        if not self.indexer or not self.indexer.is_connected():
+            raise ValueError("Indexer not connected. Please call Index.init_connect() first.")
+        if not self.indexer.get_index_summary(index_name)["is_loaded"]:
+            logger.info(f"Index '{index_name}' already unloaded. No need to unload.")
+            return self
+        self.indexer.unload_index(index_name)
+        logger.info(f"Index '{index_name}' unloaded successfully.")
         return self
 
     def delete_key(self, key_id: str):
@@ -1838,6 +2037,7 @@ es2_client = pyenvector_client
 """
 Functions:
     init_connect: Initializes the connection to the enVector server.
+    init_kms_connect: Initializes the connection to the enVector KMS service.
     init_index_config: Initializes the index configuration.
     create_index: Creates a new index.
     init: Initializes the EnvectorClient environment.
@@ -1880,6 +2080,43 @@ def init_connect(*args, **kwargs):
         The initialized EnvectorClient object.
     """
     return pyenvector_client.init_connect(*args, **kwargs)
+
+
+def init_kms_connect(*args, **kwargs):
+    """
+    Initialize the connection to the enVector KMS service.
+
+    When called after ``init_connect()``, the resulting KMSClient shares the
+    indexer's auth session so a single refresh updates both. Otherwise a
+    standalone session is built from the OIDC parameters.
+
+    Parameters
+    ----------
+    kms_address : str
+        ``host:port`` of the KMS combined service (gRPC).
+    secure : bool, optional
+        Whether to use a secure KMS connection. Defaults to True.
+    access_token : str or callable, optional
+        Bearer token used for KMS authentication.
+    refresh_token : str, optional
+        OIDC refresh token used to renew bearer tokens.
+    oidc_issuer : str, optional
+        OIDC issuer URL used to discover the token endpoint.
+    token_endpoint : str, optional
+        Explicit token endpoint for refresh token exchange.
+    client_id : str, optional
+        OIDC client ID for refresh token exchange.
+    client_secret : str, optional
+        OIDC client secret for refresh token exchange.
+    scope : str, optional
+        Optional scope value included in refresh requests.
+
+    Returns
+    -------
+    EnvectorClient
+        The EnvectorClient with KMS client attached.
+    """
+    return pyenvector_client.init_kms_connect(*args, **kwargs)
 
 
 def init_index_config(*args, **kwargs):
@@ -2112,6 +2349,57 @@ def drop_index(index_name: str):
     return pyenvector_client.drop_index(index_name)
 
 
+def delete_index(index_name: str):
+    """
+    Delete the index with the given name. Alias for :func:`drop_index`.
+
+    Parameters
+    ----------
+    index_name : str
+        The name of the index to delete.
+
+    Returns
+    -------
+    EnvectorClient
+        The EnvectorClient object after deleting the index.
+    """
+    return pyenvector_client.delete_index(index_name)
+
+
+def load_index(index_name: str):
+    """
+    Load the index with the given name into memory.
+
+    Parameters
+    ----------
+    index_name : str
+        The name of the index to load.
+
+    Returns
+    -------
+    EnvectorClient
+        The EnvectorClient object after loading the index.
+    """
+    return pyenvector_client.load_index(index_name)
+
+
+def unload_index(index_name: str):
+    """
+    Unload the index with the given name from memory.
+
+    Parameters
+    ----------
+    index_name : str
+        The name of the index to unload.
+
+    Returns
+    -------
+    EnvectorClient
+        The EnvectorClient object after unloading the index.
+    """
+    return pyenvector_client.unload_index(index_name)
+
+
 def delete_key(key_id: str):
     """
     Delete the key with the given key_id.
@@ -2129,7 +2417,7 @@ def delete_key(key_id: str):
     return pyenvector_client.delete_key(key_id)
 
 
-def generate_key(key_id: str):
+def generate_key(key_id: str, seed: Optional[bytes] = None):
     """
     Generate a key using the KeyGenerator.
 
@@ -2137,12 +2425,14 @@ def generate_key(key_id: str):
     ----------
     key_id : str
         The ID of the key to generate.
+    seed : bytes, optional
+        64-byte deterministic seed for KMS-managed key generation.
 
     Returns
     -------
     None
     """
-    return pyenvector_client.generate_key(key_id)
+    return pyenvector_client.generate_key(key_id, seed=seed)
 
 
 def register_key(key_id: str):
@@ -2319,6 +2609,21 @@ def clone_index(source_index_name: str, target_index_name: str):
         A dictionary containing the source and target index names.
     """
     return pyenvector_client.clone_index(source_index_name, target_index_name)
+
+
+def create_partition(index_name: str, partition_name: str):
+    """Create a named partition in an index."""
+    return pyenvector_client.create_partition(index_name, partition_name)
+
+
+def drop_partition(index_name: str, partition_name: str):
+    """Drop a named partition from an index (its data is removed)."""
+    return pyenvector_client.drop_partition(index_name, partition_name)
+
+
+def list_partitions(index_name: str):
+    """List an index's partitions as dicts {name, status, num_vectors}."""
+    return pyenvector_client.list_partitions(index_name)
 
 
 def load_key(key_id: str):

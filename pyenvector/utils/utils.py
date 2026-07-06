@@ -155,11 +155,26 @@ def check_key_metadata(key_id: str, key_path: str) -> bool:
 
 
 def topk(vector: List[List[float]], k: int):
-    topk_result = heapq.nlargest(
-        k, (((i, j), v) for i, row in enumerate(vector) for j, v in enumerate(row)), key=lambda x: x[1]
-    )
+    import numpy as np
 
-    topk_indices = [Position(shard_idx=pos[0], row_idx=pos[1]) for pos, _ in topk_result]
+    # Collect top-k candidates per shard using numpy argpartition, then merge.
+    # Avoids iterating all N elements (~3M with nprobe=1024) via a pure-Python
+    # generator+lambda, which dominated latency (~470ms for nprobe=1024).
+    candidates: List[tuple] = []
+    for i, row in enumerate(vector):
+        arr = np.asarray(row, dtype=np.float32)
+        n = len(arr)
+        if n == 0:
+            continue
+        k2 = min(k, n)
+        for j in np.argpartition(arr, -k2)[-k2:]:
+            candidates.append((float(arr[j]), i, int(j)))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top = candidates[:k]
+
+    topk_result = [((shard, row), score) for score, shard, row in top]
+    topk_indices = [Position(shard_idx=shard, row_idx=row) for _, shard, row in top]
 
     return topk_result, topk_indices
 
@@ -175,21 +190,101 @@ def convert_to_encode_type(encode_type: Union[str, evi.EncodeType]) -> evi.Encod
         raise ValueError(f"Unknown encode type: {encode_type}. Supported types are: ITEM, QUERY.")
 
 
+_EVI_PRESET_ATTR = {"ip1": "IP1", "ip2": "IP2", "ip3": "IP3"}
+
+
 def convert_to_preset(preset):
-    if preset.lower().startswith("ip"):  # Case: IP
-        # if preset.lower() == "ip0":
-        #     return evi.ParameterPreset.IP0
-        if preset.lower() == "ip1":
-            return evi.ParameterPreset.IP1
-        elif preset.lower() == "ip2":
-            return evi.ParameterPreset.IP2
-        else:
-            raise ValueError(f"Unsupported IP preset: {preset}. Use IP1 or IP2.")
-    elif preset.lower().startswith("qf"):  # Case: QF
+    key = preset.lower()
+    if key.startswith("ip"):  # Case: IP
+        attr = _EVI_PRESET_ATTR.get(key)
+        if attr is None:
+            raise ValueError(f"Unsupported IP preset: {preset}. Use IP1, IP2, or IP3.")
+        if not hasattr(evi.ParameterPreset, attr):
+            raise ValueError(
+                f"Preset {attr} is not available in the installed evi extension. "
+                f"Rebuild pyenvector against an evi version that exposes ParameterPreset.{attr}."
+            )
+        return getattr(evi.ParameterPreset, attr)
+    elif key.startswith("qf"):  # Case: QF
         # Consider only QF0 for now
         return evi.ParameterPreset.QF0
     else:
         raise ValueError(f"Unknown preset: {preset}. Supported presets are: IP, QF.")
+
+
+# Compat matrix between preset and eval_mode. Mirrors
+# services/internal/utils/preset.go::ValidatePresetEvalMode on the Go side.
+#   mm   / mms          -> ip1, ip2       (64-bit Q/P u64 path)
+#   mm32 / mms32        -> ip3            (32-bit Q/P u32 NTT path)
+#   rmp / flat / others -> not enforced   (passthrough)
+# IP2 was demoted from the u32 path to the u64 path (companion to evi PR
+# #698): pairing IP2 with mm32/mms32 is semantically contradictory, so IP2
+# is now valid only under the u64 modes mm/mms (alongside IP1). IP2 remains
+# a valid preset — this is a demotion of its eval-mode pairing, not removal.
+_PRESET_EVAL_MODE_ALLOWED = {
+    "mm": {"ip1", "ip2"},
+    "mms": {"ip1", "ip2"},
+    "mm32": {"ip3"},
+    "mms32": {"ip3"},
+}
+
+# Default preset chosen when an example/CLI caller omits --preset. For modes
+# with a single valid preset (mm32/mms32 -> ip3) the choice is forced; for
+# mm/mms we keep ip1 (the longest-deployed u64 option) for backward compat.
+_DEFAULT_PRESET_FOR_EVAL_MODE = {
+    "mm": "ip1",
+    "mms": "ip1",
+    "mm32": "ip3",
+    "mms32": "ip3",
+}
+
+
+def _preset_evalmode_name(value):
+    """Return the lowercase string form of a preset or eval_mode argument.
+
+    Accepts str, evi enum (ParameterPreset / EvalMode — exposes ``.name``), or
+    None/empty. Anything else (e.g. an enum without a name) yields "".
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip().lower()
+    name = getattr(value, "name", None)
+    return name.strip().lower() if isinstance(name, str) else ""
+
+
+def validate_preset_evalmode(preset, eval_mode):
+    """Raise ValueError if (preset, eval_mode) is an unsupported combination.
+
+    Accepts str or evi enum (ParameterPreset / EvalMode) on either argument.
+    Empty preset or empty eval_mode short-circuits to None so that callers can
+    let default-resolution fill them in and re-validate later.
+    """
+    p = _preset_evalmode_name(preset)
+    m = _preset_evalmode_name(eval_mode)
+    if not p or not m:
+        return
+    allowed = _PRESET_EVAL_MODE_ALLOWED.get(m)
+    if allowed is None:
+        return  # passthrough for rmp / flat / unknown
+    if p not in allowed:
+        raise ValueError(
+            f"preset {preset!r} is not compatible with eval_mode {eval_mode!r} "
+            f"(allowed: {', '.join(sorted(allowed))})"
+        )
+
+
+def resolve_preset(arg_preset, eval_mode):
+    """Return a validated, lowercase preset string for the given eval_mode.
+
+    If ``arg_preset`` is falsy, falls back to the per-eval_mode default. The
+    resolved (preset, eval_mode) pair is then run through
+    validate_preset_evalmode and any incompatibility raises ValueError.
+    """
+    m = _preset_evalmode_name(eval_mode)
+    preset = (arg_preset or _DEFAULT_PRESET_FOR_EVAL_MODE.get(m, "")).lower()
+    validate_preset_evalmode(preset, eval_mode)
+    return preset
 
 
 def convert_to_search_type(preset):

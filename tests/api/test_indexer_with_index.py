@@ -46,6 +46,8 @@ class MockEnvectorService(envector_grpc.EndpointServiceServicer):
         response.index_summary.index_type = envector_type_pb.IndexType.FLAT
         response.index_summary.is_loaded = True
         response.index_summary.is_key_loaded = True
+        response.index_summary.nlist = 16
+        response.index_summary.default_nprobe = 4
         return response
 
     def clone_index(self, request, context):
@@ -89,6 +91,9 @@ def test_get_index_summary_and_clone_index(grpc_server):
     assert summary["index_name"] == "source_index"
     assert summary["dim"] == 64
     assert summary["key_id"] == "key1"
+    # IVF clustering params are carried in the summary now (parsed off the proto).
+    assert summary["nlist"] == 16
+    assert summary["default_nprobe"] == 4
 
     cloned = indexer.clone_index("source_index", "cloned_index")
     assert cloned == {

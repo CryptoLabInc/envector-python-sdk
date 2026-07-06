@@ -18,12 +18,14 @@ def main(args):
     NUM_DATA = args.num_vectors
     INDEX_NAME = args.index_name
 
-    if args.reset:
-        ev.init_connect(address=ENVECTOR_ADDRESS)
-        ev.reset()
-
-    ev.init(address=ENVECTOR_ADDRESS, key_path="./keys", key_id=args.key_id, eval_mode=args.eval_mode)
+    ev.init(address=ENVECTOR_ADDRESS, key_path="./keys", key_id=args.key_id, eval_mode=args.eval_mode, preset=args.preset)
     print("enVector initialized.")
+    if args.reset:
+        for index_name in (f"{INDEX_NAME}_flat", f"{INDEX_NAME}_ivf"):
+            if index_name in ev.get_index_list():
+                ev.drop_index(index_name)
+        if args.key_id in ev.get_key_list():
+            ev.unload_key(args.key_id)
 
     # Generate sample vectors
     seed = 42
@@ -76,7 +78,9 @@ def main(args):
         assert matched_idx == target_idx, f"Top-1 result index {matched_idx} does not match expected {target_idx}"
 
     # Cleanup
-    ev.reset()
+    ev.drop_index(f"{INDEX_NAME}_flat")
+    ev.drop_index(f"{INDEX_NAME}_ivf")
+    ev.unload_key(args.key_id)
 
 
 if __name__ == "__main__":
@@ -85,9 +89,10 @@ if __name__ == "__main__":
     parser.add_argument("--num-vectors", type=int, default=10000, help="Number of vectors to insert")
     parser.add_argument("--host", type=str, default="localhost", help="Host for enVector connection")
     parser.add_argument("--port", type=int, default=50050, help="Port for enVector connection")
-    parser.add_argument("--eval-mode", type=str, choices=["mm32"], default="mm32", help="Evaluation mode: mm32")
-    parser.add_argument("--index-name", type=str, default="test_index", help="Name of the index to create/use")
-    parser.add_argument("--key-id", type=str, default="test-key", help="Name of the key to use")
+    parser.add_argument("--eval-mode", type=str, choices=["mm", "mms", "mm32", "mms32"], default="mm32", help="Evaluation mode")
+    parser.add_argument("--index-name", type=str, default="idx_two_types", help="Name of the index to create/use")
+    parser.add_argument("--key-id", type=str, default="test-key-mm32-ip3", help="Name of the key to use")
+    parser.add_argument("--preset", type=str, default="ip3", help="Parameter preset")
     parser.add_argument("--topk", type=int, default=3, help="k value for top-k")
 
     parser.add_argument("--nlist", type=int, default=8, help="Number of clusters (nlist) for IVF index")

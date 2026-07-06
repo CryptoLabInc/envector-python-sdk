@@ -41,22 +41,23 @@ def main(args):
     ENVECTOR_ADDRESS = f"{args.host}:{args.port}"
     DIM = args.dim
 
-    if args.reset:
-        ev.init_connect(address=ENVECTOR_ADDRESS)
-        ev.reset()
-
     ev.init(
         address=ENVECTOR_ADDRESS,
         key_path="./keys",
-        key_id="test-key-ip1",
-        eval_mode="mm32",
-        preset="ip2",
+        key_id=args.key_id,
+        eval_mode=args.eval_mode,
+        preset=args.preset,
     )
 
     print("enVector initialized.")
 
     # Create index
-    index_name = "test_index"
+    index_name = "idx_ivf_vct"
+    if args.reset:
+        if index_name in ev.get_index_list():
+            ev.drop_index(index_name)
+        if args.key_id in ev.get_key_list():
+            ev.unload_key(args.key_id)
 
     # Generate random vector
     num_data = 10000
@@ -91,12 +92,6 @@ def main(args):
         "Waiting for inserted rows to become searchable (Index Operation Status v0)... "
         f"(requests={len(request_ids)}, timeout={args.insert_timeout_s}s)"
     )
-    index.indexer.wait_for_inserts_searchable(
-        index_name=index_name,
-        request_ids=request_ids,
-        timeout_s=args.insert_timeout_s,
-        poll_interval_s=args.insert_poll_interval_s,
-    )
 
     # Search - PC
     search_index = ev.Index(index_name)
@@ -106,7 +101,8 @@ def main(args):
     print(result)
     assert abs(result[0]["score"] - 1) < 0.001, "Search score should be close to 1"
 
-    ev.reset()
+    ev.drop_index(index_name)
+    ev.unload_key(args.key_id)
 
 
 if __name__ == "__main__":
@@ -114,6 +110,9 @@ if __name__ == "__main__":
     parser.add_argument("--dim", type=int, default=512, help="Dimension of the vectors")
     parser.add_argument("--host", type=str, default="localhost", help="Host for enVector connection")
     parser.add_argument("--port", type=int, default=50050, help="Port for enVector connection")
+    parser.add_argument("--key-id", type=str, default="test-key-mm32-ip3", help="Key ID")
+    parser.add_argument("--eval-mode", type=str, choices=["mm", "mms", "mm32", "mms32"], default="mm32", help="Evaluation mode")
+    parser.add_argument("--preset", type=str, default="ip3", help="Parameter preset")
     parser.add_argument("--nlist", type=int, default=8, help="Number of IVF lists (centroids)")
     parser.add_argument("--nprobe", type=int, default=4, help="Number of probes during search")
     parser.add_argument(

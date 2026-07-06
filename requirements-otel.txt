@@ -1,0 +1,20 @@
+# Dev-only OpenTelemetry dependencies for pyenvector.telemetry.
+#
+# NOT shipped with the published wheel: the pyenvector.telemetry subpackage is
+# excluded from the wheel (see [tool.scikit-build] wheel.exclude in
+# pyproject.toml), and these packages are intentionally absent from the project
+# `dependencies`. Install only in a dev / e2e environment when you want SDK
+# calls to emit traces that connect to the server-side spans (search <-> KMS):
+#
+#     pip install -r requirements-otel.txt
+#
+# Tracing stays OFF until OTEL_TRACES_ENABLED is set, regardless of install.
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-otlp-proto-grpc>=1.20.0
+opentelemetry-exporter-otlp-proto-http>=1.20.0
+opentelemetry-instrumentation-grpc>=0.41b0
+
+# Keep protobuf on the same major as the SDK (pyenvector pins protobuf<6).
+# Recent opentelemetry exporters otherwise pull protobuf>=6, which breaks the
+# SDK's generated proto runtime. The OTLP gRPC/HTTP exporters work fine on 5.x.
+protobuf>=5.26.1,<6

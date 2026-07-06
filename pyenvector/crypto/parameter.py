@@ -46,6 +46,7 @@ PARAMETER_PRESET: List[str] = [
     # "IP0",
     "IP1",
     "IP2",
+    "IP3",
     # "QF",
     # "QF0",
     # "QF1",
@@ -60,16 +61,19 @@ EVAL_MODE: List[str] = [
     # "RMS",
     "MM",
     "MMS",
-    "MM32",   # IP2 MM with u32 coefficient storage
-    "MMS32",  # IP2 MM + shared-A with u32 coefficient storage
+    "MM32",   # u32 MM (IP3; IP2 demoted to u64 MM/MMS per evi PR #698)
+    "MMS32",  # u32 MM + shared-A (IP3; IP2 demoted to u64 MM/MMS per evi PR #698)
 ]
 
-# Required preset for each eval mode; modes absent from this map have no forced preset.
+# Default preset for each eval mode when the caller omits --preset; modes
+# absent from this map have no default preset. IP2 was demoted from the u32
+# path to the u64 path (companion to evi PR #698): u32 modes (mm32/mms32)
+# default to IP3, and IP2 remains valid only under the u64 modes (mm/mms).
 _EVAL_MODE_PRESET: Dict[str, str] = {
     "MM": "IP1",
     "MMS": "IP1",
-    "MM32": "IP2",
-    "MMS32": "IP2",
+    "MM32": "IP3",
+    "MMS32": "IP3",
 }
 
 
@@ -122,8 +126,14 @@ class ContextParameter:
         Initializes the ContextParameter class.
         """
         self.dim = dim
+        # Set preset first (leaves _preset = None when preset is None); the
+        # eval_mode setter then fills in the per-mode default only when no
+        # explicit preset was provided. Final fallback to IP1 handles eval
+        # modes (e.g. RMP) that have no per-mode preset.
         self.preset = preset
         self.eval_mode = eval_mode
+        if self._preset is None:
+            self.preset = "ip1"
         self.level = level
         self.device_type = device_type
 
@@ -165,8 +175,18 @@ class ContextParameter:
         else:
             mode_upper = mode.name
             self._eval_mode = mode
-        if mode_upper in _EVAL_MODE_PRESET:
-            self._preset = getattr(evi.ParameterPreset, _EVAL_MODE_PRESET[mode_upper])
+        # Only fall back to the per-eval-mode default preset when the caller
+        # did not specify one. Honoring an explicit preset is required so that
+        # IP3 can be selected for MM32/MMS32 and IP2 (u64, post evi PR #698)
+        # under MM/MMS without silent coercion.
+        if mode_upper in _EVAL_MODE_PRESET and self._preset is None:
+            default_attr = _EVAL_MODE_PRESET[mode_upper]
+            if not hasattr(evi.ParameterPreset, default_attr):
+                raise ValueError(
+                    f"eval_mode {mode_upper!r} defaults to preset {default_attr} but the installed "
+                    f"evi extension does not expose ParameterPreset.{default_attr}."
+                )
+            self._preset = getattr(evi.ParameterPreset, default_attr)
             self._sync_level_with_preset()
 
     @property
@@ -192,15 +212,19 @@ class ContextParameter:
             ValueError: If the preset is unsupported.
         """
         if preset is None:
-            preset = "ip1"
+            # Leave _preset unset so eval_mode-driven defaulting (or the
+            # final fallback in __init__) can populate it without clobbering
+            # an explicit user choice.
+            self._preset = None
+            return
         if isinstance(preset, str):
             preset_upper = preset.upper()
             if preset_upper not in PARAMETER_PRESET:
                 raise ValueError(f"Unsupported preset: {preset}. Supported presets are: {', '.join(PARAMETER_PRESET)}")
 
             if preset_upper.startswith("IP"):
-                if preset_upper not in ("IP1", "IP2"):
-                    raise ValueError(f"Currently IP1 and IP2 supported only. Got: {preset}")
+                if preset_upper not in ("IP1", "IP2", "IP3"):
+                    raise ValueError(f"Currently IP1, IP2 and IP3 supported only. Got: {preset}")
 
             elif preset_upper.startswith("QF"):
                 if not check_libheaan_exists():
@@ -209,11 +233,13 @@ class ContextParameter:
                     preset_upper = "QF0"
             else:
                 raise ValueError(f"Unsupported preset: {preset}")
-            forced = _EVAL_MODE_PRESET.get(getattr(getattr(self, "_eval_mode", None), "name", ""))
-            if forced is not None and forced != preset_upper:
+            current_eval_mode_name = getattr(getattr(self, "_eval_mode", None), "name", "")
+            if current_eval_mode_name:
+                utils.validate_preset_evalmode(preset_upper, current_eval_mode_name)
+            if not hasattr(evi.ParameterPreset, preset_upper):
                 raise ValueError(
-                    f"Preset '{preset_upper}' is incompatible with eval_mode "
-                    f"'{self._eval_mode.name}' (required: '{forced}')."
+                    f"Preset {preset_upper} is not available in the installed evi extension. "
+                    f"Rebuild pyenvector against an evi version that exposes ParameterPreset.{preset_upper}."
                 )
             self._preset = getattr(evi.ParameterPreset, preset_upper)
         else:
@@ -225,7 +251,7 @@ class ContextParameter:
 
     def _derive_level_from_preset(self) -> int:
         preset_name = getattr(self._preset, "name", "")
-        return 1 if preset_name in ("IP1", "IP2") else 0
+        return 1 if preset_name in ("IP1", "IP2", "IP3") else 0
 
     def _sync_level_with_preset(self) -> None:
         if not getattr(self, "_level_is_explicit", False):
@@ -673,6 +699,7 @@ class KeyParameter:
         secret_prefix: Optional[str] = None,
         vault_addr: Optional[str] = None,
         vault_mount: Optional[str] = None,
+        seed: Optional[Union[bytes, str]] = None,
     ):
         """
         Initializes the KeyParameter class.
@@ -695,6 +722,8 @@ class KeyParameter:
             secret_prefix (str, optional): Secret prefix for external key storage.
             vault_addr (str, optional): Vault address for external key storage.
             vault_mount (str, optional): Vault KV mount for external key storage.
+            seed (bytes or str, optional): 64-byte seed for deterministic key generation.
+                Accepts raw bytes or a 128-character hex string.
         """
         self.use_key_stream = use_key_stream
         self.key_path = key_path
@@ -713,6 +742,7 @@ class KeyParameter:
         self.secret_prefix = secret_prefix
         self.vault_addr = vault_addr
         self.vault_mount = vault_mount
+        self.seed = seed
 
     #     self._init_keys()
 
@@ -1155,6 +1185,8 @@ class KeyParameter:
         """
         Returns a string representation of the KeyParameter object.
         """
+        seed_repr = "(provided)" if self.seed is not None else None
         return (
-            f"KeyParameter(\n  key_path={self.key_path},\n  key_id={self.key_id},\n  seal_info={self.seal_mode_name}\n)"
+            f"KeyParameter(\n  key_path={self.key_path},\n  key_id={self.key_id},\n"
+            f"  seal_info={self.seal_mode_name},\n  seed={seed_repr})"
         )

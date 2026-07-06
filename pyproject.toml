@@ -14,7 +14,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "pyenvector"
-version = "1.4.3"
+version = "1.5.0"
 description = "Python SDK for enVector: encrypted vector search powered by homomorphic encryption"
 authors = [
     {name = "CryptoLab Inc.", email = "pypi@cryptolab.co.kr"}
@@ -31,9 +31,6 @@ dependencies = [
     "tqdm",
     "cryptography",
     "threadpoolctl>=3.1.0",
-    "boto3>=1.34.0",
-    "google-cloud-secret-manager>=2.18.0",
-    "google-cloud-storage>=2.14.0",
 ]
 
 license = {text = "Proprietary"}
@@ -62,6 +59,16 @@ Repository = "https://github.com/CryptoLabInc/envector-python-sdk"
 pyenvector-keygen = "pyenvector.cli.pyenvector_keygen:main"
 
 [project.optional-dependencies]
+aws = [
+    "boto3>=1.34.0",
+]
+gcp = [
+    "google-cloud-secret-manager>=2.18.0",
+    "google-cloud-storage>=2.14.0",
+]
+cloud = [
+    "pyenvector[aws,gcp]",
+]
 colab = [
     "numpy==2.0.2" # Compatible with Colab
 ]
@@ -79,6 +86,13 @@ cmake.args = [
 ]
 
 wheel.packages = ["pyenvector"]
+
+# The pyenvector.telemetry subpackage is a DEV-ONLY OpenTelemetry harness used to
+# connect SDK calls to server-side traces while debugging/benchmarking. It must
+# never ship in the distributed wheel: it carries no end-user value and would
+# pull an opentelemetry dependency. Exclude every file under it. (Its deps live
+# in requirements-otel.txt, deliberately outside `dependencies`.)
+wheel.exclude = ["pyenvector/telemetry/**"]
 
 wheel.install-dir = "evi"
 

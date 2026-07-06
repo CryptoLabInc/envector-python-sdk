@@ -5,7 +5,6 @@ import numpy as np
 from pyenvector.crypto import Cipher, KeyGenerator
 from pyenvector.utils import utils
 
-PRESET = "ip1"  # Preset for the context
 DIM = 512  # Dimension for the context
 
 
@@ -24,11 +23,10 @@ def get_random_vector(dim, seed=None):
     return vec
 
 
-def _run_example(eval_mode: str):
+def _run_example(eval_mode: str, key_id: str, preset: str):
     # Key Path
-    key_id = "test-key-mm" if eval_mode.upper() == "MM" else "test-key"
 
-    keygen = KeyGenerator(key_id=key_id, eval_mode=eval_mode)
+    keygen = KeyGenerator(key_id=key_id, eval_mode=eval_mode, preset=preset)
     key_dict = keygen.generate_keys_stream()
 
     enc_key_stream = key_dict["enc_blob"]
@@ -43,7 +41,7 @@ def _run_example(eval_mode: str):
     # Encrypt vector
     cipher = Cipher(
         dim=DIM,
-        preset=PRESET,
+        preset=preset,
         eval_mode=eval_mode,
         use_key_stream=True,
         sec_key=sec_key_stream,
@@ -67,11 +65,13 @@ def _run_example(eval_mode: str):
 
 
 def main(args):
-    _run_example(args.eval_mode)
+    _run_example(args.eval_mode, args.key_id, args.preset)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="enVector Encryption/Decryption Example")
-    parser.add_argument("--eval_mode", type=str, choices=["mm32"], default="mm32", help="Evaluation mode (MM32)")
+    parser.add_argument("--eval_mode", "--eval-mode", dest="eval_mode", type=str, choices=["mm", "mms", "mm32", "mms32"], default="mm32", help="Evaluation mode")
+    parser.add_argument("--key-id", type=str, default="test-key-mm32-ip3", help="Key ID")
+    parser.add_argument("--preset", type=str, default="ip3", help="Parameter preset")
     args = parser.parse_args()
     main(args)

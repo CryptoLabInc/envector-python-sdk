@@ -122,16 +122,19 @@ class Decryptor:
     def seal_mode_name(self):
         return self.seal_info.mode.name
 
-    def decrypt(self, enc_msg, sec_key: str, is_score: bool = False):
+    def decrypt(self, enc_msg, sec_key, is_score: bool = False):
         """
         Decrypts an encrypted vector.
 
         Parameters
         ----------
-        enc_msg : evi.Quey
+        enc_msg : evi.Query
             The encrypted vector to decrypt.
-        sec_key_path : str
-            The file path to the secret key used for decryption.
+        sec_key : str or evi.SecretKey
+            The secret key used for decryption. Either a key stream/path the
+            SDK can wrap via ``evi.SecretKey``, or a pre-built ``evi.SecretKey``
+            (useful when decrypting many ciphertexts in a row with the same
+            key, e.g. ``Cipher.decrypt_score``).
         is_score : bool, optional
             If True, the decryption will return the score of the encrypted vector.
 
@@ -140,7 +143,8 @@ class Decryptor:
         List[float]
             The decrypted vector as a list of floats.
         """
-        sec_key = evi.SecretKey(sec_key, self.seal_info)
+        if not isinstance(sec_key, evi.SecretKey):
+            sec_key = evi.SecretKey(sec_key, self.seal_info)
         if is_score:
             result = self.decryptor.decrypt(enc_msg, sec_key, is_score)
             del sec_key
@@ -176,7 +180,7 @@ class Decryptor:
         del sec_key
         return sliced
 
-    def decrypt_score(self, enc_msg, sec_key: str):
+    def decrypt_score(self, enc_msg, sec_key):
         """
         Decrypts an encrypted result score.
 
@@ -184,8 +188,10 @@ class Decryptor:
         ----------
         enc_msg : evi.Ciphertext
             The encrypted vector to decrypt.
-        sec_key_path : str
-            The file path to the secret key used for decryption.
+        sec_key : str or evi.SecretKey
+            The secret key used for decryption. Accepts either a key
+            stream/path or a pre-built ``evi.SecretKey`` to avoid re-parsing
+            the key when called many times in a loop.
 
         Returns
         -------

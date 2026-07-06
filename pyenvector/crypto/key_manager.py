@@ -21,7 +21,7 @@ import evi
 from pyenvector.crypto.context import Context
 from pyenvector.crypto.parameter import ContextParameter, KeyParameter
 
-from ..utils.aes import generate_aes256_key
+from ..utils.aes import derive_metadata_key_from_seed, generate_aes256_key
 from ..utils.utils import (
     _decode_blob,
     _encode_blob,
@@ -362,31 +362,43 @@ class KeyGenerator:
     dim_list : list, optional
         List of dimensions for the context. Defaults to powers of 2 from 32 to 4096.
     preset : str, optional
-        The parameter preset to use for the context. Defaults to "ip1".
+        The parameter preset to use for the context. Defaults to "ip3".
     seal_info : SealInfo, optional
         The seal information for the keys. Defaults to "SealMode.NONE".
     eval_mode : str, optional
-        The evaluation mode for the context. Defaults to "MM".
+        The evaluation mode for the context. Defaults to "MM32".
     metadata_encryption: bool, optional
         Whether to enable metadata encryption. Defaults to None.
+    seed : bytes or str, optional
+        64-byte seed for deterministic key generation. Accepts raw bytes or a
+        128-character hex string. When provided, the same seed always produces
+        the same key material across calls.
 
     Example
     --------
     >>> keygen = KeyGenerator("./keys")
     >>> keygen.generate_keys()
+
+    >>> # Deterministic key generation with a seed
+    >>> seed = bytes(range(64))
+    >>> keygen = KeyGenerator("./keys", seed=seed)
+    >>> keygen.generate_keys()
     """
+
+    SEED_SIZE = 64
 
     def __init__(
         self,
         key_path: Optional[str] = None,
         key_id: Optional[str] = None,
         dim_list: Optional[Union[int, List[int]]] = None,
-        preset: Optional[str] = "ip2",
+        preset: Optional[str] = "ip3",
         seal_mode: Optional[str] = None,
         seal_kek_path: Optional[str] = None,
         seal_kek: Optional[Union[bytes, str]] = None,
         eval_mode: Optional[str] = "MM32",
         metadata_encryption: Optional[bool] = None,
+        seed: Optional[Union[bytes, str]] = None,
     ):
         if key_path is None:
             if key_id is None:
@@ -407,10 +419,18 @@ class KeyGenerator:
         self._seal_mode = seal_mode
         self._seal_kek = seal_kek
         self.sInfo = _get_seal_info(seal_mode, seal_kek)
+        self._seed = self._parse_seed(seed)
         key_param = KeyParameter(
-            key_path=key_dir, seal_mode=seal_mode, seal_kek=seal_kek, metadata_encryption=metadata_encryption
+            key_path=key_dir,
+            seal_mode=seal_mode,
+            seal_kek=seal_kek,
+            metadata_encryption=metadata_encryption,
+            seed=self._seed,
         )
-        self._key_generator = evi.MultiKeyGenerator(context_list, key_dir, self.sInfo)
+        if self._seed is not None:
+            self._key_generator = evi.MultiKeyGenerator(context_list, key_dir, self.sInfo, self._seed)
+        else:
+            self._key_generator = evi.MultiKeyGenerator(context_list, key_dir, self.sInfo)
         self._context_param = ContextParameter(preset, eval_mode=eval_mode)
         self._key_param = key_param
         self._dim_list = dim_list
@@ -418,6 +438,22 @@ class KeyGenerator:
         self.key_dir = key_dir
         self.key_id = key_id if key_id is not None else key_dir
         self._km = KeyManager(key_id=self.key_id)
+
+    @staticmethod
+    def _parse_seed(seed: Optional[Union[bytes, str]]) -> Optional[bytes]:
+        """Convert seed to bytes and validate its length (must be exactly 64 bytes)."""
+        if seed is None:
+            return None
+        if isinstance(seed, str):
+            try:
+                seed = bytes.fromhex(seed)
+            except ValueError as exc:
+                raise ValueError("seed hex string must contain only valid hexadecimal characters") from exc
+        if not isinstance(seed, (bytes, bytearray)):
+            raise TypeError(f"seed must be bytes or hex str, got {type(seed).__name__}")
+        if len(seed) != KeyGenerator.SEED_SIZE:
+            raise ValueError(f"seed must be exactly {KeyGenerator.SEED_SIZE} bytes, got {len(seed)}")
+        return bytes(seed)
 
     @classmethod
     def _create_from_parameter(cls, context_param: ContextParameter, key_param: KeyParameter):
@@ -436,6 +472,7 @@ class KeyGenerator:
             seal_mode=key_param.seal_mode_name,
             seal_kek=key_param.seal_kek,
             metadata_encryption=key_param.metadata_encryption,
+            seed=getattr(key_param, "seed", None),
         )
 
         # *********************************************************************
@@ -489,9 +526,12 @@ class KeyGenerator:
         # Generate keys
         self._key_generator.generate_keys()
         if self._key_param.metadata_encryption:
-            # Generate metadata encryption key
+            # Generate metadata encryption key (deterministic when seed provided)
             sealing_active = self._key_param.seal_info.mode != evi.SealMode.NONE
-            metadata_enc_key = generate_aes256_key(self._key_param.metadata_key_path, False)
+            if self._seed is not None:
+                metadata_enc_key = derive_metadata_key_from_seed(self._seed)
+            else:
+                metadata_enc_key = generate_aes256_key(self._key_param.metadata_key_path, False)
             if sealing_active:
                 wrapped_metadata = self._km.wrap_metadata_key_bytes(
                     metadata_enc_key,
@@ -530,11 +570,14 @@ class KeyGenerator:
         _, sec_blob, enc_blob, eval_blob = self._key_generator.generate_keys_per_stream()
         res_dict = {"sec_blob": sec_blob, "enc_blob": enc_blob, "eval_blob": eval_blob}
         if self._key_param.metadata_encryption:
-            # Generate metadata encryption key
+            # Generate metadata encryption key (deterministic when seed provided)
             sealing = self._key_param.seal_info.mode != evi.SealMode.NONE
             if sealing:
                 raise ValueError("Sealing is not supported in stream key generation.")
-            metadata_enc_key = generate_aes256_key(self._key_param.metadata_key_path, False)
+            if self._seed is not None:
+                metadata_enc_key = derive_metadata_key_from_seed(self._seed)
+            else:
+                metadata_enc_key = generate_aes256_key(self._key_param.metadata_key_path, False)
             res_dict["metadata_blob"] = metadata_enc_key
         return res_dict
 

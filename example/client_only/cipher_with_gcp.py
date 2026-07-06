@@ -19,6 +19,7 @@ Quick start (GCP + this example)
 
 import json
 import os
+import sys
 import time
 
 import numpy as np
@@ -27,7 +28,7 @@ from pyenvector.crypto import Cipher, KeyGenerator
 from pyenvector.utils import GCPClient, utils
 
 EVAL_MODE = "mm32"
-PRESET = "ip2"
+PRESET = "ip3"
 DIM = 512
 
 BUCKET_NAME = os.environ.get("EVI_GCP_BUCKET", "envector-key-storage")
@@ -74,7 +75,8 @@ def summarize_key_dict(key_dict):
 
 def main():
     if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") and not os.environ.get("GCP_OAUTH_TOKEN"):
-        raise ValueError("Set GOOGLE_APPLICATION_CREDENTIALS or GCP_OAUTH_TOKEN before running this example")
+        print("Skipping GCP example: set GOOGLE_APPLICATION_CREDENTIALS or GCP_OAUTH_TOKEN to run this example.")
+        sys.exit(0)
     if USE_AES_KEK and not os.path.isfile(KEK_PATH):
         raise FileNotFoundError(f"KEK file not found: {KEK_PATH}")
 

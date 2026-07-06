@@ -26,7 +26,7 @@ from . import common_message_pb2 as v2_dot_common_dot_common__message__pb2
 from . import type_pb2 as v2_dot_common_dot_type__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\'v2/common/index-operation-message.proto\x12\tcommon.v2\x1a\x1ev2/common/common-message.proto\x1a\x14v2/common/type.proto\"\xa9\x01\n\x1eGetIndexOperationStatusRequest\x12(\n\x06header\x18\x01 \x01(\x0b\x32\x18.common.v2.RequestHeader\x12\x12\n\nindex_name\x18\x02 \x01(\t\x12\x12\n\nrequest_id\x18\x03 \x01(\t\x12\x35\n\x0eoperation_type\x18\x04 \x01(\x0e\x32\x1d.common.v2.IndexOperationType\"\xbd\x02\n\x1fGetIndexOperationStatusResponse\x12)\n\x06header\x18\x01 \x01(\x0b\x32\x19.common.v2.ResponseHeader\x12\x12\n\nrequest_id\x18\x02 \x01(\t\x12\x35\n\x0eoperation_type\x18\x03 \x01(\x0e\x32\x1d.common.v2.IndexOperationType\x12\x17\n\x0ftotal_row_count\x18\x04 \x01(\x04\x12\x1c\n\x14searchable_row_count\x18\x05 \x01(\x04\x12\x0c\n\x04\x64one\x18\x06 \x01(\x08\x12\x1c\n\x0fsaved_row_count\x18\x07 \x01(\x04H\x00\x88\x01\x01\x12-\n\x05state\x18\x08 \x01(\x0e\x32\x1e.common.v2.IndexOperationStateB\x12\n\x10_saved_row_count*\xc1\x01\n\x13IndexOperationState\x12%\n!INDEX_OPERATION_STATE_UNSPECIFIED\x10\x00\x12\x11\n\rSPLIT_PENDING\x10\x01\x12\r\n\tSPLITTING\x10\x02\x12\x13\n\x0fSPLIT_COMPLETED\x10\x03\x12\x11\n\rMERGE_PENDING\x10\x04\x12\x0b\n\x07MERGING\x10\x05\x12\x10\n\x0cMERGED_SAVED\x10\x06\x12\x0e\n\nSEARCHABLE\x10\x07\x12\n\n\x06\x46\x41ILED\x10\x08\x42\x1aZ\x18services/proto/common/v2b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\'v2/common/index-operation-message.proto\x12\tcommon.v2\x1a\x1ev2/common/common-message.proto\x1a\x14v2/common/type.proto\"\xc1\x01\n\x1eGetIndexOperationStatusRequest\x12(\n\x06header\x18\x01 \x01(\x0b\x32\x18.common.v2.RequestHeader\x12\x12\n\nindex_name\x18\x02 \x01(\t\x12\x12\n\nrequest_id\x18\x03 \x01(\t\x12\x35\n\x0eoperation_type\x18\x04 \x01(\x0e\x32\x1d.common.v2.IndexOperationType\x12\x16\n\x0epartition_name\x18\x05 \x01(\t\"\xbd\x02\n\x1fGetIndexOperationStatusResponse\x12)\n\x06header\x18\x01 \x01(\x0b\x32\x19.common.v2.ResponseHeader\x12\x12\n\nrequest_id\x18\x02 \x01(\t\x12\x35\n\x0eoperation_type\x18\x03 \x01(\x0e\x32\x1d.common.v2.IndexOperationType\x12\x17\n\x0ftotal_row_count\x18\x04 \x01(\x04\x12\x1c\n\x14searchable_row_count\x18\x05 \x01(\x04\x12\x0c\n\x04\x64one\x18\x06 \x01(\x08\x12\x1c\n\x0fsaved_row_count\x18\x07 \x01(\x04H\x00\x88\x01\x01\x12-\n\x05state\x18\x08 \x01(\x0e\x32\x1e.common.v2.IndexOperationStateB\x12\n\x10_saved_row_count*\xc1\x01\n\x13IndexOperationState\x12%\n!INDEX_OPERATION_STATE_UNSPECIFIED\x10\x00\x12\x11\n\rSPLIT_PENDING\x10\x01\x12\r\n\tSPLITTING\x10\x02\x12\x13\n\x0fSPLIT_COMPLETED\x10\x03\x12\x11\n\rMERGE_PENDING\x10\x04\x12\x0b\n\x07MERGING\x10\x05\x12\x10\n\x0cMERGED_SAVED\x10\x06\x12\x0e\n\nSEARCHABLE\x10\x07\x12\n\n\x06\x46\x41ILED\x10\x08\x42\x1aZ\x18services/proto/common/v2b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,10 +34,10 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'v2.common.index_operation_m
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'Z\030services/proto/common/v2'
-  _globals['_INDEXOPERATIONSTATE']._serialized_start=601
-  _globals['_INDEXOPERATIONSTATE']._serialized_end=794
+  _globals['_INDEXOPERATIONSTATE']._serialized_start=625
+  _globals['_INDEXOPERATIONSTATE']._serialized_end=818
   _globals['_GETINDEXOPERATIONSTATUSREQUEST']._serialized_start=109
-  _globals['_GETINDEXOPERATIONSTATUSREQUEST']._serialized_end=278
-  _globals['_GETINDEXOPERATIONSTATUSRESPONSE']._serialized_start=281
-  _globals['_GETINDEXOPERATIONSTATUSRESPONSE']._serialized_end=598
+  _globals['_GETINDEXOPERATIONSTATUSREQUEST']._serialized_end=302
+  _globals['_GETINDEXOPERATIONSTATUSRESPONSE']._serialized_start=305
+  _globals['_GETINDEXOPERATIONSTATUSRESPONSE']._serialized_end=622
 # @@protoc_insertion_point(module_scope)

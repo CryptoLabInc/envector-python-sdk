@@ -43,59 +43,30 @@ qa
 tests
 
 # External crypto assets not needed when building Python bindings.
-# The wheel build only consumes external/evi/crypto (the cmake source-dir).
+# The wheel build only consumes external/evi-crypto (the cmake source-dir).
 
-# Drop everything in the evi meta-repo that lives outside crypto/
-external/evi/.git
-external/evi/.gitignore
-external/evi/.github
-external/evi/.clang-format
-external/evi/.clang-tidy
-external/evi/.dockerignore
-external/evi/.pre-commit-config.yaml
-external/evi/AGENTS.md
-external/evi/CLAUDE.md
-external/evi/CMakeLists.txt
-external/evi/CMakePresets.json
-external/evi/Doxyfile
-external/evi/LICENSE
-external/evi/README.md
-external/evi/benchmark
-external/evi/bindings
-external/evi/c_api
-external/evi/cmake
-external/evi/conda
-external/evi/cuda-mem.supp
-external/evi/docker
-external/evi/docs
-external/evi/examples
-external/evi/external
-external/evi/include
-external/evi/license-dependencies
-external/evi/pyproject.toml
-external/evi/src
-external/evi/test
-external/evi/tools
-
-# Inside crypto/, drop the same noise that was ignored under evi-crypto-private
-external/evi/crypto/.gitignore
-external/evi/crypto/.clang-format
-external/evi/crypto/.clang-tidy
-external/evi/crypto/.pre-commit-config.yaml
-external/evi/crypto/CMakePresets.json
-external/evi/crypto/Doxyfile
-external/evi/crypto/LICENSE
-external/evi/crypto/NOTICE
-external/evi/crypto/README.md
-external/evi/crypto/bench_encrypt_threads.py
-external/evi/crypto/pyproject.toml
-external/evi/crypto/c_api
-external/evi/crypto/docker
-external/evi/crypto/examples
-external/evi/crypto/scripts
-external/evi/crypto/test
-external/evi/crypto/tools
-external/evi/crypto/pybind/test
-external/evi/crypto/external/deb
-external/evi/crypto/external/nlohmann_json
-external/evi/crypto/external/perfetto
+# Drop dev/CI noise inside the evi-crypto submodule that the wheel build doesn't need.
+external/evi-crypto/.git
+external/evi-crypto/.gitignore
+external/evi-crypto/.github
+external/evi-crypto/.clang-format
+external/evi-crypto/.clang-tidy
+external/evi-crypto/.dockerignore
+external/evi-crypto/.pre-commit-config.yaml
+external/evi-crypto/CMakePresets.json
+external/evi-crypto/Doxyfile
+external/evi-crypto/LICENSE
+external/evi-crypto/NOTICE
+external/evi-crypto/README.md
+external/evi-crypto/bench_encrypt_threads.py
+external/evi-crypto/pyproject.toml
+external/evi-crypto/c_api
+external/evi-crypto/docker
+external/evi-crypto/examples
+external/evi-crypto/scripts
+external/evi-crypto/test
+external/evi-crypto/tools
+external/evi-crypto/pybind/test
+external/evi-crypto/external/deb
+external/evi-crypto/external/nlohmann_json
+external/evi-crypto/external/perfetto

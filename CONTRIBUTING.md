@@ -35,9 +35,6 @@ cd envector-python-sdk
 ```bash
 ./scripts/setup.sh --python 3.12
 
-# Optional cloud SDK backends
-./scripts/setup.sh --python 3.12 --aws --gcp
-
 # Verify
 pipenv run python -c "import pyenvector as ev; print(ev.__version__)"
 
@@ -46,6 +43,8 @@ pipenv shell
 ```
 
 All dependencies, submodules, and build steps are automated.
+The published wheel keeps AWS and GCP key-store backends optional via
+`pyenvector[aws]` and `pyenvector[gcp]`.
 
 ## Manual Step-by-Step Setup
 

@@ -175,91 +175,92 @@ def test_cipher_encrypt_query_compat():
 
 
 def test_cipher_encrypt_accepts_list_of_lists_format():
-    cipher = Cipher(dim=4, eval_mode="MM")
+    cipher = Cipher(dim=32, eval_mode="MM")
     result_block = MagicMock()
     result_block.enc_type = "multiple"
     cipher.encrypt_multiple = MagicMock(return_value=result_block)
 
-    data = [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]]
+    data = [[0.1 * i for i in range(32)], [0.2 * i for i in range(32)]]
     result = cipher.encrypt(data)
 
     assert result is result_block
-    called_vectors = cipher.encrypt_multiple.call_args.kwargs["vectors"]
+    called_vectors = cipher.encrypt_multiple.call_args.args[0]
     assert called_vectors == data
 
 
 def test_cipher_encrypt_accepts_2d_ndarray_format():
-    cipher = Cipher(dim=4, eval_mode="MM")
+    cipher = Cipher(dim=32, eval_mode="MM")
     result_block = MagicMock()
     result_block.enc_type = "multiple"
     cipher.encrypt_multiple = MagicMock(return_value=result_block)
 
-    data = np.array([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]], dtype=np.float32)
+    data = np.zeros((2, 32), dtype=np.float32)
     _ = cipher.encrypt(data)
 
-    called_vectors = cipher.encrypt_multiple.call_args.kwargs["vectors"]
+    called_vectors = cipher.encrypt_multiple.call_args.args[0]
     assert len(called_vectors) == 2
     assert isinstance(called_vectors[0], np.ndarray)
 
 
 def test_cipher_encrypt_accepts_list_of_ndarray_format():
-    cipher = Cipher(dim=4, eval_mode="MM")
+    cipher = Cipher(dim=32, eval_mode="MM")
     result_block = MagicMock()
     result_block.enc_type = "multiple"
     cipher.encrypt_multiple = MagicMock(return_value=result_block)
 
-    data = [np.array([0.1, 0.2, 0.3, 0.4]), np.array([0.5, 0.6, 0.7, 0.8])]
+    data = [np.zeros(32), np.zeros(32)]
     _ = cipher.encrypt(data)
 
-    called_vectors = cipher.encrypt_multiple.call_args.kwargs["vectors"]
+    called_vectors = cipher.encrypt_multiple.call_args.args[0]
     assert len(called_vectors) == 2
     assert isinstance(called_vectors[0], np.ndarray)
 
 
 def test_cipher_encrypt_single_vector_list_wrapped_and_marked_single():
-    cipher = Cipher(dim=4, eval_mode="MM")
+    cipher = Cipher(dim=32, eval_mode="MM")
     result_block = MagicMock()
     result_block.enc_type = "multiple"
     cipher.encrypt_multiple = MagicMock(return_value=result_block)
 
-    result = cipher.encrypt([0.1, 0.2, 0.3, 0.4])
+    vec = [0.1] * 32
+    result = cipher.encrypt(vec)
 
-    called_vectors = cipher.encrypt_multiple.call_args.kwargs["vectors"]
-    assert called_vectors == [[0.1, 0.2, 0.3, 0.4]]
+    called_vectors = cipher.encrypt_multiple.call_args.args[0]
+    assert called_vectors == [vec]
     assert result.enc_type == "single"
 
 
 def test_cipher_encrypt_query_rejects_batch_input():
-    cipher = Cipher(dim=4, eval_mode="MM")
+    cipher = Cipher(dim=32, eval_mode="MM")
 
     with pytest.raises(ValueError, match="expects a single vector"):
         cipher.encrypt([[0.1, 0.2, 0.3, 0.4]], encode_type="query")
 
 
 def test_cipher_encrypt_splits_large_batch_and_returns_cipherblock_list():
-    cipher = Cipher(dim=4, eval_mode="MM")
+    cipher = Cipher(dim=32, eval_mode="MM")
     block1 = MagicMock()
     block2 = MagicMock()
     block3 = MagicMock()
     cipher.encrypt_multiple = MagicMock(side_effect=[block1, block2, block3])
 
-    data = np.random.rand(10, 4).astype(np.float32)
+    data = np.random.rand(10, 32).astype(np.float32)
     result = cipher.encrypt(data, split_batch_size=4)
 
     assert result == [block1, block2, block3]
     assert cipher.encrypt_multiple.call_count == 3
-    chunk_sizes = [len(call.kwargs["vectors"]) for call in cipher.encrypt_multiple.call_args_list]
+    chunk_sizes = [len(call.args[0]) for call in cipher.encrypt_multiple.call_args_list]
     assert chunk_sizes == [4, 4, 2]
 
 
 def test_cipher_encrypt_splits_centroids_idx_along_chunks():
-    cipher = Cipher(dim=4, eval_mode="MM")
+    cipher = Cipher(dim=32, eval_mode="MM")
     block1 = MagicMock()
     block2 = MagicMock()
     block3 = MagicMock()
     cipher.encrypt_multiple = MagicMock(side_effect=[block1, block2, block3])
 
-    data = np.random.rand(10, 4).astype(np.float32)
+    data = np.random.rand(10, 32).astype(np.float32)
     centroids_idx = list(range(10))
     _ = cipher.encrypt(data, centroids_idx=centroids_idx, split_batch_size=4)
 
@@ -268,20 +269,20 @@ def test_cipher_encrypt_splits_centroids_idx_along_chunks():
 
 
 def test_cipher_encrypt_rejects_invalid_centroids_idx_length_for_batch():
-    cipher = Cipher(dim=4, eval_mode="MM")
-    data = np.random.rand(5, 4).astype(np.float32)
+    cipher = Cipher(dim=32, eval_mode="MM")
+    data = np.random.rand(5, 32).astype(np.float32)
 
     with pytest.raises(ValueError, match="centroids_idx length"):
         cipher.encrypt(data, centroids_idx=[0, 1], split_batch_size=4)
 
 
 def test_normalize_item_encrypt_input_rejects_mixed_type_flat_list():
-    cipher = Cipher(dim=3, eval_mode="MM")
+    cipher = Cipher(dim=32, eval_mode="MM")
     with pytest.raises(ValueError, match="must be numeric"):
         cipher._normalize_item_encrypt_input([0.1, "bad", 0.3])
 
 
 def test_normalize_item_encrypt_input_rejects_mixed_type_list_of_lists():
-    cipher = Cipher(dim=3, eval_mode="MM")
+    cipher = Cipher(dim=32, eval_mode="MM")
     with pytest.raises(ValueError, match="must be lists"):
         cipher._normalize_item_encrypt_input([[0.1, 0.2, 0.3], "not_a_list"])

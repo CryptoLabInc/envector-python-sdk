@@ -3,6 +3,7 @@
 import grpc
 import warnings
 
+from google.api import httpbody_pb2 as google_dot_api_dot_httpbody__pb2
 from . import audit_message_pb2 as v2_dot_audit_dot_audit__message__pb2
 
 GRPC_GENERATED_VERSION = '1.71.2'
@@ -45,7 +46,7 @@ class AuditServiceStub(object):
         self.export_events = channel.unary_stream(
                 '/audit.v2.AuditService/export_events',
                 request_serializer=v2_dot_audit_dot_audit__message__pb2.ExportEventsRequest.SerializeToString,
-                response_deserializer=v2_dot_audit_dot_audit__message__pb2.ExportEventsResponse.FromString,
+                response_deserializer=google_dot_api_dot_httpbody__pb2.HttpBody.FromString,
                 _registered_method=True)
 
 
@@ -63,9 +64,13 @@ class AuditServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def export_events(self, request, context):
-        """Streams exported audit events in the requested format.
-        The standalone skeleton wires JSON export first; other formats are
-        reserved for follow-up phases.
+        """Streams exported audit events as a single concatenated byte stream in the
+        requested format. The response is google.api.HttpBody so grpc-gateway
+        forwards each chunk's raw bytes to HTTP clients without base64 wrapping;
+        gRPC clients receive the same bytes via HttpBody.data. The standalone
+        skeleton emits JSON Lines first; other formats are reserved.
+        End-of-stream is signalled by the underlying transport closing the stream
+        (gRPC trailer / HTTP chunked transfer end).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -82,7 +87,7 @@ def add_AuditServiceServicer_to_server(servicer, server):
             'export_events': grpc.unary_stream_rpc_method_handler(
                     servicer.export_events,
                     request_deserializer=v2_dot_audit_dot_audit__message__pb2.ExportEventsRequest.FromString,
-                    response_serializer=v2_dot_audit_dot_audit__message__pb2.ExportEventsResponse.SerializeToString,
+                    response_serializer=google_dot_api_dot_httpbody__pb2.HttpBody.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -141,7 +146,7 @@ class AuditService(object):
             target,
             '/audit.v2.AuditService/export_events',
             v2_dot_audit_dot_audit__message__pb2.ExportEventsRequest.SerializeToString,
-            v2_dot_audit_dot_audit__message__pb2.ExportEventsResponse.FromString,
+            google_dot_api_dot_httpbody__pb2.HttpBody.FromString,
             options,
             channel_credentials,
             insecure,

@@ -37,11 +37,13 @@ def get_random_vector(dim: int, seed: int) -> List[float]:
 def main(args: argparse.Namespace) -> None:
     address = f"{args.host}:{args.port}"
 
-    if args.reset:
-        ev.init_connect(address=address)
-        ev.reset()
+    ev.init(address=address, key_path="./keys", key_id=args.key_id, eval_mode=args.eval_mode, preset=args.preset)
 
-    ev.init(address=address, key_path="./keys", key_id="test-key", eval_mode=args.eval_mode)
+    if args.reset:
+        if args.index_name in ev.get_index_list():
+            ev.drop_index(args.index_name)
+        if args.key_id in ev.get_key_list():
+            ev.unload_key(args.key_id)
 
     index = ev.create_index(args.index_name, args.dim)
 
@@ -92,7 +94,8 @@ def main(args: argparse.Namespace) -> None:
     ), f"Expected metadata '{metadata[0]}', got '{output[0][0]['metadata']}'"
 
     if not args.skip_cleanup:
-        ev.reset()
+        ev.drop_index(args.index_name)
+        ev.unload_key(args.key_id)
 
 
 if __name__ == "__main__":
@@ -101,10 +104,16 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=50050, help="Port for enVector connection")
     parser.add_argument("--dim", type=int, default=512, help="Dimension of the vectors")
     parser.add_argument("--num-vectors", type=int, default=10, help="Number of vectors to insert")
-    parser.add_argument("--index-name", type=str, default="index_op_status_test", help="Index name")
+    parser.add_argument("--index-name", type=str, default="op_status_idx", help="Index name")
     parser.add_argument(
-        "--eval-mode", type=str, default="mm32", help="Evaluation mode for enVector ('rmp', 'mm32')", choices=["rmp", "mm32"]
+        "--eval-mode",
+        type=str,
+        default="mm32",
+        help="Evaluation mode for enVector ('rmp', 'mm32')",
+        choices=["rmp", "mm32"],
     )
+    parser.add_argument("--key-id", type=str, default="test-key-mm32-ip3", help="Key ID")
+    parser.add_argument("--preset", type=str, default="ip3", help="Parameter preset")
     parser.add_argument("--timeout-s", type=float, default=60.0, help="Timeout (seconds) for done polling")
     parser.add_argument("--poll-interval-s", type=float, default=1.0, help="Polling interval (seconds)")
     parser.add_argument("--reset", action="store_true", default=False, help="Reset server before running")

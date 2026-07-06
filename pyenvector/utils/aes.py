@@ -137,6 +137,26 @@ def _get_random_bytes(size: int) -> bytes:
     return secrets.token_bytes(size)
 
 
+def derive_metadata_key_from_seed(seed: bytes) -> bytes:
+    """Derive a deterministic 32-byte AES-256 metadata key from a 64-byte seed.
+
+    Uses HKDF-SHA256 with info=b"envector-metadata-key" so that the same seed
+    produces the same metadata key in both the SDK and the KMS.
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    if len(seed) != 64:
+        raise ValueError(f"seed must be exactly 64 bytes, got {len(seed)}")
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"metadatakey",
+        info=b"envector-metadata-key",
+    )
+    return hkdf.derive(seed)
+
+
 def generate_aes256_key(path: str, save: bool) -> bytes:
     """
     Generates a 32-byte random key (AES-256) and saves it to a file.
@@ -276,14 +296,17 @@ def unseal_metadata_enc_key(
     return metadata_enc_key
 
 
-def _to_bytes(metadata: Union[dict, list, str, bytes]) -> bytes:
-    """Convert metadata to bytes for encryption."""
+def _to_str(metadata: Union[dict, list, str, bytes]) -> str:
+    """Convert metadata to a JSON string for encryption."""
     if isinstance(metadata, (dict, list)):
-        return json.dumps(metadata, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return json.dumps(metadata, separators=(",", ":"), ensure_ascii=False)
     if isinstance(metadata, str):
-        return metadata.encode("utf-8")
+        return metadata
     if isinstance(metadata, (bytes, bytearray)):
-        return bytes(metadata)
+        try:
+            return bytes(metadata).decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise ValueError("bytes metadata must be valid UTF-8 for EVI envelope format") from e
     raise TypeError(f"Unsupported metadata type: {type(metadata)}")
 
 
@@ -327,6 +350,16 @@ def _resolve_metadata_key(
     return key_bytes
 
 
+def resolve_metadata_key(
+    key_source: Union[str, bytes, bytearray, None],
+    kek: Optional[Union[bytes, str]] = None,
+) -> bytes:
+    """Public entry point so callers can resolve the key once and pass the bytes
+    to encrypt_metadata/decrypt_metadata, avoiding a per-item file read +
+    KeyManager unwrap on every metadata value in an insert/search batch."""
+    return _resolve_metadata_key(key_source, kek)
+
+
 def encrypt_metadata(
     metadata: Union[dict, list, str, bytes],
     key_path: Union[str, bytes, bytearray, None],
@@ -335,30 +368,33 @@ def encrypt_metadata(
     kek: Optional[Union[bytes, str]] = None,
 ) -> str:
     """
-    Encrypts metadata using AES-GCM and returns a Base64 string.
+    Encrypts metadata as an EVI AES-256-GCM JSON envelope and returns Base64.
 
     Args:
         metadata: Metadata to encrypt. Can be dict, list, str, or bytes.
-                 (Will be converted to JSON string if dict/list, or to string if str/bytes.)
+                 (Will be converted to JSON string if dict/list, or to UTF-8 string if str/bytes.)
         key_path: Path to the encryption key file (can be sealed or unsealed)
         aad: Additional authenticated data (optional)
         kek: Key Encryption Key for unsealing the metadata key (bytes or path to KEK file, optional)
 
     Returns:
-        str: Base64-encoded encrypted metadata string
+        str: Base64-encoded JSON envelope containing iv, tag, and encrypted_data.
 
     Note:
         The Go backend expects metadata to be stored as string type in the database.
         This function ensures compatibility by converting all input types to string format.
+        Bytes metadata must be valid UTF-8 for the EVI envelope format.
         If kek is provided, the function will unseal the key at key_path before use.
     """
     # Load the metadata encryption key (accepts file path or raw key bytes)
     key = _resolve_metadata_key(key_path, kek)
 
-    # Encrypt using AES-256-GCM
-    pt = _to_bytes(metadata)
-    token = AESHelper.encrypt_aes_gcm(key, pt, aad)
-    return base64.b64encode(token).decode("ascii")
+    # Emit the EVI AES-256-GCM JSON envelope so SDK-produced metadata matches
+    # KMS EncryptMetadata. Metadata encrypted by older seed-based SDK builds is
+    # not KMS-compatible and is intentionally not supported by KMS.
+    pt_str = _to_str(metadata)
+    encrypted_json = evi.utils.encrypt_metadata(pt_str, key, aad)
+    return base64.b64encode(encrypted_json.encode("utf-8")).decode("ascii")
 
 
 def decrypt_metadata(
@@ -369,10 +405,10 @@ def decrypt_metadata(
     kek: Optional[Union[bytes, str]] = None,
 ) -> Union[dict, list, str, bytes]:
     """
-    Decrypts a Base64 string using AES-GCM.
+    Decrypts Base64-encoded metadata.
 
     Args:
-        token_b64: Base64-encoded encrypted metadata string
+        token_b64: Base64-encoded EVI JSON envelope, or legacy binary GCM/CTR metadata.
         key_path: Path to the decryption key file (can be sealed or unsealed)
         aad: Additional authenticated data (optional)
         kek: Key Encryption Key for unsealing the metadata key (bytes or path to KEK file, optional)
@@ -386,13 +422,35 @@ def decrypt_metadata(
         This function attempts to restore the original metadata format.
         The Go backend stores metadata as string, so this function handles
         the conversion back to the appropriate Python type.
+        EVI JSON envelopes contain iv, tag, and encrypted_data fields.
+        Non-envelope payloads fall back to legacy binary AES-GCM and, when no
+        AAD is supplied, legacy AES-CTR.
         If kek is provided, the function will unseal the key at key_path before use.
     """
     # Load the metadata encryption key (accepts file path or raw key bytes)
     key = _resolve_metadata_key(key_path, kek)
 
-    # Decode and decrypt (GCM first, CTR fallback for legacy data)
     raw = base64.b64decode(token_b64)
+
+    # Try EVI JSON envelope format (compatible with KMS DecryptMetadata)
+    encrypted_json = None
+    try:
+        candidate = raw.decode("utf-8").strip()
+        if candidate.startswith("{") and candidate.endswith("}"):
+            parsed = json.loads(candidate)
+            if {"iv", "tag", "encrypted_data"} <= parsed.keys():
+                encrypted_json = candidate
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pass
+
+    if encrypted_json is not None:
+        pt_str = evi.utils.decrypt_metadata(encrypted_json, key, aad)
+        try:
+            return json.loads(pt_str)
+        except Exception:
+            return pt_str
+
+    # Fallback: legacy binary GCM format
     if aad is not None:
         # AAD was provided — GCM only, never fall back to CTR (B-3)
         pt = AESHelper.decrypt_aes_gcm(key, raw, aad)
@@ -408,7 +466,6 @@ def decrypt_metadata(
             )
             pt = AESHelper.decrypt_aes_ctr(key, raw)
 
-    # Try to decode as UTF-8 and parse as JSON if possible
     try:
         text = pt.decode("utf-8")
         try:

@@ -1,6 +1,12 @@
+import evi
 import pytest
 
 from pyenvector.crypto.parameter import ContextParameter, IndexParameter, KeyParameter
+
+_EVI_HAS_IP3 = hasattr(evi.ParameterPreset, "IP3")
+_skip_unless_ip3 = pytest.mark.skipif(
+    not _EVI_HAS_IP3, reason="evi extension built without IP3 preset"
+)
 
 
 @pytest.mark.parametrize(
@@ -8,8 +14,19 @@ from pyenvector.crypto.parameter import ContextParameter, IndexParameter, KeyPar
     [
         ("IP1", 32, "MM", "CPU", "IP1", "IP"),
         ("IP1", 64, "MM", "CPU", "IP1", "IP"),
-        ("IP2", 32, "MM", "CPU", "IP1", "IP"),  # MM forces IP1 regardless of requested preset
-        ("IP2", 64, "MM", "CPU", "IP1", "IP"),  # MM forces IP1 regardless of requested preset
+        # Explicit user preset is honored (no silent coercion). IP2 + MM is a
+        # valid combo after the u64 demotion (companion to evi PR #698): IP2
+        # was demoted from the u32 path to the u64 MM/MMS path.
+        ("IP2", 32, "MM", "CPU", "IP2", "IP"),
+        ("IP2", 64, "MM", "CPU", "IP2", "IP"),
+        # preset=None lets the eval_mode default kick in. After the u64
+        # demotion mm32/mms32 default to ip3 (was ip2). These require an evi
+        # extension built with IP3.
+        pytest.param(None, 32, "MM32", "CPU", "IP3", "IP", marks=_skip_unless_ip3),
+        pytest.param(None, 32, "MMS32", "CPU", "IP3", "IP", marks=_skip_unless_ip3),
+        (None, 32, "MM", "CPU", "IP1", "IP"),
+        pytest.param("IP3", 32, "MM32", "CPU", "IP3", "IP", marks=_skip_unless_ip3),
+        pytest.param("IP3", 64, "MMS32", "CPU", "IP3", "IP", marks=_skip_unless_ip3),
         ("QF0", 128, "MM", "GPU", "QF0", "QF"),
         ("IP1", 64, "MM", "GPU", "IP1", "IP"),
     ],

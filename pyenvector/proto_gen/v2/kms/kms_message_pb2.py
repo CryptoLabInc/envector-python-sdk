@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from ..common import type_pb2 as v2_dot_common_dot_type__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18v2/kms/kms-message.proto\x12\x06kms.v2\x1a\x14v2/common/type.proto\"\x9e\x01\n\x10KeyVersionRecord\x12\x0f\n\x07version\x18\x01 \x01(\r\x12\x1f\n\x05state\x18\x02 \x01(\x0e\x32\x10.kms.v2.KeyState\x12!\n\x08key_type\x18\x03 \x01(\x0e\x32\x0f.kms.v2.KeyType\x12\x12\n\ncreated_at\x18\x04 \x01(\t\x12\x12\n\nupdated_at\x18\x05 \x01(\t\x12\r\n\x05\x61\x63tor\x18\x06 \x01(\t\"^\n\nTopKResult\x12\x13\n\x07item_id\x18\x01 \x01(\tB\x02\x18\x01\x12\r\n\x05score\x18\x02 \x01(\x02\x12,\n\x0cmetadata_idx\x18\x03 \x01(\x0b\x32\x16.common.v2.MetadataIdx*\x84\x01\n\x07KeyType\x12\x18\n\x14KEY_TYPE_UNSPECIFIED\x10\x00\x12\x17\n\x13KEY_TYPE_SECRET_KEY\x10\x01\x12\x14\n\x10KEY_TYPE_ENC_KEY\x10\x02\x12\x15\n\x11KEY_TYPE_EVAL_KEY\x10\x03\x12\x19\n\x15KEY_TYPE_METADATA_KEY\x10\x04*\x86\x01\n\x08KeyState\x12\x19\n\x15KEY_STATE_UNSPECIFIED\x10\x00\x12\x17\n\x13KEY_STATE_PREPARING\x10\x01\x12\x14\n\x10KEY_STATE_ACTIVE\x10\x02\x12\x17\n\x13KEY_STATE_SUSPENDED\x10\x03\x12\x17\n\x13KEY_STATE_DESTROYED\x10\x04*\x7f\n\x0cKeyGenStatus\x12\x1e\n\x1aKEY_GEN_STATUS_UNSPECIFIED\x10\x00\x12\x1a\n\x16KEY_GEN_STATUS_PENDING\x10\x01\x12\x18\n\x14KEY_GEN_STATUS_READY\x10\x02\x12\x19\n\x15KEY_GEN_STATUS_FAILED\x10\x03\x42\x17Z\x15services/proto/kms/v2b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18v2/kms/kms-message.proto\x12\x06kms.v2\x1a\x14v2/common/type.proto\"\x9e\x01\n\x10KeyVersionRecord\x12\x0f\n\x07version\x18\x01 \x01(\r\x12\x1f\n\x05state\x18\x02 \x01(\x0e\x32\x10.kms.v2.KeyState\x12!\n\x08key_type\x18\x03 \x01(\x0e\x32\x0f.kms.v2.KeyType\x12\x12\n\ncreated_at\x18\x04 \x01(\t\x12\x12\n\nupdated_at\x18\x05 \x01(\t\x12\r\n\x05\x61\x63tor\x18\x06 \x01(\t\"^\n\nTopKResult\x12\x13\n\x07item_id\x18\x01 \x01(\tB\x02\x18\x01\x12\r\n\x05score\x18\x02 \x01(\x02\x12,\n\x0cmetadata_idx\x18\x03 \x01(\x0b\x32\x16.common.v2.MetadataIdx*\x84\x01\n\x07KeyType\x12\x18\n\x14KEY_TYPE_UNSPECIFIED\x10\x00\x12\x17\n\x13KEY_TYPE_SECRET_KEY\x10\x01\x12\x14\n\x10KEY_TYPE_ENC_KEY\x10\x02\x12\x15\n\x11KEY_TYPE_EVAL_KEY\x10\x03\x12\x19\n\x15KEY_TYPE_METADATA_KEY\x10\x04*\x9e\x01\n\x08KeyState\x12\x19\n\x15KEY_STATE_UNSPECIFIED\x10\x00\x12\x17\n\x13KEY_STATE_PREPARING\x10\x01\x12\x14\n\x10KEY_STATE_ACTIVE\x10\x02\x12\x17\n\x13KEY_STATE_SUSPENDED\x10\x03\x12\x17\n\x13KEY_STATE_DESTROYED\x10\x04\x12\x16\n\x12KEY_STATE_ROTATING\x10\x05*\x7f\n\x0cKeyGenStatus\x12\x1e\n\x1aKEY_GEN_STATUS_UNSPECIFIED\x10\x00\x12\x1a\n\x16KEY_GEN_STATUS_PENDING\x10\x01\x12\x18\n\x14KEY_GEN_STATUS_READY\x10\x02\x12\x19\n\x15KEY_GEN_STATUS_FAILED\x10\x03\x42\x17Z\x15services/proto/kms/v2b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -38,9 +38,9 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_KEYTYPE']._serialized_start=316
   _globals['_KEYTYPE']._serialized_end=448
   _globals['_KEYSTATE']._serialized_start=451
-  _globals['_KEYSTATE']._serialized_end=585
-  _globals['_KEYGENSTATUS']._serialized_start=587
-  _globals['_KEYGENSTATUS']._serialized_end=714
+  _globals['_KEYSTATE']._serialized_end=609
+  _globals['_KEYGENSTATUS']._serialized_start=611
+  _globals['_KEYGENSTATUS']._serialized_end=738
   _globals['_KEYVERSIONRECORD']._serialized_start=59
   _globals['_KEYVERSIONRECORD']._serialized_end=217
   _globals['_TOPKRESULT']._serialized_start=219

@@ -1,6 +1,7 @@
 """Tests for AES-GCM / AES-CTR encryption utilities (GAP-001)."""
 
 import base64
+import json
 import secrets
 import warnings
 
@@ -10,6 +11,7 @@ from cryptography.exceptions import InvalidTag
 from pyenvector.utils.aes import (
     AESHelper,
     decrypt_metadata,
+    derive_metadata_key_from_seed,
     encrypt_metadata,
     seal_metadata_enc_key,
     unseal_metadata_enc_key,
@@ -132,10 +134,49 @@ class TestSealUnseal:
 
 
 class TestEncryptDecryptMetadata:
-    def test_gcm_round_trip(self):
+    def test_evi_envelope_round_trip(self):
         key = secrets.token_bytes(32)
         original = {"name": "test", "value": 42}
         token = encrypt_metadata(original, key)
+        envelope = json.loads(base64.b64decode(token).decode("utf-8"))
+        assert sorted(envelope) == ["encrypted_data", "iv", "tag"]
+        result = decrypt_metadata(token, key)
+        assert result == original
+
+    def test_evi_envelope_uses_evi_decrypt_not_legacy_fallback(self, monkeypatch):
+        key = secrets.token_bytes(32)
+        original = {"name": "test", "value": 42}
+        token = encrypt_metadata(original, key)
+
+        def fail_legacy_gcm(*args, **kwargs):
+            raise AssertionError("legacy GCM fallback should not be used for EVI metadata envelope")
+
+        monkeypatch.setattr(AESHelper, "decrypt_aes_gcm", fail_legacy_gcm)
+        assert decrypt_metadata(token, key) == original
+
+    def test_evi_envelope_decrypt_failure_does_not_fall_back_to_legacy(self, monkeypatch):
+        key = secrets.token_bytes(32)
+        wrong_key = secrets.token_bytes(32)
+        token = encrypt_metadata({"name": "test"}, key)
+
+        def fail_legacy_gcm(*args, **kwargs):
+            raise AssertionError("legacy GCM fallback should not be used for EVI metadata envelope")
+
+        monkeypatch.setattr(AESHelper, "decrypt_aes_gcm", fail_legacy_gcm)
+        with pytest.raises((InvalidTag, RuntimeError)):
+            decrypt_metadata(token, wrong_key)
+
+    def test_encrypt_bytes_requires_valid_utf8(self):
+        key = secrets.token_bytes(32)
+        with pytest.raises(ValueError, match="valid UTF-8"):
+            encrypt_metadata(b"\xff", key)
+
+    def test_decrypt_legacy_gcm_round_trip(self):
+        key = secrets.token_bytes(32)
+        original = {"name": "test", "value": 42}
+        plaintext = json.dumps(original, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        legacy = AESHelper.encrypt_aes_gcm(key, plaintext)
+        token = base64.b64encode(legacy).decode("ascii")
         result = decrypt_metadata(token, key)
         assert result == original
 
@@ -170,6 +211,37 @@ class TestEncryptDecryptMetadata:
         # Decrypting with aad should fail (GCM only), not silently fall back
         with pytest.raises(Exception):
             decrypt_metadata(token_b64, key, aad=b"some-aad")
+
+
+# ---------------------------------------------------------------------------
+# derive_metadata_key_from_seed
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveMetadataKeyFromSeed:
+    # Known test vector: HKDF-SHA256(IKM=\x00*64, salt="metadatakey", info="envector-metadata-key")
+    _ZERO_SEED = bytes(64)
+    _EXPECTED_KEY = bytes.fromhex("8f4e0734d229e41e7f54c1dda91a3b6b83d43e1ba96f78ed49e4336276a1afbe")
+
+    def test_known_test_vector(self):
+        assert derive_metadata_key_from_seed(self._ZERO_SEED) == self._EXPECTED_KEY
+
+    def test_output_length(self):
+        key = derive_metadata_key_from_seed(self._ZERO_SEED)
+        assert len(key) == 32
+
+    def test_deterministic(self):
+        seed = secrets.token_bytes(64)
+        assert derive_metadata_key_from_seed(seed) == derive_metadata_key_from_seed(seed)
+
+    def test_different_seeds_produce_different_keys(self):
+        seed_a = bytes(64)
+        seed_b = bytes([1] * 64)
+        assert derive_metadata_key_from_seed(seed_a) != derive_metadata_key_from_seed(seed_b)
+
+    def test_wrong_seed_length_raises(self):
+        with pytest.raises(ValueError, match="64 bytes"):
+            derive_metadata_key_from_seed(bytes(32))
 
 
 # ---------------------------------------------------------------------------

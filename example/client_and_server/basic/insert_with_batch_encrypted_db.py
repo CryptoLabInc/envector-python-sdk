@@ -22,21 +22,21 @@ def get_random_vector(dim, seed=None):
     return vec
 
 
-def main():
+def main(args):
     # Key Path
     key_path = "./keys"
-    key_id = "test-key"
+    key_id = args.key_id
 
     # Connect to endpoint of enVector
     ENVECTOR_ADDRESS = f"{args.host}:{args.port}"
-    ev.init(address=ENVECTOR_ADDRESS, key_path=key_path, key_id=key_id)
+    ev.init(address=ENVECTOR_ADDRESS, key_path=key_path, key_id=key_id, eval_mode=args.eval_mode, preset=args.preset)
     if ev.is_connected():
         print("Connected to Indexer.")
     else:
         print("Failed to connect to Indexer.")
         return
 
-    index_name = "test_index"
+    index_name = "basic_ins_batch_idx"
     index = ev.create_index(index_name, DIM)
 
     # Generate random vector with seed
@@ -62,12 +62,16 @@ def main():
 
     assert abs(results[0][0]["score"] - 1) < 0.001, "Search score should be close to 1"
 
-    ev.reset()
+    ev.drop_index(index_name)
+    ev.unload_key(args.key_id)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="enVector API Example")
     parser.add_argument("--host", type=str, default="localhost", help="Host for enVector connection")
     parser.add_argument("--port", type=int, default=50050, help="Port for enVector connection")
+    parser.add_argument("--key-id", type=str, default="test-key-mm32-ip3", help="Key ID")
+    parser.add_argument("--eval-mode", type=str, choices=["mm", "mms", "mm32", "mms32"], default="mm32", help="Evaluation mode")
+    parser.add_argument("--preset", type=str, default="ip3", help="Parameter preset")
     args = parser.parse_args()
-    main()
+    main(args)

@@ -87,6 +87,21 @@ class EndpointServiceStub(object):
                 request_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.CloneIndexRequest.SerializeToString,
                 response_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.CloneIndexResponse.FromString,
                 _registered_method=True)
+        self.create_partition = channel.unary_unary(
+                '/endpoint.v2.EndpointService/create_partition',
+                request_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.CreatePartitionRequest.SerializeToString,
+                response_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.CreatePartitionResponse.FromString,
+                _registered_method=True)
+        self.drop_partition = channel.unary_unary(
+                '/endpoint.v2.EndpointService/drop_partition',
+                request_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.DropPartitionRequest.SerializeToString,
+                response_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.DropPartitionResponse.FromString,
+                _registered_method=True)
+        self.list_partitions = channel.unary_unary(
+                '/endpoint.v2.EndpointService/list_partitions',
+                request_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.ListPartitionsRequest.SerializeToString,
+                response_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.ListPartitionsResponse.FromString,
+                _registered_method=True)
         self.register_key = channel.stream_unary(
                 '/endpoint.v2.EndpointService/register_key',
                 request_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.RegisterKeyRequest.SerializeToString,
@@ -156,6 +171,11 @@ class EndpointServiceStub(object):
                 '/endpoint.v2.EndpointService/get_metadata',
                 request_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.GetMetadataRequest.SerializeToString,
                 response_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.GetMetadataResponse.FromString,
+                _registered_method=True)
+        self.update_metadata = channel.unary_unary(
+                '/endpoint.v2.EndpointService/update_metadata',
+                request_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.UpdateMetadataRequest.SerializeToString,
+                response_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.UpdateMetadataResponse.FromString,
                 _registered_method=True)
         self.export_system = channel.unary_stream(
                 '/endpoint.v2.EndpointService/export_system',
@@ -258,6 +278,25 @@ class EndpointServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def create_partition(self, request, context):
+        """Partition-related (named partitions within an index).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def drop_partition(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def list_partitions(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def register_key(self, request_iterator, context):
         """Key-related
         """
@@ -344,6 +383,12 @@ class EndpointServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def update_metadata(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def export_system(self, request, context):
         """Backup / Restore (Phase 1 — system scope, multi-part bundle, admin-only).
 
@@ -351,7 +396,8 @@ class EndpointServiceServicer(object):
         body; client typically pipes into `tar -xz -C ./bundle-{ts}/`.
         Returns stream<google.api.HttpBody> so grpc-gateway forwards raw tar
         bytes without JSON/base64 wrapping. bundle_root_sha256 + bundle_version
-        travel inside the bundle (manifest.json, the first tar entry); the
+        travel inside the bundle (manifest.json, the last tar entry — written
+        after all parts so the catalog can include their sha256 chain); the
         client computes total bytes locally.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -471,6 +517,21 @@ def add_EndpointServiceServicer_to_server(servicer, server):
                     request_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.CloneIndexRequest.FromString,
                     response_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.CloneIndexResponse.SerializeToString,
             ),
+            'create_partition': grpc.unary_unary_rpc_method_handler(
+                    servicer.create_partition,
+                    request_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.CreatePartitionRequest.FromString,
+                    response_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.CreatePartitionResponse.SerializeToString,
+            ),
+            'drop_partition': grpc.unary_unary_rpc_method_handler(
+                    servicer.drop_partition,
+                    request_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.DropPartitionRequest.FromString,
+                    response_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.DropPartitionResponse.SerializeToString,
+            ),
+            'list_partitions': grpc.unary_unary_rpc_method_handler(
+                    servicer.list_partitions,
+                    request_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.ListPartitionsRequest.FromString,
+                    response_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.ListPartitionsResponse.SerializeToString,
+            ),
             'register_key': grpc.stream_unary_rpc_method_handler(
                     servicer.register_key,
                     request_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.RegisterKeyRequest.FromString,
@@ -540,6 +601,11 @@ def add_EndpointServiceServicer_to_server(servicer, server):
                     servicer.get_metadata,
                     request_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.GetMetadataRequest.FromString,
                     response_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.GetMetadataResponse.SerializeToString,
+            ),
+            'update_metadata': grpc.unary_unary_rpc_method_handler(
+                    servicer.update_metadata,
+                    request_deserializer=v2_dot_endpoint_dot_endpoint__message__pb2.UpdateMetadataRequest.FromString,
+                    response_serializer=v2_dot_endpoint_dot_endpoint__message__pb2.UpdateMetadataResponse.SerializeToString,
             ),
             'export_system': grpc.unary_stream_rpc_method_handler(
                     servicer.export_system,
@@ -847,6 +913,87 @@ class EndpointService(object):
             '/endpoint.v2.EndpointService/clone_index',
             v2_dot_endpoint_dot_endpoint__message__pb2.CloneIndexRequest.SerializeToString,
             v2_dot_endpoint_dot_endpoint__message__pb2.CloneIndexResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def create_partition(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/endpoint.v2.EndpointService/create_partition',
+            v2_dot_endpoint_dot_endpoint__message__pb2.CreatePartitionRequest.SerializeToString,
+            v2_dot_endpoint_dot_endpoint__message__pb2.CreatePartitionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def drop_partition(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/endpoint.v2.EndpointService/drop_partition',
+            v2_dot_endpoint_dot_endpoint__message__pb2.DropPartitionRequest.SerializeToString,
+            v2_dot_endpoint_dot_endpoint__message__pb2.DropPartitionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def list_partitions(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/endpoint.v2.EndpointService/list_partitions',
+            v2_dot_endpoint_dot_endpoint__message__pb2.ListPartitionsRequest.SerializeToString,
+            v2_dot_endpoint_dot_endpoint__message__pb2.ListPartitionsResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1225,6 +1372,33 @@ class EndpointService(object):
             '/endpoint.v2.EndpointService/get_metadata',
             v2_dot_endpoint_dot_endpoint__message__pb2.GetMetadataRequest.SerializeToString,
             v2_dot_endpoint_dot_endpoint__message__pb2.GetMetadataResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def update_metadata(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/endpoint.v2.EndpointService/update_metadata',
+            v2_dot_endpoint_dot_endpoint__message__pb2.UpdateMetadataRequest.SerializeToString,
+            v2_dot_endpoint_dot_endpoint__message__pb2.UpdateMetadataResponse.FromString,
             options,
             channel_credentials,
             insecure,

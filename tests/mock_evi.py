@@ -8,6 +8,8 @@ import types
 from enum import Enum
 from typing import Any
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 
 def _b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
@@ -18,9 +20,35 @@ def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(padded)
 
 
+def _encrypt_metadata(metadata: str, key: bytes, aad: bytes | None = None) -> str:
+    nonce = secrets.token_bytes(12)
+    sealed = AESGCM(bytes(key)).encrypt(nonce, metadata.encode("utf-8"), aad)
+    ciphertext, tag = sealed[:-16], sealed[-16:]
+    return json.dumps(
+        {
+            "encrypted_data": base64.b64encode(ciphertext).decode("ascii"),
+            "iv": base64.b64encode(nonce).decode("ascii"),
+            "tag": base64.b64encode(tag).decode("ascii"),
+        },
+        separators=(",", ":"),
+    )
+
+
+def _decrypt_metadata(encrypted_json: str, key: bytes, aad: bytes | None = None) -> str:
+    envelope = json.loads(encrypted_json)
+    nonce = base64.b64decode(envelope["iv"])
+    ciphertext = base64.b64decode(envelope["encrypted_data"])
+    tag = base64.b64decode(envelope["tag"])
+    return AESGCM(bytes(key)).decrypt(nonce, ciphertext + tag, aad).decode("utf-8")
+
+
 class ParameterPreset(Enum):
     IP1 = "IP1"
+    # IP2 stays a valid preset; it was demoted from the u32 path to the u64
+    # MM/MMS path (companion to evi PR #698). IP3 is the u32 mm32/mms32
+    # preset and must be present so eval-mode defaulting can resolve it.
     IP2 = "IP2"
+    IP3 = "IP3"
     QF0 = "QF0"
 
 
@@ -81,6 +109,12 @@ class Query:
             return json.dumps(payload).encode("utf-8")
         except TypeError:
             return b"mock-query"
+
+    @staticmethod
+    def serializeToTruncated(query: "Query") -> bytes:
+        # Mock: b-part truncation is a wire-size optimization; the mock payload
+        # has no b-part tail, so it serializes identically to serializeTo.
+        return Query.serializeTo(query)
 
 
 class Ciphertext:
@@ -305,7 +339,11 @@ def install_mock_evi() -> types.ModuleType:
     module.GcpConfig = GcpConfig
     module.VaultConfig = VaultConfig
     module.KeyStorageConfig = KeyStorageConfig
-    module.utils = types.SimpleNamespace(get_random_bytes=lambda size: secrets.token_bytes(size))
+    module.utils = types.SimpleNamespace(
+        get_random_bytes=lambda size: secrets.token_bytes(size),
+        encrypt_metadata=_encrypt_metadata,
+        decrypt_metadata=_decrypt_metadata,
+    )
     module.__dict__["_IS_PYTEST_MOCK"] = True
     sys.modules["evi"] = module
     return module

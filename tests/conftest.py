@@ -61,7 +61,7 @@ def setup_and_cleanup_keys():
     from pyenvector.crypto.key_manager import KeyGenerator
 
     shutil.rmtree("./temp/", ignore_errors=True)
-    keygen = KeyGenerator(key_path="./temp/keys/none", seal_mode=None, eval_mode="MM")
+    keygen = KeyGenerator(key_path="./temp/keys/none", seal_mode=None, preset="ip1", eval_mode="MM")
     keygen.generate_keys()
     kek = os.urandom(32)
     with open("./temp/keys/aes.kek", "wb") as f:
@@ -70,6 +70,7 @@ def setup_and_cleanup_keys():
         key_path="./temp/keys/aes",
         seal_mode="aes",
         seal_kek_path="./temp/keys/aes.kek",
+        preset="ip1",
         eval_mode="MM",
     )
     keygen.generate_keys()

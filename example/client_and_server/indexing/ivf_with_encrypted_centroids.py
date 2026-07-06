@@ -32,7 +32,9 @@ def main(args):
     ev.init(
         address=envector_address,
         key_path="./keys",
-        key_id="test-key",
+        key_id=args.key_id,
+        eval_mode=args.eval_mode,
+        preset=args.preset,
     )
 
     dim = args.dim
@@ -48,23 +50,24 @@ def main(args):
     centroids = [c for c in kmeans.cluster_centers_]
     centroids_idx = kmeans.predict(np.stack(vectors)).tolist()
 
-    index_params = {"index_type": "IVF_FLAT", "nlist": nlist, "centroids": centroids, "default_nprobe": 1}
-    index_name = "ivf_encrypted"
+    index_params = {"index_type": "IVF_VCT", "nlist": nlist, "centroids": centroids, "default_nprobe": 1}
+    index_name = "idx_ivf_enc_cent"
     index = ev.create_index(index_name, dim, index_params=index_params)
     print(f"Index created: {index_name}")
 
     # Encrypt item vectors with centroid assignments embedded in CipherBlock.
-    encrypted_block = index.cipher.encrypt_multiple(vectors, centroids_idx=centroids_idx)
+    encrypted_block = index.cipher.encrypt(vectors, centroids_idx=centroids_idx)
 
     # Insert pre-encrypted data into IVF index.
-    index.insert([encrypted_block], metadata=metadata)
+    index.insert(encrypted_block, metadata=metadata)
     print(f"Inserted {num_data} encrypted vectors with centroids_idx.")
 
     query = vectors[0].tolist()
     result = ev.Index(index_name).search(query, top_k=2, output_fields=["metadata"])[0]
     print("Search result:", result)
 
-    ev.reset()
+    ev.drop_index(index_name)
+    ev.unload_key(args.key_id)
 
 
 if __name__ == "__main__":
@@ -74,5 +77,8 @@ if __name__ == "__main__":
     parser.add_argument("--nlist", type=int, default=8)
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=50050)
+    parser.add_argument("--key-id", type=str, default="test-key-mm32-ip3")
+    parser.add_argument("--eval-mode", type=str, choices=["mm", "mms", "mm32", "mms32"], default="mm32")
+    parser.add_argument("--preset", type=str, default="ip3")
     args = parser.parse_args()
     main(args)

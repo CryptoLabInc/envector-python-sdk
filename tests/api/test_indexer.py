@@ -15,6 +15,7 @@ from pyenvector.errors import (
 )
 from pyenvector.proto_gen.v2.common import index_operation_message_pb2 as envector_op_pb2
 from pyenvector.proto_gen.v2.common import type_pb2 as envector_type_pb
+from pyenvector.proto_gen.v2.endpoint import endpoint_message_pb2 as envector_msg_pb2
 
 
 class FakeRpcError(grpc.RpcError):
@@ -81,7 +82,7 @@ def test_indexer_access_token_provider_failure_raises_validation_error(mock_stub
         _ = indexer.grpc_metadata
 
 
-@patch("pyenvector.api.grpc.urllib_request.urlopen")
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
 @patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
 def test_indexer_refresh_access_token_updates_metadata(mock_stub, mock_urlopen, mock_connection):
     refresh_response = MagicMock()
@@ -113,7 +114,7 @@ def test_indexer_rejects_callable_access_token_with_refresh_token(mock_stub, moc
         )
 
 
-@patch("pyenvector.api.grpc.urllib_request.urlopen")
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
 def test_auth_session_concurrent_refresh_coalesces_to_single_post(mock_urlopen):
     call_count = {"n": 0}
     inside_urlopen = threading.Event()
@@ -162,7 +163,7 @@ def test_auth_session_concurrent_refresh_coalesces_to_single_post(mock_urlopen):
 
 @patch.dict("os.environ", {"ES2_GRPC_HEALTH_CHECK": "0"})
 @patch("pyenvector.api.grpc.Connection")
-@patch("pyenvector.api.grpc.urllib_request.urlopen")
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
 @patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
 def test_connect_bootstrap_propagates_rotated_refresh_token(
     mock_stub, mock_urlopen, mock_connection_cls
@@ -291,6 +292,8 @@ def test_get_index_summary(mock_stub, mock_connection):
     mock_response.index_summary.remaining_insertable_shards = 3
     mock_response.index_summary.remaining_insertable_vectors_guaranteed = 1200
     mock_response.index_summary.remaining_insertable_vectors_best_effort = 1800
+    mock_response.index_summary.nlist = 64
+    mock_response.index_summary.default_nprobe = 8
 
     indexer = Indexer(mock_connection)
     indexer.stub.get_index_summary = MagicMock(return_value=mock_response)
@@ -317,6 +320,8 @@ def test_get_index_summary(mock_stub, mock_connection):
         "remaining_insertable_shards": 3,
         "remaining_insertable_vectors_guaranteed": 1200,
         "remaining_insertable_vectors_best_effort": 1800,
+        "nlist": 64,
+        "default_nprobe": 8,
     }
 
     indexer.stub.get_index_summary.assert_called_once()
@@ -406,7 +411,7 @@ def test_get_index_operation_status_uses_latest_provider_token(mock_stub, mock_c
     ]
 
 
-@patch("pyenvector.api.grpc.urllib_request.urlopen")
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
 @patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
 def test_get_index_operation_status_refreshes_after_unauthenticated(mock_stub, mock_urlopen, mock_connection):
     refresh_response = MagicMock()
@@ -442,7 +447,7 @@ def test_get_index_operation_status_refreshes_after_unauthenticated(mock_stub, m
     assert second_call.kwargs["metadata"] == [("authorization", "Bearer refreshed-token")]
 
 
-@patch("pyenvector.api.grpc.urllib_request.urlopen")
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
 @patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
 def test_get_index_operation_status_raises_when_unauth_persists_after_refresh(
     mock_stub, mock_urlopen, mock_connection
@@ -474,7 +479,7 @@ def test_get_index_operation_status_raises_when_unauth_persists_after_refresh(
     assert indexer.stub.get_index_operation_status.call_count == 2
 
 
-@patch("pyenvector.api.grpc.urllib_request.urlopen")
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
 @patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
 def test_unary_with_refresh_chains_refresh_failure_to_original_rpc_error(
     mock_stub, mock_urlopen, mock_connection
@@ -501,6 +506,191 @@ def test_unary_with_refresh_chains_refresh_failure_to_original_rpc_error(
 
     assert excinfo.value.__cause__ is rpc_err
     assert indexer.stub.get_index_operation_status.call_count == 1
+
+
+def _make_indexer_with_refresh(mock_connection):
+    return Indexer(
+        mock_connection,
+        access_token="expired-token",
+        refresh_token="refresh-token",
+        token_endpoint="https://issuer/token",
+        client_id="envector-cli",
+    )
+
+
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
+@patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
+def test_insert_data_bulk_refreshes_after_unauthenticated(mock_stub, mock_urlopen, mock_connection):
+    # Regression guard: the client-streaming persist_batch path must refresh and
+    # retry on UNAUTHENTICATED just like the unary RPCs, instead of surfacing
+    # "Token has expired" mid-bulk-insert.
+    refresh_response = MagicMock()
+    refresh_response.read.return_value = b'{"access_token":"refreshed-token","refresh_token":"refreshed-refresh"}'
+    mock_urlopen.return_value.__enter__.return_value = refresh_response
+
+    ok = envector_msg_pb2.BatchInsertDataResponse()
+    ok.header.return_code = envector_type_pb.ReturnCode.Success
+    ok.header.id = "split-req-1"
+    ok.item_ids.extend([1, 2])
+
+    indexer = _make_indexer_with_refresh(mock_connection)
+
+    # Materialize each request stream the way the server would, so we can assert
+    # the retry replays a fresh stream (cluster ids re-sent) after the refresh.
+    captured = []
+
+    def fake_persist_batch(request_iter, metadata=None):
+        captured.append({"requests": list(request_iter), "metadata": metadata})
+        if len(captured) == 1:
+            raise FakeRpcError(grpc.StatusCode.UNAUTHENTICATED)
+        return ok
+
+    indexer.stub.persist_batch = MagicMock(side_effect=fake_persist_batch)
+
+    out_request_id = []
+    with patch("pyenvector.api.grpc.evi.Query.serializeTo", return_value=b"payload"):
+        item_ids = indexer.insert_data_bulk(
+            index_name="idx",
+            enc_vec=[MagicMock()],
+            numitems=[2],
+            centroid_idx=[7],
+            out_request_id=out_request_id,
+        )
+
+    assert item_ids == [1, 2]
+    assert out_request_id == ["split-req-1"]
+    assert indexer.stub.persist_batch.call_count == 2
+    assert captured[0]["metadata"] == [("authorization", "Bearer expired-token")]
+    assert captured[1]["metadata"] == [("authorization", "Bearer refreshed-token")]
+    # The retry must replay a fresh request stream that still carries the cluster
+    # ids — the per-stream `cluster_ids_sent` flag must reset on each attempt.
+    assert list(captured[0]["requests"][0].cluster_ids) == [7]
+    assert list(captured[1]["requests"][0].cluster_ids) == [7]
+
+
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
+@patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
+def test_insert_data_bulk_raises_when_unauth_persists_after_refresh(mock_stub, mock_urlopen, mock_connection):
+    refresh_response = MagicMock()
+    refresh_response.read.return_value = b'{"access_token":"refreshed-token","refresh_token":"refreshed-refresh"}'
+    mock_urlopen.return_value.__enter__.return_value = refresh_response
+
+    indexer = _make_indexer_with_refresh(mock_connection)
+    indexer.stub.persist_batch = MagicMock(
+        side_effect=[
+            FakeRpcError(grpc.StatusCode.UNAUTHENTICATED),
+            FakeRpcError(grpc.StatusCode.UNAUTHENTICATED),
+        ]
+    )
+
+    with patch("pyenvector.api.grpc.evi.Query.serializeTo", return_value=b"payload"):
+        with pytest.raises(EnvectorTransportError):
+            indexer.insert_data_bulk(index_name="idx", enc_vec=[MagicMock()], numitems=[1])
+
+    assert indexer.stub.persist_batch.call_count == 2
+
+
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
+@patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
+def test_insert_data_rows_batch_refreshes_after_unauthenticated(mock_stub, mock_urlopen, mock_connection):
+    refresh_response = MagicMock()
+    refresh_response.read.return_value = b'{"access_token":"refreshed-token","refresh_token":"refreshed-refresh"}'
+    mock_urlopen.return_value.__enter__.return_value = refresh_response
+
+    ok = envector_msg_pb2.InsertDataResponse()
+    ok.header.return_code = envector_type_pb.ReturnCode.Success
+    ok.header.id = "split-req-2"
+    ok.item_ids.extend([9])
+
+    indexer = _make_indexer_with_refresh(mock_connection)
+    indexer.stub.persist_rows = MagicMock(side_effect=[FakeRpcError(grpc.StatusCode.UNAUTHENTICATED), ok])
+
+    item_ids = indexer.insert_data_rows_batch(
+        index_name="idx",
+        enc_vecs=[b"\x00" * 16],
+        metadata_list=["m0"],
+        cluster_ids=[3],
+    )
+
+    assert item_ids == [9]
+    assert indexer.stub.persist_rows.call_count == 2
+    second_call = indexer.stub.persist_rows.call_args_list[1]
+    assert second_call.kwargs["metadata"] == [("authorization", "Bearer refreshed-token")]
+
+
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
+@patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
+def test_async_persist_data_bulk_refreshes_after_unauthenticated(mock_stub, mock_urlopen, mock_connection):
+    # async_persist_data_bulk has its own request generator and an extra
+    # _check_insertable precondition, so it needs coverage independent of
+    # insert_data_bulk to guard the duplicated cluster-id replay path.
+    refresh_response = MagicMock()
+    refresh_response.read.return_value = b'{"access_token":"refreshed-token","refresh_token":"refreshed-refresh"}'
+    mock_urlopen.return_value.__enter__.return_value = refresh_response
+
+    ok = envector_msg_pb2.BatchInsertDataResponse()
+    ok.header.return_code = envector_type_pb.ReturnCode.Success
+    ok.header.id = "split-req-3"
+    ok.item_ids.extend([4, 5])
+
+    indexer = _make_indexer_with_refresh(mock_connection)
+    indexer.get_index_summary = MagicMock(return_value={"remaining_insertable_shards": 4})
+
+    captured = []
+
+    def fake_persist_batch(request_iter, metadata=None):
+        captured.append({"requests": list(request_iter), "metadata": metadata})
+        if len(captured) == 1:
+            raise FakeRpcError(grpc.StatusCode.UNAUTHENTICATED)
+        return ok
+
+    indexer.stub.persist_batch = MagicMock(side_effect=fake_persist_batch)
+
+    with patch("pyenvector.api.grpc.evi.Query.serializeTo", return_value=b"payload"):
+        item_ids = indexer.async_persist_data_bulk(
+            index_name="idx",
+            enc_vec=[MagicMock()],
+            numitems=[2],
+            centroid_idx=[7],
+        )
+
+    assert item_ids == [4, 5]
+    assert indexer.stub.persist_batch.call_count == 2
+    assert captured[0]["metadata"] == [("authorization", "Bearer expired-token")]
+    assert captured[1]["metadata"] == [("authorization", "Bearer refreshed-token")]
+    # The replayed stream must re-send the cluster ids after the refresh.
+    assert list(captured[0]["requests"][0].cluster_ids) == [7]
+    assert list(captured[1]["requests"][0].cluster_ids) == [7]
+
+
+@patch("pyenvector.api.auth_session.urllib_request.urlopen")
+@patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
+def test_async_persist_data_rows_batch_refreshes_after_unauthenticated(mock_stub, mock_urlopen, mock_connection):
+    # async_persist_data_rows_batch is a separate generator path from
+    # insert_data_rows_batch and needs its own refresh-retry coverage.
+    refresh_response = MagicMock()
+    refresh_response.read.return_value = b'{"access_token":"refreshed-token","refresh_token":"refreshed-refresh"}'
+    mock_urlopen.return_value.__enter__.return_value = refresh_response
+
+    ok = envector_msg_pb2.InsertDataResponse()
+    ok.header.return_code = envector_type_pb.ReturnCode.Success
+    ok.header.id = "split-req-4"
+    ok.item_ids.extend([8])
+
+    indexer = _make_indexer_with_refresh(mock_connection)
+    indexer.stub.persist_rows = MagicMock(side_effect=[FakeRpcError(grpc.StatusCode.UNAUTHENTICATED), ok])
+
+    item_ids = indexer.async_persist_data_rows_batch(
+        index_name="idx",
+        enc_vecs=[b"\x00" * 16],
+        metadata_list=["m0"],
+        cluster_ids=[3],
+    )
+
+    assert item_ids == [8]
+    assert indexer.stub.persist_rows.call_count == 2
+    second_call = indexer.stub.persist_rows.call_args_list[1]
+    assert second_call.kwargs["metadata"] == [("authorization", "Bearer refreshed-token")]
 
 
 @patch("pyenvector.api.grpc.time.sleep", autospec=True)
@@ -900,6 +1090,42 @@ def test_async_merge_by_request_ids_returns_merge_request_id(mock_stub, mock_con
     assert req.header.type == envector_type_pb.MessageType.MergeByRequestIds
     assert req.index_name == "idx"
     assert list(req.request_ids) == ["split-1", "split-2"]
+
+
+@patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
+def test_async_merge_by_request_ids_allows_empty_request_ids(mock_stub, mock_connection):
+    indexer = Indexer(mock_connection)
+    merge_request_id = "merge-req-empty"
+
+    response = MagicMock()
+    response.header.return_code = envector_type_pb.ReturnCode.Success
+    response.header.id = merge_request_id
+    indexer.stub.merge_by_request_ids = MagicMock(return_value=response)
+
+    out = indexer.async_merge_by_request_ids("idx", [])
+
+    assert out == merge_request_id
+    req = indexer.stub.merge_by_request_ids.call_args[0][0]
+    assert req.index_name == "idx"
+    assert list(req.request_ids) == []
+
+
+@patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub")
+def test_async_merge_by_request_ids_allows_none_request_ids(mock_stub, mock_connection):
+    indexer = Indexer(mock_connection)
+    merge_request_id = "merge-req-none"
+
+    response = MagicMock()
+    response.header.return_code = envector_type_pb.ReturnCode.Success
+    response.header.id = merge_request_id
+    indexer.stub.merge_by_request_ids = MagicMock(return_value=response)
+
+    out = indexer.async_merge_by_request_ids("idx")
+
+    assert out == merge_request_id
+    req = indexer.stub.merge_by_request_ids.call_args[0][0]
+    assert req.index_name == "idx"
+    assert list(req.request_ids) == []
 
 
 ###################################

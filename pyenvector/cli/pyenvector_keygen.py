@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pyenvector
 from pyenvector.crypto import KeyManager
+from pyenvector.utils.utils import validate_preset_evalmode
 
 
 def ensure_dir_empty(path_str: str) -> None:
@@ -57,6 +58,28 @@ def ensure_kek_loaded(args, parser):
     return "aes", kek_bytes
 
 
+def load_seed(args, parser) -> bytes | None:
+    if args.seed and args.seed_file:
+        parser.error("--seed and --seed-file are mutually exclusive.")
+    if args.seed:
+        try:
+            seed = bytes.fromhex(args.seed)
+        except ValueError:
+            parser.error("--seed must be a valid hex string (128 hex characters = 64 bytes).")
+        if len(seed) != 64:
+            parser.error(f"--seed must be exactly 64 bytes (128 hex chars), got {len(seed)} bytes.")
+        return seed
+    if args.seed_file:
+        with open(args.seed_file, "rb") as f:
+            seed = f.read(65)
+        if len(seed) < 64:
+            parser.error(f"--seed-file must contain at least 64 bytes, got {len(seed)}.")
+        if len(seed) > 64:
+            print("[WARN] Seed file longer than 64 bytes; only the first 64 bytes will be used.", file=sys.stderr)
+        return seed[:64]
+    return None
+
+
 def _create_key_generator(
     key_path,
     key_id,
@@ -66,6 +89,7 @@ def _create_key_generator(
     seal_kek,
     eval_mode,
     metadata_encryption,
+    seed=None,
 ):
     metadata_flag = metadata_encryption if isinstance(metadata_encryption, bool) else metadata_encryption == "true"
     return pyenvector.KeyGenerator(
@@ -77,10 +101,11 @@ def _create_key_generator(
         seal_kek_path=seal_kek,
         eval_mode=eval_mode,
         metadata_encryption=metadata_flag,
+        seed=seed,
     )
 
 
-def generate_key(dim_list, outdir, seal_mode, seal_kek, preset, eval_mode, metadata_encryption, key_id):
+def generate_key(dim_list, outdir, seal_mode, seal_kek, preset, eval_mode, metadata_encryption, key_id, seed=None):
     keygen = _create_key_generator(
         key_path=outdir,
         key_id=key_id,
@@ -90,6 +115,7 @@ def generate_key(dim_list, outdir, seal_mode, seal_kek, preset, eval_mode, metad
         seal_kek=seal_kek,
         eval_mode=eval_mode,
         metadata_encryption=metadata_encryption,
+        seed=seed,
     )
 
     print("Generating key...")
@@ -100,9 +126,11 @@ def generate_key(dim_list, outdir, seal_mode, seal_kek, preset, eval_mode, metad
     print(f"  Preset: {preset}")
     print(f"  Seal Mode: {seal_mode}")
     print(f"  Path: {outdir}")
+    if seed is not None:
+        print("  Seed: (provided, deterministic)")
 
 
-def generate_key_stream(dim_list, key_path, preset, eval_mode, metadata_encryption, key_id):
+def generate_key_stream(dim_list, key_path, preset, eval_mode, metadata_encryption, key_id, seed=None):
     keygen = _create_key_generator(
         key_path=key_path,
         key_id=key_id,
@@ -112,6 +140,7 @@ def generate_key_stream(dim_list, key_path, preset, eval_mode, metadata_encrypti
         seal_kek=None,
         eval_mode=eval_mode,
         metadata_encryption=metadata_encryption,
+        seed=seed,
     )
     print("Generating key stream...")
     key_dict = keygen.generate_keys_stream()
@@ -187,9 +216,9 @@ def main():
     parser.add_argument(
         "--preset",
         type=str,
-        default="ip1",
-        choices=["ip1"],
-        help="Parameter preset for the key (default: 'ip1')",
+        default="ip3",
+        choices=["ip1", "ip2", "ip3"],
+        help="Parameter preset for the key (default: 'ip3'; ip1/ip2 require mm/mms (u64), ip3 requires mm32/mms32 (u32))",
     )
     parser.add_argument(
         "--eval-mode",
@@ -197,8 +226,8 @@ def main():
         dest="eval_mode",
         type=str,
         default="mm32",
-        choices=["mm", "mms"],
-        help="Evaluation mode for the key (default: 'mm')",
+        choices=["mm", "mms", "mm32", "mms32"],
+        help="Evaluation mode for the key (default: 'mm32')",
     )
     parser.add_argument(
         "--metadata-encryption",
@@ -254,8 +283,32 @@ def main():
         default="",
         help="Secret prefix when --key-store aws or gcp is specified.",
     )
+    parser.add_argument(
+        "--seed",
+        dest="seed",
+        type=str,
+        default=None,
+        help=(
+            "128-character hex string (64 bytes) for deterministic key generation. "
+            "The same seed always produces the same key material."
+        ),
+    )
+    parser.add_argument(
+        "--seed-file",
+        "--seed_file",
+        dest="seed_file",
+        type=str,
+        default=None,
+        help="Path to a binary file containing exactly 64 bytes used as seed for deterministic key generation.",
+    )
 
     args = parser.parse_args()
+
+    try:
+        validate_preset_evalmode(args.preset, args.eval_mode)
+    except ValueError as e:
+        parser.error(str(e))
+
     outdir = args.key_path + "/" + args.key_id if args.key_id else args.key_path
 
     use_remote = args.key_store in {"aws", "gcp"}
@@ -273,6 +326,8 @@ def main():
     else:
         ensure_dir_empty(outdir)
 
+    seed = load_seed(args, parser)
+
     if use_remote:
         key_dict = generate_key_stream(
             args.dim,
@@ -281,6 +336,7 @@ def main():
             args.eval_mode,
             args.metadata_encryption,
             args.key_id,
+            seed=seed,
         )
         if args.key_store == "aws":
             upload_keys_to_aws(key_dict, args.key_id, args.region_name, args.bucket_name, args.secret_prefix)
@@ -297,6 +353,7 @@ def main():
             args.eval_mode,
             args.metadata_encryption,
             args.key_id,
+            seed=seed,
         )
 
 

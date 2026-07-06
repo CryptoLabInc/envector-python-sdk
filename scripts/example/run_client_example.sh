@@ -1,88 +1,22 @@
 #!/bin/bash
 
-# Run only the examples under example/client_only
-
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-EXAMPLE_DIR="$ROOT_DIR/example/client_only"
-KEYS_DIR="$ROOT_DIR/keys"
+source "$SCRIPT_DIR/lib/example_runner.sh"
 
-SKIP_FILES=("cipher*.py")
+EXAMPLE_DIRS=(
+    "client_only"
+)
 
-should_skip() {
-    local rel_path="$1"
-    local pattern
-    for pattern in "${SKIP_FILES[@]-}"; do
-        case "$rel_path" in
-            $pattern) return 0 ;;
-        esac
-    done
-    return 1
-}
+parse_common_args "$@"
+KEY_ID="${KEY_ID:-${EVAL_MODE}-${PRESET}}"
+install_example_deps
+ensure_aes_kek
 
-# Resolve Python interpreter (prefer python, fallback to python3)
-PYTHON_BIN=${PYTHON_BIN:-python}
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    PYTHON_BIN=python3
-fi
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    echo "No Python interpreter found (python or python3)."
-    exit 127
-fi
+run_python_examples_in_dirs "${EXAMPLE_DIRS[@]}" -- \
+    --key-id "$KEY_ID" \
+    --eval-mode "$EVAL_MODE" \
+    --preset "$PRESET"
 
-# Ensure a default AES KEK exists for AES-sealed examples
-AES_KEK_PATH="$ROOT_DIR/aes.kek"
-if [[ ! -f "$AES_KEK_PATH" ]]; then
-    echo "01234567890123456789012345678901" > "$AES_KEK_PATH"
-fi
-
-# Start fresh for tests by removing any existing example keys.
-if [[ -d "$KEYS_DIR" ]]; then
-    rm -rf "$KEYS_DIR"
-fi
-
-# Parse arguments (accept --port for compatibility with other example runners)
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --port)
-            if [[ "$#" -lt 2 ]]; then
-                echo "Missing value for --port"
-                exit 1
-            fi
-            shift 2
-            ;;
-        *)
-            echo "Unknown option: $1"
-            exit 1
-            ;;
-    esac
-done
-
-# Find all Python files in client_only, excluding utils.py
-python_files=$(find "$EXAMPLE_DIR" -name "*.py" ! -name "utils.py" | sort)
-
-if [[ -z "$python_files" ]]; then
-    echo "No example files found in $EXAMPLE_DIR"
-    exit 0
-fi
-
-# Execute each Python example
-for py_file in $python_files; do
-    relative_path="${py_file#$EXAMPLE_DIR/}"
-    if should_skip "$relative_path"; then
-        echo "Skipping client_only/$relative_path..."
-        continue
-    fi
-    echo "Running client_only/$relative_path..."
-    PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}" "$PYTHON_BIN" "$py_file"
-    status=$?
-    if [ $status -ne 0 ]; then
-        echo "Error running client_only/$relative_path (exit $status)"
-        exit $status
-    fi
-    echo
-done
-
-echo "All client_only examples completed successfully."
+echo "Client-only examples completed successfully."

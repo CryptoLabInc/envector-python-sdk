@@ -6,7 +6,6 @@ import numpy as np
 from pyenvector.crypto import Cipher, KeyGenerator
 from pyenvector.utils import utils
 
-PRESET = "ip1"  # Preset for the context
 DIM = 512  # Dimension for the context
 
 
@@ -25,12 +24,11 @@ def get_random_vector(dim, seed=None):
     return vec
 
 
-def _run_example(eval_mode: str):
+def _run_example(eval_mode: str, key_id: str, preset: str):
     # Key Path
     key_path = "./keys"
-    key_id = f"test-key-seal-{eval_mode.lower()}"
-    key_dir = f"{key_path}/{key_id}"
     seal_mode = "aes"
+    key_dir = f"{key_path}/{key_id}-{seal_mode}"
     seal_kek_path = "./aes.kek"
 
     # Skip key generation if keys already exist
@@ -38,7 +36,7 @@ def _run_example(eval_mode: str):
         print(f"Keys already exist in {key_dir}. Skipping key generation.")
     else:
         # Generate keys
-        keygen = KeyGenerator(key_dir, seal_mode=seal_mode, seal_kek_path=seal_kek_path, eval_mode=eval_mode)
+        keygen = KeyGenerator(key_dir, seal_mode=seal_mode, seal_kek_path=seal_kek_path, eval_mode=eval_mode, preset=preset)
         keygen.generate_keys()
 
     # Generate random vector
@@ -51,7 +49,7 @@ def _run_example(eval_mode: str):
     sec_key_path = key_dir + "/SecKey.json"
     cipher = Cipher(
         dim=DIM,
-        preset=PRESET,
+        preset=preset,
         eval_mode=eval_mode,
         seal_mode=seal_mode,
         seal_kek_path=seal_kek_path,
@@ -80,6 +78,8 @@ def _run_example(eval_mode: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="enVector Encryption/Decryption Example")
-    parser.add_argument("--eval_mode", type=str, choices=["mm32"], default="mm32", help="Evaluation mode (MM32)")
+    parser.add_argument("--eval_mode", "--eval-mode", dest="eval_mode", type=str, choices=["mm", "mms", "mm32", "mms32"], default="mm32", help="Evaluation mode")
+    parser.add_argument("--key-id", type=str, default="test-key-seal-mm32-ip3", help="Key ID")
+    parser.add_argument("--preset", type=str, default="ip3", help="Parameter preset")
     args = parser.parse_args()
-    _run_example(args.eval_mode)
+    _run_example(args.eval_mode, args.key_id, args.preset)

@@ -18,19 +18,19 @@ Examples:
   # Python 3.12 + manylinux_2_28 only
   CIBW_BUILD='cp312-*' \
   CIBW_MANYLINUX_POLICIES='manylinux_2_28' \
-  WHEEL_VERSION=1.4.3 \
+  WHEEL_VERSION=1.4.0a5 \
   ./scripts/build_wheel_by_os.sh
 
   # Python 3.10 + manylinux2014 only
   CIBW_BUILD='cp310-*' \
   CIBW_MANYLINUX_POLICIES='manylinux2014' \
-  WHEEL_VERSION=1.4.3 \
+  WHEEL_VERSION=1.4.0a5 \
   ./scripts/build_wheel_by_os.sh
 
   # Python 3.11 + both Linux policies
   CIBW_BUILD='cp311-*' \
   CIBW_MANYLINUX_POLICIES='manylinux_2_28 manylinux2014' \
-  WHEEL_VERSION=1.4.3 \
+  WHEEL_VERSION=1.4.0a5 \
   ./scripts/build_wheel_by_os.sh
 EOF
 }
@@ -92,6 +92,16 @@ rm -rf "$TOML_FILE.bak"
 
 if [[ "$PLATFORM" == "Darwin" && "$BUILD_ARM" == "0" ]]; then
     echo "[INFO] Building macOS wheels..."
+    # Configure git to clone private GitHub repos (e.g. deb-private) via
+    # tokenized HTTPS, since CMake FetchContent uses SSH URLs but the runner
+    # may not have an SSH key / known_hosts entry for github.com.
+    if [[ -n "${GITHUB_TOKEN:-}" ]] && command -v git >/dev/null 2>&1; then
+      git config --global --unset-all url."https://oauth2:${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
+      git config --global --add url."https://oauth2:${GITHUB_TOKEN}@github.com/".insteadOf https://github.com/
+      git config --global --add url."https://oauth2:${GITHUB_TOKEN}@github.com/".insteadOf git@github.com:
+    else
+      echo "[WARN] GITHUB_TOKEN not set or git missing; private deps may fail to clone." >&2
+    fi
     rm -rf dist
     echo "[INFO] Running build_all_combinations_mac.sh"
     ./scripts/build_all_combinations_mac.sh

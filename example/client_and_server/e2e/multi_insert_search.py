@@ -24,6 +24,7 @@ from typing import List
 import numpy as np
 
 import pyenvector as ev
+from pyenvector.utils.utils import resolve_preset
 
 BASE_VECTOR_SEED = 42
 
@@ -67,21 +68,16 @@ def search_and_validate(index, query_vector, expected_metadata, top_k=1):
 def main(args: argparse.Namespace) -> None:
     address = f"{args.host}:{args.port}"
 
-    if args.reset:
-        ev.init_connect(address=address)
-        ev.reset()
-
-    mode_to_preset = {
-        "mm": "ip1",
-        "mms": "ip1",
-        "mm32": "ip2",
-        "mms32": "ip2",
-    }
-    preset = mode_to_preset[args.eval_mode]
-    key_id = f"test-key-{args.eval_mode}-{preset}"
+    preset = resolve_preset(args.preset, args.eval_mode)
+    key_id = args.key_id or f"test-key-{args.eval_mode}-{preset}"
 
     ev.init(address=address, key_path="./keys", key_id=key_id, eval_mode=args.eval_mode, preset=preset)
     print("enVector initialized.")
+    if args.reset:
+        if args.index_name in ev.get_index_list():
+            ev.drop_index(args.index_name)
+        if key_id in ev.get_key_list():
+            ev.unload_key(key_id)
 
     index = ev.create_index(args.index_name, args.dim)
     print(f"Index '{args.index_name}' created (dim={args.dim}).")
@@ -162,12 +158,20 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=50050, help="Port for enVector connection")
     parser.add_argument("--dim", type=int, default=512, help="Dimension of the vectors")
     parser.add_argument("--num-vectors", type=int, default=10, help="Number of vectors per insert batch")
-    parser.add_argument("--index-name", type=str, default="multi_insert_test", help="Index name")
+    parser.add_argument("--index-name", type=str, default="multi_insert_idx", help="Index name")
     parser.add_argument(
         "--eval-mode", type=str, default="mm32", help="Evaluation mode for enVector ('mm', 'mms', 'mm32', 'mms32')", choices=["mm", "mms", "mm32", "mms32"]
     )
+    parser.add_argument("--key-id", type=str, default=None, help="Name of the key to use")
     parser.add_argument("--timeout-s", type=float, default=60.0, help="Timeout (seconds) for done polling")
     parser.add_argument("--poll-interval-s", type=float, default=1.0, help="Polling interval (seconds)")
     parser.add_argument("--reset", action="store_true", default=False, help="Reset server before running")
     parser.add_argument("--skip-cleanup", action="store_true", default=False, help="Do not reset server after running")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=["ip1", "ip2", "ip3"],
+        default=None,
+        help="Parameter preset. Default: ip1 for mm/mms, ip3 for mm32/mms32.",
+    )
     main(parser.parse_args())

@@ -287,6 +287,36 @@ class TestToApplicationError:
         assert err.request_id == "req-42"
 
 
+class TestNonFatalWarningHandling:
+    @pytest.fixture
+    def indexer(self):
+        with patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub"):
+            from pyenvector.api.grpc import Indexer
+
+            mock_conn = MagicMock()
+            mock_conn.is_connected.return_value = True
+            mock_conn.server_address = "localhost:50050"
+            return Indexer(mock_conn)
+
+    def test_warning_response_does_not_raise_and_logs_warning(self, indexer):
+        from pyenvector.proto_gen.v2.common import type_pb2 as envector_type_pb
+
+        header = MagicMock()
+        header.return_code = envector_type_pb.ReturnCode.Warning
+        header.error_message = "index already warm"
+        header.id = "req-warning"
+
+        response = MagicMock()
+        response.header = header
+
+        indexer.stub.load_index = MagicMock(return_value=response)
+        with patch("pyenvector.api.grpc.logger.warning") as mock_warning:
+            indexer.load_index("test_index")
+
+        mock_warning.assert_called_once()
+        assert "index already warm" in mock_warning.call_args.args[2]
+
+
 # ---------------------------------------------------------------------------
 # _normalize_transport_error() mapping from gRPC status codes
 # ---------------------------------------------------------------------------
@@ -362,3 +392,145 @@ class TestNormalizeTransportError:
         err = self._make_rpc_error(grpc.StatusCode.UNAVAILABLE)
         result = indexer._normalize_transport_error(err, "search", request_id="req-xyz")
         assert result.request_id == "req-xyz"
+
+
+# ---------------------------------------------------------------------------
+# Log message renders without a custom formatter (no reliance on extra={})
+# ---------------------------------------------------------------------------
+
+
+class TestErrorLogMessageRendersFully:
+    """The ERROR log line must include the actionable fields in the message body itself,
+    so the default stdlib formatter (which only renders %(message)s) still surfaces them.
+    Previously these fields lived only in extra={}, which is silently dropped by default."""
+
+    @pytest.fixture
+    def indexer(self):
+        with patch("pyenvector.api.grpc.envector_grpc.EndpointServiceStub"):
+            from pyenvector.api.grpc import Indexer
+
+            mock_conn = MagicMock()
+            mock_conn.is_connected.return_value = True
+            mock_conn.server_address = "localhost:50050"
+            return Indexer(mock_conn)
+
+    def _capture_pyenvector_log(self, caplog):
+        # The SDK uses stdlib logging.getLogger("pyenvector"); caplog needs to attach there.
+        import logging
+
+        caplog.set_level(logging.ERROR, logger="pyenvector")
+        return caplog
+
+    def test_application_error_log_contains_error_message_and_ids(self, indexer, caplog):
+        from pyenvector.proto_gen.v2.common import type_pb2 as envector_type_pb
+
+        self._capture_pyenvector_log(caplog)
+
+        header = MagicMock()
+        header.return_code = envector_type_pb.ReturnCode.NoSuchIndex
+        header.error_message = "shard not loaded for uplus_20260511060525"
+        header.id = "req-app-1"
+        header.retryable = False
+        header.action = None
+
+        indexer._to_application_error(header, "get metadata")
+
+        # The rendered message (post-% formatting) must include the actionable bits.
+        records = [r for r in caplog.records if r.name == "pyenvector"]
+        assert len(records) == 1
+        rendered = records[0].getMessage()
+        assert "Application error from server" in rendered
+        assert "operation=get metadata" in rendered
+        # return_code must render as the human-readable enum name, not the raw int.
+        assert "return_code=NoSuchIndex" in rendered
+        assert "return_code=3" not in rendered
+        assert "shard not loaded for uplus_20260511060525" in rendered
+        assert "req-app-1" in rendered
+
+    def test_application_error_log_falls_back_to_int_for_unknown_return_code(self, indexer, caplog):
+        """Future-proofing: if the server sends a ReturnCode this SDK doesn't know,
+        ReturnCode.Name() raises ValueError. The helper must fall back to str()
+        rather than crashing inside the error-logging path."""
+        self._capture_pyenvector_log(caplog)
+
+        header = MagicMock()
+        header.return_code = 9999  # not a known enum member
+        header.error_message = "future server error"
+        header.id = "req-future-1"
+        header.retryable = False
+        header.action = None
+
+        indexer._to_application_error(header, "get metadata")
+
+        records = [r for r in caplog.records if r.name == "pyenvector"]
+        assert len(records) == 1
+        rendered = records[0].getMessage()
+        assert "return_code=9999" in rendered
+
+    def test_application_error_extra_matches_message_body(self, indexer, caplog):
+        """extra={} payload must use the same return_code formatting as the message body
+        (enum name), and expose the raw int separately as `return_code_value`. This keeps
+        structured/JSON consumers consistent with the rendered text."""
+        from pyenvector.proto_gen.v2.common import type_pb2 as envector_type_pb
+
+        self._capture_pyenvector_log(caplog)
+
+        header = MagicMock()
+        header.return_code = envector_type_pb.ReturnCode.NoSuchIndex
+        header.error_message = "shard not loaded"
+        header.id = "req-extra-1"
+        header.retryable = False
+        header.action = None
+
+        indexer._to_application_error(header, "get metadata")
+
+        records = [r for r in caplog.records if r.name == "pyenvector"]
+        assert len(records) == 1
+        record = records[0]
+        assert record.return_code == "NoSuchIndex"
+        assert record.return_code_value == int(envector_type_pb.ReturnCode.NoSuchIndex)
+        # Message body and extra agree on the human-readable name.
+        assert f"return_code={record.return_code}" in record.getMessage()
+
+    def test_transport_error_extra_matches_message_body(self, indexer, caplog):
+        from pyenvector.proto_gen.v2.common import type_pb2 as envector_type_pb
+
+        self._capture_pyenvector_log(caplog)
+
+        err = MagicMock()
+        err.code.return_value = grpc.StatusCode.UNAVAILABLE
+        err.details.return_value = "connection refused"
+
+        indexer._normalize_transport_error(err, "search", request_id="req-extra-2")
+
+        records = [r for r in caplog.records if r.name == "pyenvector"]
+        assert len(records) == 1
+        record = records[0]
+        expected_name = envector_type_pb.ReturnCode.Name(envector_type_pb.ReturnCode.DependencyError)
+        assert record.return_code == expected_name
+        assert record.return_code_value == int(envector_type_pb.ReturnCode.DependencyError)
+        assert f"return_code={record.return_code}" in record.getMessage()
+
+    def test_transport_error_log_contains_grpc_code_and_request_id(self, indexer, caplog):
+        from pyenvector.proto_gen.v2.common import type_pb2 as envector_type_pb
+
+        self._capture_pyenvector_log(caplog)
+
+        err = MagicMock()
+        err.code.return_value = grpc.StatusCode.UNAVAILABLE
+        err.details.return_value = "connection refused"
+
+        indexer._normalize_transport_error(err, "search", request_id="req-xport-2")
+
+        records = [r for r in caplog.records if r.name == "pyenvector"]
+        assert len(records) == 1
+        rendered = records[0].getMessage()
+        assert "gRPC transport error" in rendered
+        assert "operation=search" in rendered
+        assert "grpc_code=UNAVAILABLE" in rendered
+        # UNAVAILABLE maps to ReturnCode.DependencyError per the status map
+        # in _get_grpc_status_map(); assert the message renders the enum name.
+        expected_name = envector_type_pb.ReturnCode.Name(envector_type_pb.ReturnCode.DependencyError)
+        assert f"return_code={expected_name}" in rendered
+        assert "connection refused" in rendered
+        assert "req-xport-2" in rendered

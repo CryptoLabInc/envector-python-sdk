@@ -65,10 +65,6 @@ def main(args):
     DIM = args.dim
     NUM_DATA = args.num_vectors
 
-    if args.reset:
-        ev.init_connect(address=ENVECTOR_ADDRESS)
-        ev.reset()
-
     index_name = args.index_name
 
     ev.init(
@@ -76,10 +72,16 @@ def main(args):
         key_path=args.key_path,
         key_id=args.key_id,
         eval_mode=args.eval_mode,
+        preset=args.preset,
         auto_key_setup=args.auto_key_setup,
     )
 
     print("enVector initialized.")
+    if args.reset:
+        if index_name in ev.get_index_list():
+            ev.drop_index(index_name)
+        if args.key_id in ev.get_key_list():
+            ev.unload_key(args.key_id)
 
     vectors = []
     db_metadata = []
@@ -117,9 +119,6 @@ def main(args):
         query = [vectors[target_idx]]
     else:
         query = [get_random_vector(DIM, seed=NUM_DATA + 1)]
-
-    print("Waiting for data to be indexed...")
-    time.sleep(100)
 
     search_index = ev.Index(index_name)
 
@@ -187,7 +186,8 @@ def main(args):
             assert matched_idx == target_idx, f"Top-1 result index {matched_idx} does not match expected {target_idx}"
 
     if not args.skip_cleanup:
-        ev.reset()
+        ev.drop_index(index_name)
+        ev.unload_key(args.key_id)
 
 
 if __name__ == "__main__":
@@ -197,9 +197,9 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="localhost", help="Host for enVector connection")
     parser.add_argument("--port", type=int, default=50050, help="Port for enVector connection")
 
-    parser.add_argument("--index-name", type=str, default="test_index", help="Name of the index to create/use")
+    parser.add_argument("--index-name", type=str, default="basic_append_idx", help="Name of the index to create/use")
     parser.add_argument("--key-path", type=str, default="./keys", help="Path to the key directory")
-    parser.add_argument("--key-id", type=str, default="test-key", help="Key ID for encryption/decryption")
+    parser.add_argument("--key-id", type=str, default="test-key-mm32-ip3", help="Key ID for encryption/decryption")
     parser.add_argument(
         "--auto-key-setup",
         action=argparse.BooleanOptionalAction,
@@ -209,8 +209,9 @@ if __name__ == "__main__":
     parser.add_argument("--topk", type=int, default=3, help="k value for top-k")
     parser.add_argument("--search-type", nargs="*", help="Type of search: pc, cc", default=["pc"])
     parser.add_argument(
-        "--eval-mode", type=str, default="mm32", help="Evaluation mode for enVector ('mm32')", choices=["mm32"]
+        "--eval-mode", type=str, default="mm32", help="Evaluation mode", choices=["mm", "mms", "mm32", "mms32"]
     )
+    parser.add_argument("--preset", type=str, default="ip3", help="Parameter preset")
 
     parser.add_argument("--repeat", type=int, default=1, help="Number of times to repeat the search")
     parser.add_argument("--parallel", type=int, default=1, help="Number of parallel threads for search")

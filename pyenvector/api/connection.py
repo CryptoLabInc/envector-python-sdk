@@ -11,6 +11,7 @@
 
 import contextlib
 import os
+from typing import Optional, Union
 
 # Suppress noisy gRPC core logs unless the app overrides them.
 # This prevents lines like
@@ -57,6 +58,7 @@ class Connection:
         self,
         server_address: str,
         secure: bool = False,
+        ca_cert: Union[str, bytes, None] = None,
     ):
         opts = [
             ("grpc.max_receive_message_length", MAX_MESSAGE_LENGTH),
@@ -67,7 +69,12 @@ class Connection:
         self.secure = bool(secure)
         with _suppress_c_core_stderr():
             if secure:
-                creds = grpc.ssl_channel_credentials()
+                if isinstance(ca_cert, str):
+                    with open(ca_cert, "rb") as cert_file:
+                        root_certificates = cert_file.read()
+                else:
+                    root_certificates = ca_cert
+                creds = grpc.ssl_channel_credentials(root_certificates=root_certificates)
                 self.channel = grpc.secure_channel(server_address, creds, options=opts)
             else:
                 self.channel = grpc.insecure_channel(server_address, options=opts)

@@ -23,10 +23,11 @@ _sym_db = _symbol_database.Default()
 
 
 from google.api import annotations_pb2 as google_dot_api_dot_annotations__pb2
+from google.api import httpbody_pb2 as google_dot_api_dot_httpbody__pb2
 from . import audit_message_pb2 as v2_dot_audit_dot_audit__message__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18v2/audit/audit-api.proto\x12\x08\x61udit.v2\x1a\x1cgoogle/api/annotations.proto\x1a\x1cv2/audit/audit-message.proto2\xeb\x01\n\x0c\x41uditService\x12\x65\n\x0blist_events\x12\x1b.audit.v2.ListEventsRequest\x1a\x1c.audit.v2.ListEventsResponse\"\x1b\x82\xd3\xe4\x93\x02\x15\"\x10/v2/audit/events:\x01*\x12t\n\rexport_events\x12\x1d.audit.v2.ExportEventsRequest\x1a\x1e.audit.v2.ExportEventsResponse\"\"\x82\xd3\xe4\x93\x02\x1c\"\x17/v2/audit/events/export:\x01*0\x01\x42\x19Z\x17services/proto/audit/v2b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18v2/audit/audit-api.proto\x12\x08\x61udit.v2\x1a\x1cgoogle/api/annotations.proto\x1a\x19google/api/httpbody.proto\x1a\x1cv2/audit/audit-message.proto2\xe1\x01\n\x0c\x41uditService\x12\x65\n\x0blist_events\x12\x1b.audit.v2.ListEventsRequest\x1a\x1c.audit.v2.ListEventsResponse\"\x1b\x82\xd3\xe4\x93\x02\x15\"\x10/v2/audit/events:\x01*\x12j\n\rexport_events\x12\x1d.audit.v2.ExportEventsRequest\x1a\x14.google.api.HttpBody\"\"\x82\xd3\xe4\x93\x02\x1c\"\x17/v2/audit/events/export:\x01*0\x01\x42\x19Z\x17services/proto/audit/v2b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -38,6 +39,6 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_AUDITSERVICE'].methods_by_name['list_events']._serialized_options = b'\202\323\344\223\002\025\"\020/v2/audit/events:\001*'
   _globals['_AUDITSERVICE'].methods_by_name['export_events']._loaded_options = None
   _globals['_AUDITSERVICE'].methods_by_name['export_events']._serialized_options = b'\202\323\344\223\002\034\"\027/v2/audit/events/export:\001*'
-  _globals['_AUDITSERVICE']._serialized_start=99
-  _globals['_AUDITSERVICE']._serialized_end=334
+  _globals['_AUDITSERVICE']._serialized_start=126
+  _globals['_AUDITSERVICE']._serialized_end=351
 # @@protoc_insertion_point(module_scope)

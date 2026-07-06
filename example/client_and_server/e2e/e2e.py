@@ -19,6 +19,7 @@ import time
 import numpy as np
 
 import pyenvector as ev
+from pyenvector.utils.utils import resolve_preset
 
 BASE_VECTOR_SEED = 42
 
@@ -38,10 +39,10 @@ def get_random_vector(dim, seed=None):
     return vec
 
 
-def parallel_search(ENVECTOR_ADDRESS, index_name, query, key_id, eval_mode, top_k, output_fields, search_params):
+def parallel_search(ENVECTOR_ADDRESS, index_name, query, key_id, eval_mode, preset, top_k, output_fields, search_params):
     # Reinitialize enVector context in each worker process to avoid pickling/grpc issues
     try:
-        ev.init(address=ENVECTOR_ADDRESS, key_path="./keys", key_id=key_id, eval_mode=eval_mode, auto_key_setup=False)
+        ev.init(address=ENVECTOR_ADDRESS, key_path="./keys", key_id=key_id, eval_mode=eval_mode, preset=preset, auto_key_setup=False)
         search_idx = ev.Index(index_name)
         res = search_idx.search(query, top_k=top_k, output_fields=output_fields, search_params=search_params)
         return ("ok", res)
@@ -51,10 +52,10 @@ def parallel_search(ENVECTOR_ADDRESS, index_name, query, key_id, eval_mode, top_
         return ("err", f"{type(e).__name__}: {e}")
 
 
-def parallel_insert_worker(ENVECTOR_ADDRESS, index_name, vectors, metadata, key_id, eval_mode):
+def parallel_insert_worker(ENVECTOR_ADDRESS, index_name, vectors, metadata, key_id, eval_mode, preset):
     # Reinitialize enVector context in each worker process
     try:
-        ev.init(address=ENVECTOR_ADDRESS, key_path="./keys", key_id=key_id, eval_mode=eval_mode, auto_key_setup=False)
+        ev.init(address=ENVECTOR_ADDRESS, key_path="./keys", key_id=key_id, eval_mode=eval_mode, preset=preset, auto_key_setup=False)
         insert_idx = ev.Index(index_name)
         req_ids = []
         # Do not block here; let the parent process handle waiting with CLI-configured timeouts.
@@ -97,21 +98,7 @@ def main(args):
     DIM = args.dim
     NUM_DATA = args.num_vectors
 
-    if args.reset:
-        ev.init_connect(address=ENVECTOR_ADDRESS)
-        ev.reset()
-
-    # Eval mode determines the preset — they are coupled:
-    #   mm / mms          -> IP1 (server base-converts to IP0 during makeSearchable)
-    #   mm32 / mms32      -> IP2 (u32 storage, no base conversion)
-    # Only the eval mode is user-facing; the preset is derived from it.
-    mode_to_preset = {
-        "mm": "ip1",
-        "mms": "ip1",
-        "mm32": "ip2",
-        "mms32": "ip2",
-    }
-    preset = mode_to_preset[args.eval_mode]
+    preset = resolve_preset(args.preset, args.eval_mode)
     key_id = args.key_id or f"test-key-{args.eval_mode}-{preset}"
 
     index_name = args.index_name
@@ -127,6 +114,11 @@ def main(args):
     # When running different eval modes against the same stack, each run gets
     # its own index so there is no residual binding from a previous mode's key.
     index_name = f"{index_name}_{args.eval_mode}"
+    if args.reset:
+        if index_name in ev.get_index_list():
+            ev.drop_index(index_name)
+        if key_id in ev.get_key_list():
+            ev.unload_key(key_id)
 
     if not args.skip_insert:
         # 인덱스 타입에 따라 params 설정
@@ -163,6 +155,7 @@ def main(args):
                     metadata_chunk,
                     key_id,
                     args.eval_mode,
+                    preset,
                 )
                 for vector_chunk, metadata_chunk in chunk_vector_batches(vectors, db_metadata, chunk_size)
             ]
@@ -248,6 +241,7 @@ def main(args):
                             query,
                             key_id,
                             args.eval_mode,
+                            preset,
                             args.topk,
                             ["metadata"],
                             search_params,
@@ -313,9 +307,16 @@ if __name__ == "__main__":
         type=str,
         choices=["mm", "mms", "mm32", "mms32"],
         default="mm32",
-        help="Evaluation mode: mm (IP1), mms (IP1 + shared-A), mm32 (IP2 u32), mms32 (IP2 u32 + shared-A)",
+        help="Evaluation mode: mm (IP1), mms (IP1 + shared-A), mm32 (IP3 u32), mms32 (IP3 u32 + shared-A)",
     )
-    parser.add_argument("--index-name", type=str, default="test_index", help="Name of the index to create/use")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=["ip1", "ip2", "ip3"],
+        default=None,
+        help="Parameter preset. Default: ip1 for mm/mms, ip3 for mm32/mms32.",
+    )
+    parser.add_argument("--index-name", type=str, default="e2e_main_idx", help="Name of the index to create/use")
     parser.add_argument("--key-id", type=str, default=None, help="Name of the key to use (default: test-key-<preset>)")
     parser.add_argument("--topk", type=int, default=3, help="k value for top-k")
     parser.add_argument("--search-type", nargs="*", help="Type of search: pc, cc", default=["pc"])
@@ -352,6 +353,5 @@ if __name__ == "__main__":
         default=1.0,
         help="Polling interval (seconds) for insert completion status",
     )
-
     args = parser.parse_args()
     main(args)

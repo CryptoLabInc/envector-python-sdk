@@ -30,6 +30,11 @@ pip install pyenvector
 
 # or, for pre-release versions:
 pip install pyenvector --pre
+
+# Optional cloud key-store backends:
+pip install "pyenvector[aws]"
+pip install "pyenvector[gcp]"
+pip install "pyenvector[cloud]"
 ```
 
 Requires Python 3.9 -- 3.13. Wheels are available for Linux (x86_64) and macOS (arm64).
@@ -70,6 +75,9 @@ ev.drop_index("my_index")
 - **Key management** — generate, seal (AES KEK), and upload keys to AWS S3 / GCP Cloud Storage via the `pyenvector-keygen` CLI.
 - **Cloud-ready** — deploy the enVector server on GKE, EKS, or on-prem. The SDK talks gRPC.
 
+AWS and GCP key-store support are optional extras. Install `pyenvector[aws]` or
+`pyenvector[gcp]` only when you need those backends.
+
 ## CLI: Key Generation
 
 ```bash
@@ -81,12 +89,14 @@ pyenvector-keygen --key-path ./keys --key-id my_key \
   --seal-mode aes --seal-key-path aes.kek
 
 # Upload directly to AWS
+pip install "pyenvector[aws]"
 pyenvector-keygen --key-store aws --key-id my_key \
   --region-name ap-northeast-2 \
   --bucket-name my-bucket \
   --secret-prefix envector/keys
 
 # Upload directly to GCP
+pip install "pyenvector[gcp]"
 pyenvector-keygen --key-store gcp --key-id my_key \
   --bucket-name my-bucket \
   --secret-prefix envector/keys
@@ -119,7 +129,7 @@ See the [`example/`](./example) directory:
 Docker packaging is split into two phases under `sdk/python/docker/`:
 
 - **wheel build**: [`docker/buildpack/Dockerfile`](./docker/buildpack/Dockerfile)
-  builds manylinux wheels from source using the private
+  builds manylinux wheels from source using the public
   `external/evi-crypto` submodule (cmake source-dir: `external/evi-crypto`).
 - **runtime packaging**:
   [`docker/dockerize/Dockerfile`](./docker/dockerize/Dockerfile)
@@ -143,12 +153,12 @@ wheel-build phase (`git submodule update --init --recursive`).
 
 # Package from an existing wheelhouse without reading the private source tree
 ./scripts/build_docker.sh \
-  --wheelhouse ./dist/sdk-wheel-house/1.4.3-py312
+  --wheelhouse ./dist/sdk-wheel-house/1.4.0a5-py312
 
 # Multi-arch manifest -- must push to a registry (docker cannot --load
 # a multi-platform manifest into the local daemon)
 ./scripts/build_docker.sh --target-arch multiarch --action push \
-  --image <registry>/pyenvector --tag v1.4.3
+  --image <registry>/pyenvector --tag v1.4.0a5
 
 # Different CPython ABI
 ./scripts/build_docker.sh --python 3.11 --tag dev

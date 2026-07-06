@@ -246,6 +246,7 @@ if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     (
       cd / || cd /tmp || true
       git config --global url."https://oauth2:${GITHUB_TOKEN}@github.com/".insteadOf https://github.com/
+      git config --global --add url."https://oauth2:${GITHUB_TOKEN}@github.com/".insteadOf git@github.com:
     )
   else
     echo "[WARN] git is not available; cannot preconfigure token for GitHub clones." >&2

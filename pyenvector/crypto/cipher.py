@@ -35,6 +35,7 @@ import os
 from numbers import Integral
 from typing import TYPE_CHECKING, Optional, Sequence
 
+import evi
 import numpy as np
 
 from pyenvector.crypto.block import CipherBlock
@@ -123,6 +124,9 @@ class Cipher:
             index_config (IndexConfig): The configuration for the index, including preset and key paths.
         """
 
+        enc_key = index_config.enc_key if index_config.use_key_stream else None
+        sec_key = index_config.sec_key if index_config.use_key_stream else None
+
         return cls(
             enc_key_path=index_config.enc_key_path,
             sec_key_path=index_config.sec_key_path,
@@ -133,8 +137,8 @@ class Cipher:
             seal_mode=index_config.seal_mode,
             seal_kek=index_config.seal_kek,
             use_key_stream=index_config.use_key_stream,
-            enc_key=index_config.enc_key,
-            sec_key=index_config.sec_key,
+            enc_key=enc_key,
+            sec_key=sec_key,
         )
 
     def _normalize_item_encrypt_input(self, data):
@@ -568,9 +572,14 @@ class Cipher:
         else:
             decryptor = self._decryptor
         sec_key = utils.get_key_stream(sec_key)
+        # Build SecretKey once and reuse for every score ciphertext; otherwise
+        # Decryptor.decrypt_score would re-parse (and re-unseal) the key for
+        # every shard in the loop.
+        sec_key_obj = evi.SecretKey(sec_key, decryptor.seal_info)
         result = []
         for score in encrypted_score.data.ctxt_score:
-            result.append(decryptor.decrypt_score(score, sec_key=sec_key))
+            result.append(decryptor.decrypt_score(score, sec_key=sec_key_obj))
+        del sec_key_obj
         del sec_key
         ret = {"score": result}
 
