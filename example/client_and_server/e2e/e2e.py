@@ -103,13 +103,15 @@ def main(args):
 
     # Eval mode determines the preset — they are coupled:
     #   mm / mms          -> IP1 (server base-converts to IP0 during makeSearchable)
-    #   mm32 / mms32      -> IP2 (u32 storage, no base conversion)
+    #   mm32 / mms32      -> IP3 (u32 storage, no base conversion)
+    # IP2 was demoted from the u32 path to u64 (evi PR #698), so the u32 eval
+    # modes now pair with IP3; pairing them with IP2 is rejected by the server.
     # Only the eval mode is user-facing; the preset is derived from it.
     mode_to_preset = {
         "mm": "ip1",
         "mms": "ip1",
-        "mm32": "ip2",
-        "mms32": "ip2",
+        "mm32": "ip3",
+        "mms32": "ip3",
     }
     preset = mode_to_preset[args.eval_mode]
     key_id = args.key_id or f"test-key-{args.eval_mode}-{preset}"
@@ -313,7 +315,7 @@ if __name__ == "__main__":
         type=str,
         choices=["mm", "mms", "mm32", "mms32"],
         default="mm32",
-        help="Evaluation mode: mm (IP1), mms (IP1 + shared-A), mm32 (IP2 u32), mms32 (IP2 u32 + shared-A)",
+        help="Evaluation mode: mm (IP1), mms (IP1 + shared-A), mm32 (IP3 u32), mms32 (IP3 u32 + shared-A)",
     )
     parser.add_argument("--index-name", type=str, default="test_index", help="Name of the index to create/use")
     parser.add_argument("--key-id", type=str, default=None, help="Name of the key to use (default: test-key-<preset>)")
