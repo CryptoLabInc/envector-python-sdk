@@ -143,12 +143,12 @@ wheel-build phase (`git submodule update --init --recursive`).
 
 # Package from an existing wheelhouse without reading the private source tree
 ./scripts/build_docker.sh \
-  --wheelhouse ./dist/sdk-wheel-house/1.4.0a5-py312
+  --wheelhouse ./dist/sdk-wheel-house/1.4.3-py312
 
 # Multi-arch manifest -- must push to a registry (docker cannot --load
 # a multi-platform manifest into the local daemon)
 ./scripts/build_docker.sh --target-arch multiarch --action push \
-  --image <registry>/pyenvector --tag v1.4.0a5
+  --image <registry>/pyenvector --tag v1.4.3
 
 # Different CPython ABI
 ./scripts/build_docker.sh --python 3.11 --tag dev
